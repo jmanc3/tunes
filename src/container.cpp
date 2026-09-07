@@ -134,6 +134,8 @@ void layout_absolute(Container* root, Container* container, const Bounds& bounds
     }
 }
 
+#include <format>
+
 void layout_fullycustom(Container* root, Container* container, const Bounds& bounds) {
     if (container->pre_layout)
         container->pre_layout(root, container, bounds);

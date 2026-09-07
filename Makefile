@@ -29,7 +29,8 @@ PKGS := \
 	alsa \
 	libpipewire-0.3 \
 	libpulse \
-	gtk+-3.0
+	gtk+-3.0 \
+	libmagic
 
 CPPFLAGS := -Iinclude $(shell pkg-config --cflags $(PKGS))
 CFLAGS := -std=c11

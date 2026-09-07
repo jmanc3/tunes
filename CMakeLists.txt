@@ -37,6 +37,7 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
     libpipewire-0.3
     libpulse
     gtk+-3.0
+    libmagic
 )
 
 target_link_libraries(tunes PRIVATE PkgConfig::DEPS)

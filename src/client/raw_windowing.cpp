@@ -2,8 +2,6 @@
  
 #include "client/raw_windowing.h"
 
-//#include "heart.h"
-#include "utility.h"
 
 #include <cairo-deprecated.h>
 #include <cstddef>
@@ -42,6 +40,7 @@
 #include <functional>
 #include <climits>
 #include <atomic>
+#include <utility.h>
 
 extern "C" {
 #define namespace namespace_
@@ -60,7 +59,6 @@ extern "C" {
 
 #include "../include/container.h"
 #include "../include/events.h"
-//#include "../include/hypriso.h"
 
 #ifdef TRACY_ENABLE
 #include "tracy/Tracy.hpp"
@@ -278,7 +276,7 @@ static const struct wl_buffer_listener buffer_listener = {
 static void handle_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
     auto win = (wl_window *) data;
     win->marked_for_closing = true;
-    printf("Compositor requested window close\n");
+    // printf("Compositor requested window close\n");
     //running = false;  // set your main loop flag to exit
 }
 
@@ -298,7 +296,7 @@ static void handle_toplevel_configure(
     //wl_window_draw(win);
 
     // Usually you’d handle resize here
-    printf("size reconfigured\n");
+    // printf("size reconfigured\n");
 }
 
 int create_timerfd_ms(uint32_t time_ms) {
@@ -954,11 +952,11 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
                                  wl_fixed_t sx, wl_fixed_t sy) {
     double dx = wl_fixed_to_double(sx);
     double dy = wl_fixed_to_double(sy);
-    printf("pointer: enter at %.2f, %.2f\n", dx, dy);
+    // printf("pointer: enter at %.2f, %.2f\n", dx, dy);
     auto ctx = (wl_context *) data;
     for (auto w : ctx->windows) {
         if (w->surface == surface) {
-            printf("pointer: enter at %.2f, %.2f for %s\n", dx, dy, w->title.data());
+            // printf("pointer: enter at %.2f, %.2f for %s\n", dx, dy, w->title.data());
             w->has_pointer_focus = true;
             w->cur_x = sx;
             w->cur_y = sy;
@@ -977,7 +975,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
 
 static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
                                  uint32_t serial, struct wl_surface *surface) {
-    printf("pointer: leave\n");
+    // printf("pointer: leave\n");
     auto ctx = (wl_context *) data;
     for (auto w : ctx->windows) {
         if (w->surface == surface) {
@@ -1015,7 +1013,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
                                   uint32_t serial, uint32_t time,
                                   uint32_t button, uint32_t state) {
     const char *st = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? "pressed" : "released";
-    printf("pointer: button %u %s\n", button, st);
+    // printf("pointer: button %u %s\n", button, st);
     //win->marked_for_closing = true;
     auto ctx = (wl_context *) data;
     if (state == WL_POINTER_BUTTON_STATE_PRESSED)
@@ -1208,7 +1206,7 @@ static void keyboard_handle_enter(void *data, struct wl_keyboard *wl_keyboard,
                                  struct wl_array *keys) {
     //(void) wl_keyboard; (void) serial; (void) surface; (void) keys;
     auto ctx = (wl_context *) data;
-    printf("keyboard: enter (focus)\n");
+    // printf("keyboard: enter (focus)\n");
     for (auto w : ctx->windows) {
         if (w->surface == surface) {
             w->has_keyboard_focus = true;
@@ -1224,7 +1222,7 @@ static void keyboard_handle_enter(void *data, struct wl_keyboard *wl_keyboard,
 static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
                                  uint32_t serial, struct wl_surface *surface) {
     //(void) wl_keyboard; (void) serial; (void) surface;
-    printf("keyboard: leave (lost focus)\n");
+    // printf("keyboard: leave (lost focus)\n");
     auto ctx = (wl_context *) data;
     ctx->most_recently_pressed = -1;
     timerfd_stop(ctx->key_repeat_timer_fd);

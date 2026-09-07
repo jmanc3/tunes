@@ -4,6 +4,14 @@
 #include <cairo/cairo.h>
 #include <cassert>
 
+#define center_y(c, in_h) (c->real_bounds.y + c->real_bounds.h * .5) - (in_h * .5)
+#define center_x(c, in_w) c->real_bounds.x + c->real_bounds.w * .5 - in_w * .5
+#define paint [](Container *root, Container *c)
+#define fz std::format
+#define BTN_LEFT		0x110
+#define BTN_RIGHT		0x111
+#define BTN_MIDDLE		0x112
+
 struct RGBA  {
     double r = 0;
     double g = 0;
@@ -28,12 +36,6 @@ struct Timer {
     
 };
 
-#define center_y(c, in_h) (c->real_bounds.y + c->real_bounds.h * .5) - (in_h * .5)
-#define center_x(c, in_w) c->real_bounds.x + c->real_bounds.w * .5 - in_w * .5
-#define paint [](Container *root, Container *c)
-#define fz std::format
-
-
 static void later(float time_ms, std::function<void(Timer *)> func) {
     
 }
@@ -50,5 +52,6 @@ static void set_rect(cairo_t *cr, Bounds bounds) {
 }
 
 static void log(std::string args) {
-    
+    //printf(args.c_str());
+    //printf("\n");
 }
