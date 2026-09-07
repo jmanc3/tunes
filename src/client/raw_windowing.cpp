@@ -1,0 +1,2376 @@
+// wl_input.c
+ 
+#include "client/raw_windowing.h"
+
+//#include "heart.h"
+#include "utility.h"
+
+#include <cairo-deprecated.h>
+#include <cstddef>
+#include <wayland-client-core.h>
+#include <wayland-client-protocol.h>
+#include <wayland-cursor.h>
+#include <wayland-server-core.h>
+#include <xkbcommon/xkbcommon-names.h>
+#define _POSIX_C_SOURCE 200809L
+#include <poll.h>    // for POLLIN, POLLOUT, POLLERR, etc.
+#include <errno.h>   // for EAGAIN, EINTR, and other errno constants
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <string>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <ctype.h>
+#include <sys/timerfd.h>
+
+#include <wayland-client.h>
+#include <vector>
+#include <cairo.h>
+#include <pango/pangocairo.h>
+#include <wayland-client.h>
+#include <cairo/cairo.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <climits>
+#include <atomic>
+
+extern "C" {
+#define namespace namespace_
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#undef namespace
+#include "xdg-shell-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
+#include "wp-viewporter-client-protocol.h"
+#include "cursor-shape-v1-client-protocol.h"
+#include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
+}
+
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-keysyms.h>
+
+#include "../include/container.h"
+#include "../include/events.h"
+//#include "../include/hypriso.h"
+
+#ifdef TRACY_ENABLE
+#include "tracy/Tracy.hpp"
+#endif
+
+static int unique_id = 0;
+static uint32_t popup_reposition_token = 1;
+
+struct wl_window;
+
+bool wl_window_resize_buffer(struct wl_window *win, int new_width, int new_height);
+
+#define WL_TRIPLE_BUFFER_COUNT 3
+
+struct wl_buffer_slot {
+    wl_buffer *buffer = nullptr;
+    cairo_surface_t *cairo_surface = nullptr;
+    cairo_t *cr = nullptr;
+
+    void *data = nullptr;
+    size_t size = 0;
+    int stride = 0;
+
+    bool busy = false;
+};
+
+struct output {
+    int id = -1;
+    std::string name = "--notsetyet--";
+    struct wl_output *output = nullptr;
+    bool received_geom = false;
+    int32_t physical_height = -1;
+    int32_t physical_width  = -1;
+};
+
+struct pending_pointer_axis_event {
+    uint32_t axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
+    bool has_event = false;
+    bool has_delta = false;
+    double delta = 0.0;
+    bool has_discrete = false;
+    int32_t discrete = 0;
+    bool has_value120 = false;
+    int32_t value120 = 0;
+    bool has_stop = false;
+    uint32_t stop_time = 0;
+    bool has_relative_direction = false;
+    uint32_t relative_direction = 0;
+
+    void clear_payload() {
+        has_event = false;
+        has_delta = false;
+        delta = 0.0;
+        has_discrete = false;
+        discrete = 0;
+        has_value120 = false;
+        value120 = 0;
+        has_stop = false;
+        stop_time = 0;
+        has_relative_direction = false;
+        relative_direction = 0;
+    }
+};
+
+struct pending_pointer_frame_event {
+    bool has_source = false;
+    uint32_t source = WL_POINTER_AXIS_SOURCE_WHEEL;
+    pending_pointer_axis_event axes[2];
+
+    pending_pointer_frame_event() {
+        axes[0].axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
+        axes[1].axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+    }
+};
+
+struct wl_context {
+    int wake_pipe[2];
+    int id;
+    RawApp *ra;
+
+    std::vector<PolledFunction> polled_fds;
+    
+    std::vector<std::function<void()>> functions_to_call;
+    std::mutex functions_mut;
+    bool have_functions_to_execute = false;
+
+    // A close request may come from a thread other than the Wayland loop.
+    // Keep it from returning while libwayland is invoking client callbacks.
+    std::recursive_mutex dispatch_mut;
+  
+    // close_app() may be called from a thread other than the Wayland event loop.
+    // Keep the stop request synchronized with the loop that owns `display`.
+    std::atomic_bool running { true };
+    
+    struct wl_display *display = nullptr;
+    
+    struct wl_registry *registry = nullptr;
+    struct wl_compositor *compositor = nullptr;
+    struct wl_shm *shm = nullptr;
+    struct wl_seat *seat = nullptr;
+    struct xdg_wm_base *wm_base = nullptr;
+    struct zwlr_layer_shell_v1 *layer_shell = nullptr;
+    struct wl_keyboard *keyboard = nullptr;
+    struct wl_pointer *pointer = nullptr;
+    struct xkb_context *xkb_ctx = nullptr;
+    struct wp_fractional_scale_manager_v1 *fractional_scale_manager = nullptr;
+    struct wp_viewporter *viewporter = nullptr;
+    struct wp_cursor_shape_manager_v1 *shape_manager = nullptr;
+    struct wp_cursor_shape_device_v1 *shape_device = nullptr;
+    struct zwlr_foreign_toplevel_manager_v1 *top_level_manager = nullptr;
+    struct xkb_keymap *keymap = nullptr;
+    struct xkb_state *xkb_state = nullptr;
+    xkb_mod_index_t mod_shift;
+    xkb_mod_index_t mod_caps;
+    xkb_mod_index_t mod_alt;
+    xkb_mod_index_t mod_ctrl;
+    xkb_mod_index_t mod_super;
+    int most_recently_pressed = -1;
+    int key_repeat_timer_fd = -1;
+    int key_repeat_rate = 100;
+    int key_repeat_delay = 100;
+    uint32_t last_pointer_button_serial = 0;
+    pending_pointer_frame_event pointer_axis_pending;
+
+    std::vector<output *> outputs;
+    uint32_t shm_format;
+
+    std::vector<wl_window *> windows;
+};
+
+static pending_pointer_axis_event *pointer_pending_axis(wl_context *ctx, uint32_t axis) {
+    for (auto &pending : ctx->pointer_axis_pending.axes) {
+        if (pending.axis == axis) return &pending;
+    }
+    return nullptr;
+}
+
+struct wl_window {
+    int id;
+    bool keeper_of_life = true; // While this window exists app should continue to run
+    RawWindow *rw = nullptr;
+    bool configured = false;
+    
+    struct wl_context *ctx = nullptr;
+    struct wl_surface *surface = nullptr;
+    struct xdg_surface *xdg_surface = nullptr;
+    struct xdg_toplevel *xdg_toplevel = nullptr;
+    struct xdg_popup *xdg_popup = nullptr;
+    struct zwlr_layer_surface_v1 *layer_surface = nullptr;
+    struct wl_output *output = nullptr;
+    struct wl_shm_pool *pool = nullptr;
+    struct wp_fractional_scale_v1 *fractional_scale = nullptr;
+    wp_viewport *viewport = nullptr;
+    wl_buffer_slot slots[WL_TRIPLE_BUFFER_COUNT];
+    bool dropped_frame = false;
+    bool resize_next = false;
+
+    struct wl_cursor_theme *cursor_theme = nullptr;
+    struct wl_cursor *cursor = nullptr;
+    struct wl_surface *cursor_surface = nullptr;
+
+    float current_fractional_scale = 1.0; // default value
+    bool fractional_scale_set_once = false;
+
+    std::function<void(wl_window *)> on_render = nullptr;
+
+    cairo_t *cr = nullptr;  // points to current slot's cr (e.g. slots[0]) for API use
+    
+    int pending_width, pending_height; // recieved from configured event
+    int min_width = 0, min_height = 0; // applied after first configure so initial size is (w,h)
+
+    int logical_width, logical_height;
+    int scaled_w, scaled_h;
+
+    int cur_x = 0;
+    int cur_y = 0;
+
+    std::string title;
+    bool has_pointer_focus = false;
+    bool has_keyboard_focus = false;
+    bool is_layer = true;
+    bool marked_for_closing = false;
+
+    RawWindowSettings::PopupPositioner popup_positioner = {};
+    bool popup_use_fallback_anchor_rect = false;
+    int popup_fallback_anchor_x = 0;
+    int popup_fallback_anchor_y = 0;
+};
+
+std::vector<wl_context *> apps;
+std::vector<wl_window *> windows;
+
+static struct wl_buffer *create_shm_buffer(struct wl_context *d, int width, int height);
+static struct wl_buffer *get_attach_buffer(struct wl_window *win);
+
+static void buffer_release(void *data, struct wl_buffer *wl_buffer) {
+    log("buffer released and available");
+    auto win = (wl_window *) data;
+    for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
+        if (win->slots[i].buffer == wl_buffer) {
+            win->slots[i].busy = false;
+            break;
+        }
+    }
+    if (win->dropped_frame) {
+        win->dropped_frame = false;
+        windowing::redraw(win->rw);
+    }
+}
+
+static const struct wl_buffer_listener buffer_listener = {
+    .release = buffer_release,
+};
+
+static void handle_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
+    auto win = (wl_window *) data;
+    win->marked_for_closing = true;
+    printf("Compositor requested window close\n");
+    //running = false;  // set your main loop flag to exit
+}
+
+static void handle_toplevel_configure(
+    void *data,
+    struct xdg_toplevel *toplevel,
+    int32_t width,
+    int32_t height,
+    struct wl_array *states)
+{
+    auto win = (wl_window *) data;
+
+    // Save for later (don’t resize yet)
+    if (width > 0) win->pending_width  = width;
+    if (height > 0) win->pending_height = height;
+    //wl_window_resize_buffer(win, width, height);
+    //wl_window_draw(win);
+
+    // Usually you’d handle resize here
+    printf("size reconfigured\n");
+}
+
+int create_timerfd_ms(uint32_t time_ms) {
+    // 1. Create the timerfd
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0) {
+        return -1;
+    }
+
+    // 2. Prepare the time specification
+    struct itimerspec ts;
+    ts.it_interval.tv_sec = 0;
+    ts.it_interval.tv_nsec = 0;
+
+    // Handle the 0ms case: timerfd_settime disarms if tv_sec/tv_nsec are both 0.
+    // If 0 is passed, we set the smallest possible expiration (1 nanosecond).
+    if (time_ms == 0) {
+        ts.it_value.tv_sec = 0;
+        ts.it_value.tv_nsec = 1;
+    } else {
+        ts.it_value.tv_sec = time_ms / 1000;
+        ts.it_value.tv_nsec = (time_ms % 1000) * 1000000L;
+    }
+
+    // 3. Set the timer
+    // Flags = 0 means relative time (it expires 'time_ms' from now)
+    if (timerfd_settime(tfd, 0, &ts, NULL) < 0) {
+        close(tfd);
+        return -1;
+    }
+
+    return tfd;
+}
+
+void timerfd_update(int tfd, uint32_t ms) {
+    struct itimerspec ts = {0};
+    ts.it_value.tv_sec  = ms / 1000;
+    ts.it_value.tv_nsec = (ms % 1000) * 1000000L;
+    // interval stays zero: still one-shot
+    timerfd_settime(tfd, 0, &ts, NULL);
+}
+
+static void timerfd_stop(int tfd) {
+    if (tfd < 0)
+        return;
+    struct itimerspec ts = {};
+    timerfd_settime(tfd, 0, &ts, nullptr);
+}
+
+static void config_surface(wl_window *win, uint32_t w, uint32_t h) {
+    wl_window_resize_buffer(win, win->pending_width, win->pending_height);
+    if (win->rw && win->rw->on_resize) {
+        win->rw->on_resize(win->rw, win->scaled_w, win->scaled_h);
+    }
+    if (win->on_render)
+        win->on_render(win);
+}
+
+static void handle_surface_configure(void *data,
+			  struct xdg_surface *xdg_surface,
+			  uint32_t serial) {
+    struct wl_window *win = (struct wl_window *)data;
+
+    xdg_surface_ack_configure(xdg_surface, serial);
+
+    if (win->pending_width > 0 && win->pending_height > 0 &&
+        (win->pending_width != win->logical_width || win->pending_height != win->logical_height)) {
+        if (win->configured) {
+            config_surface(win, win->pending_width, win->pending_height);
+        }
+    }
+
+    if (!win->configured && win->xdg_toplevel) {
+        xdg_toplevel_set_min_size(win->xdg_toplevel, win->min_width, win->min_height);
+    }
+    win->configured = true;
+    wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+    log("surface commit");
+    wl_surface_commit(win->surface);
+}
+
+static const struct xdg_surface_listener xdg_surface_listener = {
+    .configure = handle_surface_configure, 	 
+};
+
+static const struct xdg_toplevel_listener xdg_toplevel_listener = {
+    .configure = handle_toplevel_configure,
+    .close = handle_toplevel_close,
+};
+
+static void handle_popup_configure(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t width, int32_t height) {
+    (void) popup;
+    (void) x;
+    (void) y;
+    auto win = (wl_window *) data;
+    if (width > 0) win->pending_width = width;
+    if (height > 0) win->pending_height = height;
+}
+
+static void handle_popup_done(void *data, struct xdg_popup *popup) {
+    (void) popup;
+    auto win = (wl_window *) data;
+    win->marked_for_closing = true;
+}
+
+static void handle_popup_repositioned(void *data, struct xdg_popup *popup, uint32_t token) {
+    (void) data;
+    (void) popup;
+    (void) token;
+}
+
+static const struct xdg_popup_listener xdg_popup_listener = {
+    .configure = handle_popup_configure,
+    .popup_done = handle_popup_done,
+    .repositioned = handle_popup_repositioned,
+};
+
+/* ---- helper: create a simple shm buffer so surface is mapped ---- */
+static int create_shm_file(size_t size) {
+    char temp[] = "/tmp/wl-shm-XXXXXX";
+    int fd = mkstemp(temp);
+    if (fd >= 0) {
+        unlink(temp); // unlink so it is removed after close
+        if (ftruncate(fd, size) < 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    return fd;
+}
+
+static int create_anonymous_file(off_t size) {
+    char path[] = "/dev/shm/wayland-shm-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        fprintf(stderr, "mkstemp failed: %s\n", strerror(errno));
+        return -1;
+    }
+    unlink(path);
+    if (ftruncate(fd, size) < 0) {
+        fprintf(stderr, "ftruncate failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void destroy_shm_buffer(struct wl_window *win) {
+    for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
+        wl_buffer_slot *slot = &win->slots[i];
+        if (slot->cairo_surface) {
+            cairo_surface_destroy(slot->cairo_surface);
+            slot->cairo_surface = nullptr;
+        }
+        if (slot->cr) {
+            cairo_destroy(slot->cr);
+            slot->cr = nullptr;
+        }
+        if (slot->buffer) {
+            wl_buffer_destroy(slot->buffer);
+            slot->buffer = nullptr;
+        }
+        if (slot->data) {
+            munmap(slot->data, slot->size);
+            slot->data = nullptr;
+        }
+        slot->size = 0;
+        slot->stride = 0;
+        slot->busy = false;
+    }
+    win->cr = nullptr;
+}
+
+static wl_buffer *get_attach_buffer(struct wl_window *win) {
+    return win->slots[0].buffer;
+}
+
+void on_window_render(wl_window *win) {
+#ifdef TRACY_ENABLE
+    ZoneScoped;
+#endif
+    if (win->resize_next) {
+        wl_window_resize_buffer(win, win->logical_width, win->logical_height);
+        win->resize_next = false;
+    }
+    log("on_window_render");
+    wl_buffer_slot *slot = nullptr;
+    for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
+        if (!win->slots[i].busy) {
+            slot = &win->slots[i];
+            break;
+        }
+    }
+    if (!slot) {
+        win->dropped_frame = true;
+        return;
+    }
+
+    if (win->rw) {
+        win->rw->cr = slot->cr;
+        if (win->rw->on_render) {
+            win->rw->on_render(win->rw, win->scaled_w, win->scaled_h);
+        }
+    }
+    wl_surface_attach(win->surface, slot->buffer, 0, 0);
+    wl_surface_damage_buffer(win->surface, 0, 0, INT32_MAX, INT32_MAX);
+    log("surface commit");
+    wl_surface_commit(win->surface);
+    slot->busy = true;
+}
+
+bool wl_window_resize_buffer(struct wl_window *win, int _new_width, int _new_height) {
+#ifdef TRACY_ENABLE
+    ZoneScoped;
+#endif
+ 
+    log("wl_window_resize_buffer");
+    destroy_shm_buffer(win);
+
+    win->logical_width = _new_width;
+    win->logical_height = _new_height;
+    win->scaled_w = win->logical_width * win->current_fractional_scale;
+    win->scaled_h = win->logical_height * win->current_fractional_scale;
+
+    const int stride = win->scaled_w * 4;
+    const size_t size = (size_t)stride * win->scaled_h;
+
+    for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
+        wl_buffer_slot *slot = &win->slots[i];
+        int fd = create_anonymous_file((off_t)size);
+        if (fd < 0) {
+            fprintf(stderr, "Failed to create shm file\n");
+            destroy_shm_buffer(win);
+            return false;
+        }
+
+        void *data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (data == MAP_FAILED) {
+            fprintf(stderr, "mmap failed: %s\n", strerror(errno));
+            close(fd);
+            destroy_shm_buffer(win);
+            return false;
+        }
+
+        struct wl_shm_pool *pool = wl_shm_create_pool(win->ctx->shm, fd, (int)size);
+        struct wl_buffer *buffer =
+            wl_shm_pool_create_buffer(pool, 0, win->scaled_w, win->scaled_h, stride, WL_SHM_FORMAT_ARGB8888);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+
+        if (!buffer) {
+            fprintf(stderr, "Failed to create wl_buffer\n");
+            munmap(data, size);
+            destroy_shm_buffer(win);
+            return false;
+        }
+
+        slot->buffer = buffer;
+        slot->data = data;
+        slot->size = size;
+        slot->stride = stride;
+
+        slot->cairo_surface = cairo_image_surface_create_for_data(
+            (unsigned char*)data,
+            CAIRO_FORMAT_ARGB32,
+            win->scaled_w,
+            win->scaled_h,
+            stride
+        );
+
+        if (cairo_surface_status(slot->cairo_surface) != CAIRO_STATUS_SUCCESS) {
+            fprintf(stderr, "Failed to create cairo surface\n");
+            destroy_shm_buffer(win);
+            return false;
+        }
+
+        slot->cr = cairo_create(slot->cairo_surface);
+        wl_buffer_add_listener(slot->buffer, &buffer_listener, win);
+    }
+
+    win->cr = win->slots[0].cr;
+    if (win->rw)
+        win->rw->cr = win->cr;
+
+    if (win->rw) {
+        win->on_render = on_window_render;
+    }
+
+    if (win->viewport) {
+        wl_surface_set_buffer_scale(win->surface, std::ceil(win->current_fractional_scale * 120.0));
+        
+        wp_viewport_set_destination(win->viewport, win->logical_width, win->logical_height);
+    }
+
+    return true;
+}
+
+static void config_layer_shell(wl_window *win, uint32_t width, uint32_t height);
+
+static void handle_fractional_scale_preferred_scale(
+    void *data,
+    wp_fractional_scale_v1 *obj,
+    uint32_t scale)
+{
+    auto win = (wl_window *) data;
+    bool found = false;
+    for (auto w : windows)
+        if (w == win)
+            found = true;
+    if (!found)
+        return;
+    if (!win->rw)
+        return;
+    win->rw->fractional_scale_set_once = true;
+    win->current_fractional_scale = ((float) scale) / 120.0f;
+
+    if (win->rw) {
+        win->rw->dpi = win->current_fractional_scale;
+        if (win->rw->on_scale_change)
+            win->rw->on_scale_change(win->rw, win->rw->dpi);
+    }
+
+    win->resize_next = true;
+
+    wl_surface_set_buffer_scale(win->surface, std::ceil(scale));
+
+    wp_viewport_set_destination(win->viewport,
+                                win->logical_width,
+                                win->logical_height);
+
+    wl_surface_commit(win->surface);
+
+    if (win->rw)
+        windowing::redraw(win->rw);
+}
+
+static const wp_fractional_scale_v1_listener fractional_scale_listener = {
+    .preferred_scale = handle_fractional_scale_preferred_scale
+};
+
+bool still_need_work(wl_context *ctx) {
+    bool any_false = false;
+    for (auto o : ctx->outputs) {
+        if (!o->received_geom) {
+            any_false = true;
+        }
+        if (o->name == "--notsetyet--")
+            any_false = true;
+    }
+    return any_false;
+}
+
+struct wl_window *wl_window_create(struct wl_context *ctx,
+                                   int width, int height,
+                                   int min_width, int min_height,
+                                   const char *title, RawWindow *rw)
+{
+    struct wl_window *win = new wl_window;
+    win->ctx = ctx;
+    win->logical_width = width;
+    win->logical_height = height;
+    win->scaled_w = win->logical_width * win->current_fractional_scale;
+    win->scaled_h = win->logical_height * win->current_fractional_scale;
+    win->title = title;
+    win->pending_width = width;
+    win->pending_height = height;
+    win->min_width = min_width;
+    win->min_height = min_height;
+    win->pool = NULL;
+    win->rw = rw;
+
+    // 1️⃣ Create surface
+    win->surface = wl_compositor_create_surface(ctx->compositor);
+    if (!win->surface) {
+        fprintf(stderr, "Failed to create wl_surface\n");
+        delete win;
+        return nullptr;
+    }
+
+    win->viewport = wp_viewporter_get_viewport(ctx->viewporter, win->surface); 
+
+    // 2️⃣ Get xdg_surface
+    win->xdg_surface = xdg_wm_base_get_xdg_surface(ctx->wm_base, win->surface);
+    if (!win->xdg_surface) {
+        fprintf(stderr, "Failed to get xdg_surface\n");
+        wl_surface_destroy(win->surface);
+        delete win;
+        return nullptr;
+    }
+
+    // 3️⃣ Add surface listener BEFORE committing
+    xdg_surface_add_listener(win->xdg_surface, &xdg_surface_listener, win);
+
+    // 4️⃣ Create toplevel
+    win->xdg_toplevel = xdg_surface_get_toplevel(win->xdg_surface);
+    if (!win->xdg_toplevel) {
+        fprintf(stderr, "Failed to get xdg_toplevel\n");
+        xdg_surface_destroy(win->xdg_surface);
+        wl_surface_destroy(win->surface);
+        delete win;
+        return nullptr;
+    }
+
+    // 5️⃣ Add toplevel listener
+    xdg_toplevel_add_listener(win->xdg_toplevel, &xdg_toplevel_listener, win);
+
+    // 6️⃣ Set metadata (min_size set after first configure so window opens at requested w×h)
+    xdg_toplevel_set_title(win->xdg_toplevel, title ? title : "Wayland Window");
+
+    // 7️⃣ Single initial commit
+    log("surface commit");
+    wl_surface_commit(win->surface);
+
+    if (!win->configured)
+        wl_display_dispatch(ctx->display);
+
+    wl_window_resize_buffer(win, win->scaled_w, win->scaled_h); // create shm buffer
+    wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+    log("surface commit");
+    wl_surface_commit(win->surface);
+
+    win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
+    wp_fractional_scale_v1_add_listener(win->fractional_scale, &fractional_scale_listener, win);
+
+    ctx->windows.push_back(win);
+    return win;
+}
+
+struct wl_window *wl_popup_window_create(struct wl_context *ctx,
+                                         int width, int height,
+                                         const char *title, RawWindow *rw)
+{
+    struct wl_window *win = new wl_window;
+    win->ctx = ctx;
+    win->logical_width = width;
+    win->logical_height = height;
+    win->scaled_w = win->logical_width * win->current_fractional_scale;
+    win->scaled_h = win->logical_height * win->current_fractional_scale;
+    win->title = title ? title : "";
+    win->pending_width = width;
+    win->pending_height = height;
+    win->pool = NULL;
+    win->rw = rw;
+
+    win->surface = wl_compositor_create_surface(ctx->compositor);
+    if (!win->surface) {
+        fprintf(stderr, "Failed to create wl_surface\n");
+        delete win;
+        return nullptr;
+    }
+
+    win->viewport = wp_viewporter_get_viewport(ctx->viewporter, win->surface);
+
+    win->xdg_surface = xdg_wm_base_get_xdg_surface(ctx->wm_base, win->surface);
+    if (!win->xdg_surface) {
+        fprintf(stderr, "Failed to get xdg_surface for popup\n");
+        wl_surface_destroy(win->surface);
+        delete win;
+        return nullptr;
+    }
+
+    xdg_surface_add_listener(win->xdg_surface, &xdg_surface_listener, win);
+
+    wl_window_resize_buffer(win, win->scaled_w, win->scaled_h);
+
+    win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
+    wp_fractional_scale_v1_add_listener(win->fractional_scale, &fractional_scale_listener, win);
+
+    ctx->windows.push_back(win);
+    return win;
+}
+
+static void config_layer_shell(wl_window *win, uint32_t width, uint32_t height) {
+    wl_window_resize_buffer(win, width, height);
+    if (win->rw)
+        if (win->rw->on_resize)
+            win->rw->on_resize(win->rw, win->scaled_w, win->scaled_h);
+    if (win->on_render)
+        win->on_render(win);
+}
+
+static void configure_layer_shell(void *data,
+                        		  struct zwlr_layer_surface_v1 *surf,
+                        		  uint32_t serial,
+                        		  uint32_t width,
+                            	  uint32_t height) {
+    zwlr_layer_surface_v1_ack_configure(surf, serial);
+    struct wl_window *win = (struct wl_window *)data;
+    if (win->configured) {
+        config_layer_shell(win, width, height);
+        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+        wl_surface_commit(win->surface);
+    }
+    win->configured = true;
+}
+
+static const struct zwlr_layer_surface_v1_listener layer_shell_listener = {
+    .configure = configure_layer_shell,
+    .closed = nullptr
+};
+
+struct wl_window *wl_layer_window_create(struct wl_context *ctx, int width, int height,
+                                         zwlr_layer_shell_v1_layer layer, const char *title,
+                                         int alignment,
+                                         std::string monitor_name, bool exclusive_zone, RawWindow *rw)
+{
+    struct wl_window *win = new wl_window;
+    win->ctx = ctx;
+    win->logical_width = width;
+    win->logical_height = height;
+    win->scaled_w = win->logical_width * win->current_fractional_scale;
+    win->scaled_h = win->logical_height * win->current_fractional_scale;
+    win->title = title;
+    win->rw = rw;
+
+    win->surface = wl_compositor_create_surface(ctx->compositor);
+
+    win->viewport = wp_viewporter_get_viewport(ctx->viewporter, win->surface);
+
+    bool found = false;
+    for (auto o : ctx->outputs) {
+        if (o->name == monitor_name) {
+            found = true;
+            win->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+                ctx->layer_shell, win->surface, o->output, layer, title);
+             break;
+        }
+    }
+    if (!found) {
+        win->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+            ctx->layer_shell, win->surface, NULL, layer, title);
+    }
+
+    if (alignment == 1) {
+        zwlr_layer_surface_v1_set_anchor(win->layer_surface,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    } else if (alignment == 2) {
+        zwlr_layer_surface_v1_set_anchor(win->layer_surface,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
+    } else if (alignment == 3 || alignment == 0) {
+        zwlr_layer_surface_v1_set_anchor(win->layer_surface,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+    } else if (alignment == 4) {
+        zwlr_layer_surface_v1_set_anchor(win->layer_surface,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
+    }
+
+    zwlr_layer_surface_v1_set_size(win->layer_surface, width, height);
+    zwlr_layer_surface_v1_set_keyboard_interactivity(win->layer_surface,
+        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+
+    if (exclusive_zone) {
+        if (alignment == 1 || alignment == 3 || alignment == 0) {
+            zwlr_layer_surface_v1_set_exclusive_zone(win->layer_surface, height);
+        } else {
+            zwlr_layer_surface_v1_set_exclusive_zone(win->layer_surface, width);
+        }
+    }
+
+    zwlr_layer_surface_v1_add_listener(win->layer_surface, &layer_shell_listener, win);
+
+    log("surface commit");
+    wl_surface_commit(win->surface);
+    if (!win->configured)
+        wl_display_dispatch(ctx->display);
+
+    wl_window_resize_buffer(win, win->scaled_w, win->scaled_h); // create shm buffer
+    wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+    log("surface commit");
+    wl_surface_commit(win->surface);
+
+    win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
+    wp_fractional_scale_v1_add_listener(win->fractional_scale, &fractional_scale_listener, win);
+
+    ctx->windows.push_back(win);
+    return win;
+}
+
+static struct wl_buffer *create_shm_buffer(struct wl_context *ctx, int width, int height) {
+    int stride = width * 4;
+    size_t size = stride * height;
+    int fd = create_shm_file(size);
+    if (fd < 0) return NULL;
+    void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+    // fill with transparent black
+    memset(data, 0, size);
+        // Fill with white (255,255,255) at 60% transparency (A=153)
+    uint8_t *pixels = (uint8_t *) data;
+    const uint8_t alpha = (255.f * .2);
+    const uint8_t value = 255 * alpha / 255; // premultiplied: 153
+    for (size_t i = 0; i < size; i += 4) {
+        pixels[i + 0] = value; // B
+        pixels[i + 1] = value; // G
+        pixels[i + 2] = value; // R
+        pixels[i + 3] = alpha; // A
+    }
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(ctx->shm, fd, size);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
+                                                         width, height,
+                                                         stride, ctx->shm_format);
+    wl_shm_pool_destroy(pool);
+    munmap(data, size);
+    close(fd);
+    return buffer;
+}
+
+struct wl_buffer *create_shm_buffer_with_cairo(struct wl_context *ctx,
+                                               int width, int height,
+                                               void (**out_unmap)(void*, size_t),
+                                               void **out_data,
+                                               size_t *out_size)
+{
+    int stride = width * 4;
+    size_t size = stride * height;
+    int fd = create_shm_file(size);
+    if (fd < 0) return NULL;
+
+    void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+
+    // Create shm pool + buffer
+    struct wl_shm_pool *pool = wl_shm_create_pool(ctx->shm, fd, size);
+    struct wl_buffer *buffer =
+        wl_shm_pool_create_buffer(pool, 0, width, height, stride, ctx->shm_format);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+
+    //if (out_unmap) *out_unmap = munmap;
+    if (out_data) *out_data = data;
+    if (out_size) *out_size = size;
+    return buffer;
+}
+
+/* ---- pointer callbacks ---- */
+static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+                                 uint32_t serial, struct wl_surface *surface,
+                                 wl_fixed_t sx, wl_fixed_t sy) {
+    double dx = wl_fixed_to_double(sx);
+    double dy = wl_fixed_to_double(sy);
+    printf("pointer: enter at %.2f, %.2f\n", dx, dy);
+    auto ctx = (wl_context *) data;
+    for (auto w : ctx->windows) {
+        if (w->surface == surface) {
+            printf("pointer: enter at %.2f, %.2f for %s\n", dx, dy, w->title.data());
+            w->has_pointer_focus = true;
+            w->cur_x = sx;
+            w->cur_y = sy;
+            if (w->rw->on_mouse_enters) {
+               w->rw->on_mouse_enters(w->rw, sx, sy);
+            }
+            if (w->on_render)
+                w->on_render(w);
+
+            {
+                wp_cursor_shape_device_v1_set_shape(ctx->shape_device, serial, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
+            }
+        }
+    }
+}
+
+static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
+                                 uint32_t serial, struct wl_surface *surface) {
+    printf("pointer: leave\n");
+    auto ctx = (wl_context *) data;
+    for (auto w : ctx->windows) {
+        if (w->surface == surface) {
+            w->has_pointer_focus = false;
+            if (w->rw->on_mouse_leaves) {
+               w->rw->on_mouse_leaves(w->rw, w->cur_x, w->cur_y);
+            }
+            if (w->on_render)
+                w->on_render(w);
+        }
+    }
+}
+
+static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+                                  uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
+    double dx = wl_fixed_to_double(sx);
+    double dy = wl_fixed_to_double(sy);
+    auto ctx = (wl_context *) data;
+    auto windows_snapshot = ctx->windows;
+    for (auto w : windows_snapshot) {
+        if (w->has_pointer_focus) {
+            log(fz("pointer: motion at {}, {} for %s\n", dx, dy, w->title.data()));
+            w->cur_x = dx;
+            w->cur_y = dy;
+            if (w->rw->on_mouse_move)
+               w->rw->on_mouse_move(w->rw, dx, dy);
+            if (w->on_render)
+                w->on_render(w);
+        }
+    }
+    //running = false;
+}
+
+static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+                                  uint32_t serial, uint32_t time,
+                                  uint32_t button, uint32_t state) {
+    const char *st = (state == WL_POINTER_BUTTON_STATE_PRESSED) ? "pressed" : "released";
+    printf("pointer: button %u %s\n", button, st);
+    //win->marked_for_closing = true;
+    auto ctx = (wl_context *) data;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+        ctx->last_pointer_button_serial = serial;
+
+    auto windows_snapshot = ctx->windows;
+    for (auto w : windows_snapshot) {
+        if (w->has_pointer_focus) {
+            log(fz("pointer: handle button {} {} {} {}", w->cur_x, w->cur_y, button, state));
+            if (w->rw->on_mouse_press) {
+                w->rw->on_mouse_press(w->rw, button, state, w->cur_x, w->cur_y);
+            }
+
+            if (w->on_render)
+                w->on_render(w);
+        }
+    }
+
+    //running = false;
+    //stop_dock();
+}
+
+static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+                                uint32_t time, uint32_t axis, wl_fixed_t value) {
+    auto ctx = (wl_context *) data;
+    pending_pointer_axis_event *pending = pointer_pending_axis(ctx, axis);
+    if (!pending) return;
+
+    pending->has_event = true;
+    pending->has_delta = true;
+    pending->delta = wl_fixed_to_double(value);
+}
+
+static void pointer_handle_frame(void *data,
+	      struct wl_pointer *wl_pointer) {
+    auto ctx = (wl_context *) data;
+    auto windows_snapshot = ctx->windows;
+
+    auto dispatch_axis = [&](pending_pointer_axis_event &pending) {
+        if (!pending.has_event) return;
+
+        int source = ctx->pointer_axis_pending.has_source ? (int)ctx->pointer_axis_pending.source : (int)WL_POINTER_AXIS_SOURCE_WHEEL;
+        int direction = pending.has_relative_direction ? (int)pending.relative_direction : 0;
+        double delta = pending.has_delta ? pending.delta : 0.0;
+        int discrete = 0;
+        if (pending.has_discrete) {
+            discrete = pending.discrete;
+        } else if (pending.has_value120) {
+            discrete = pending.value120 / 120;
+        }
+        bool mouse = source == WL_POINTER_AXIS_SOURCE_WHEEL ||
+                     source == WL_POINTER_AXIS_SOURCE_WHEEL_TILT;
+
+        for (auto w : windows_snapshot) {
+            if (!w->has_pointer_focus) continue;
+            if (w->rw->on_scrolled) {
+                if (pending.axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+                    w->rw->on_scrolled(w->rw, source, pending.axis, direction, -delta, discrete, mouse);
+                } else {
+                    w->rw->on_scrolled(w->rw, source, pending.axis, direction, delta, discrete, mouse);
+                }
+            }
+            if (w->on_render) {
+                w->on_render(w);
+            }
+        }
+
+        pending.clear_payload();
+    };
+
+    for (auto &pending : ctx->pointer_axis_pending.axes) {
+        dispatch_axis(pending);
+    }
+    ctx->pointer_axis_pending.has_source = false;
+}
+
+static void pointer_handle_axis_source(void *data,
+	    struct wl_pointer *wl_pointer,
+	    uint32_t axis_source) {
+    auto ctx = (wl_context *) data;
+    ctx->pointer_axis_pending.has_source = true;
+    ctx->pointer_axis_pending.source = axis_source;
+}
+
+static void pointer_handle_axis_stop(void *data,
+		  struct wl_pointer *wl_pointer,
+		  uint32_t time,
+		  uint32_t axis) {
+    auto ctx = (wl_context *) data;
+    pending_pointer_axis_event *pending = pointer_pending_axis(ctx, axis);
+    if (!pending) return;
+
+    pending->has_event = true;
+    pending->has_stop = true;
+    pending->stop_time = time;
+}
+
+static void pointer_handle_axis_discrete(void *data,
+    struct wl_pointer *wl_pointer,
+    uint32_t axis,
+    int32_t discrete) {
+    auto ctx = (wl_context *) data;
+    pending_pointer_axis_event *pending = pointer_pending_axis(ctx, axis);
+    if (!pending) return;
+
+    pending->has_event = true;
+    pending->has_discrete = true;
+    pending->discrete = discrete;
+}
+
+static void pointer_handle_axis_value120(void *data,
+    struct wl_pointer *wl_pointer,
+    uint32_t axis,
+    int32_t value120) {
+    auto ctx = (wl_context *) data;
+    pending_pointer_axis_event *pending = pointer_pending_axis(ctx, axis);
+    if (!pending) return;
+
+    pending->has_event = true;
+    pending->has_value120 = true;
+    pending->value120 = value120;
+}
+
+static void pointer_handle_axis_relative_direction(void *data,
+				struct wl_pointer *wl_pointer,
+				uint32_t axis,
+				uint32_t direction) {
+    auto ctx = (wl_context *) data;
+    pending_pointer_axis_event *pending = pointer_pending_axis(ctx, axis);
+    if (!pending) return;
+
+    pending->has_event = true;
+    pending->has_relative_direction = true;
+    pending->relative_direction = direction;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_handle_enter,
+    .leave = pointer_handle_leave,
+    .motion = pointer_handle_motion,
+    .button = pointer_handle_button,
+    .axis = pointer_handle_axis,
+    .frame = pointer_handle_frame,
+    .axis_source = pointer_handle_axis_source,
+    .axis_stop = pointer_handle_axis_stop,
+    .axis_discrete = pointer_handle_axis_discrete,
+    .axis_value120 = pointer_handle_axis_value120,
+    .axis_relative_direction = pointer_handle_axis_relative_direction,
+};
+
+/* ---- keyboard callbacks ---- */
+static void keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
+                                   uint32_t format, int fd, uint32_t size) {
+    wl_context *ctx = (wl_context *) data;
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        close(fd);
+        return;
+    }
+
+    char *map_shm = (char *) mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (map_shm == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+
+    struct xkb_keymap *keymap = xkb_keymap_new_from_string(ctx->xkb_ctx,
+                                                           map_shm,
+                                                           XKB_KEYMAP_FORMAT_TEXT_V1,
+                                                           XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!keymap) {
+        printf("Failed to compile xkb keymap\n");
+    } else {
+        if (ctx->keymap) xkb_keymap_unref(ctx->keymap);
+        if (ctx->xkb_state) xkb_state_unref(ctx->xkb_state);
+        ctx->keymap = keymap;
+        ctx->xkb_state = xkb_state_new(ctx->keymap);
+        ctx->mod_shift = xkb_keymap_mod_get_index(ctx->keymap, XKB_MOD_NAME_SHIFT);
+        ctx->mod_caps = xkb_keymap_mod_get_index(ctx->keymap, XKB_MOD_NAME_CAPS);
+        ctx->mod_ctrl  = xkb_keymap_mod_get_index(ctx->keymap, XKB_MOD_NAME_CTRL);
+        ctx->mod_alt   = xkb_keymap_mod_get_index(ctx->keymap, XKB_MOD_NAME_ALT);
+        ctx->mod_super = xkb_keymap_mod_get_index(ctx->keymap, XKB_MOD_NAME_LOGO);
+    }
+
+    munmap(map_shm, size);
+    close(fd);
+}
+
+static void keyboard_handle_enter(void *data, struct wl_keyboard *wl_keyboard,
+                                 uint32_t serial, struct wl_surface *surface,
+                                 struct wl_array *keys) {
+    //(void) wl_keyboard; (void) serial; (void) surface; (void) keys;
+    auto ctx = (wl_context *) data;
+    printf("keyboard: enter (focus)\n");
+    for (auto w : ctx->windows) {
+        if (w->surface == surface) {
+            w->has_keyboard_focus = true;
+            if (w->rw->on_keyboard_focus) {
+                w->rw->on_keyboard_focus(w->rw, true);
+            }
+            if (w->on_render)
+                w->on_render(w);
+        }
+    }
+}
+
+static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
+                                 uint32_t serial, struct wl_surface *surface) {
+    //(void) wl_keyboard; (void) serial; (void) surface;
+    printf("keyboard: leave (lost focus)\n");
+    auto ctx = (wl_context *) data;
+    ctx->most_recently_pressed = -1;
+    timerfd_stop(ctx->key_repeat_timer_fd);
+    for (auto w : ctx->windows) {
+        if (w->surface == surface) {
+            w->has_keyboard_focus = false;
+            if (w->rw->on_keyboard_focus) {
+                w->rw->on_keyboard_focus(w->rw, false);
+            }
+            if (w->on_render)
+                w->on_render(w);
+        }
+    }
+}
+
+static void keyboard_emit_key(wl_context *ctx, uint32_t key, uint32_t state,
+                              bool update_xkb_state) {
+    wl_window *win = nullptr;
+    for (auto w : ctx->windows)
+        if (w->has_keyboard_focus)
+            win = w;
+    if (!win) {
+        for (auto w : ctx->windows)
+            if (w->has_pointer_focus)
+                win = w;
+    }
+    if (!win)
+        return;
+
+    /* ---- CRITICAL: update XKB key state ---- */
+    if (ctx->xkb_state && update_xkb_state) {
+        enum xkb_key_direction dir =
+            (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+                ? XKB_KEY_DOWN
+                : XKB_KEY_UP;
+
+        xkb_state_update_key(ctx->xkb_state, key + 8, dir);
+    }
+                                    
+    if (ctx->xkb_state) {
+        xkb_keysym_t sym = xkb_state_key_get_one_sym(ctx->xkb_state, key + 8);
+
+        xkb_mod_mask_t mods = xkb_state_serialize_mods(ctx->xkb_state, (xkb_state_component) (XKB_STATE_MODS_DEPRESSED | XKB_STATE_MODS_LATCHED));
+
+        uint32_t modmask = MOD_NONE;
+        if (ctx->mod_shift != XKB_MOD_INVALID && (mods & (1u << ctx->mod_shift)))
+            modmask |= MOD_SHIFT;
+        if (ctx->mod_ctrl != XKB_MOD_INVALID && (mods & (1u << ctx->mod_ctrl)))
+            modmask |= MOD_CTRL;
+        if (ctx->mod_alt != XKB_MOD_INVALID && (mods & (1u << ctx->mod_alt)))
+            modmask |= MOD_ALT;
+        if (ctx->mod_super != XKB_MOD_INVALID && (mods & (1u << ctx->mod_super)))
+            modmask |= MOD_SUPER;
+        if (ctx->mod_caps != XKB_MOD_INVALID && (mods & (1u << ctx->mod_caps)))
+            modmask |= MOD_CAPS;
+
+        char utf8[64];
+        int len = xkb_state_key_get_utf8(ctx->xkb_state, key + 8, utf8, sizeof(utf8));
+        if (win->rw) {
+            bool is_text = len > 0;
+            if (is_text) {
+                if (iscntrl(utf8[0])) {
+                    is_text = false;
+                }
+                if (modmask & MOD_CTRL || modmask & MOD_ALT || modmask & MOD_SUPER) {
+                    is_text = false;
+                }
+            }
+            if (state == WL_KEYBOARD_KEY_STATE_PRESSED &&
+                sym == XKB_KEY_Escape &&
+                win->xdg_popup) {
+                win->marked_for_closing = true;
+                return;
+            }
+            win->rw->on_key_press(win->rw, key, state == WL_KEYBOARD_KEY_STATE_PRESSED, sym, modmask, is_text, std::string(utf8, len));
+        }
+    }
+
+    if (win->on_render)
+        win->on_render(win);
+}
+
+static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
+                                uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+    wl_context *ctx = (wl_context *) data;
+    keyboard_emit_key(ctx, key, state, true);
+
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        const xkb_keycode_t keycode = key + 8;
+        const bool repeatable = ctx->keymap && xkb_keymap_key_repeats(ctx->keymap, keycode);
+        if (repeatable && ctx->key_repeat_rate > 0) {
+            ctx->most_recently_pressed = key;
+            timerfd_update(ctx->key_repeat_timer_fd, ctx->key_repeat_delay);
+        }
+    } else {
+        if (ctx->most_recently_pressed == key) {
+            ctx->most_recently_pressed = -1;
+            timerfd_stop(ctx->key_repeat_timer_fd);
+        }
+    }
+}
+
+static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
+                                      uint32_t serial,
+                                      uint32_t mods_depressed,
+                                      uint32_t mods_latched,
+                                      uint32_t mods_locked,
+                                      uint32_t group)
+{
+    wl_context *ctx = (wl_context *)data;
+
+    if (!ctx->xkb_state)
+        return;
+
+    xkb_state_update_mask(
+        ctx->xkb_state,
+        mods_depressed,
+        mods_latched,
+        mods_locked,
+        0,        // depressed layout switches (rarely used)
+        0,        // latched layout switches
+        group
+    );
+}
+
+static void keyboard_handle_repeat_info(void *data,
+                            		    struct wl_keyboard *wl_keyboard,
+                            		    int32_t rate,
+                            		    int32_t delay) {
+    wl_context *ctx = (wl_context *)data;
+    ctx->key_repeat_rate = rate;
+    ctx->key_repeat_delay = delay;
+}
+
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = keyboard_handle_keymap,
+    .enter = keyboard_handle_enter,
+    .leave = keyboard_handle_leave,
+    .key = keyboard_handle_key,
+    .modifiers = keyboard_handle_modifiers,
+    .repeat_info = keyboard_handle_repeat_info,
+};
+
+/* ---- seat listener ---- */
+static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
+    wl_context *d = (wl_context *) data;
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !d->pointer) {
+        d->pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(d->pointer, &pointer_listener, d);
+        if (d->shape_manager && d->pointer)
+            d->shape_device = wp_cursor_shape_manager_v1_get_pointer(d->shape_manager, d->pointer);
+    } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+        wl_pointer_destroy(d->pointer);
+        d->pointer = NULL;
+    }
+
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !d->keyboard) {
+        d->keyboard = wl_seat_get_keyboard(seat);
+        wl_keyboard_add_listener(d->keyboard, &keyboard_listener, d);
+    } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && d->keyboard) {
+        wl_keyboard_destroy(d->keyboard);
+        d->keyboard = NULL;
+    }
+}
+
+static void seat_handle_name(void *data, struct wl_seat *seat, const char *name) {
+    (void)data; (void)seat; (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_handle_capabilities,
+    .name = seat_handle_name,
+};
+
+/* ---- xdg_wm_base ping handler ---- */
+static void xdg_wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial) {
+    xdg_wm_base_pong(wm_base, serial);
+}
+
+static const struct xdg_wm_base_listener wm_base_listener = {
+    .ping = xdg_wm_base_ping
+};
+
+
+//
+// ----- TOPLEVEL CALLBACKS -----
+//
+static void handle_toplevel_title(void* data, zwlr_foreign_toplevel_handle_v1*, const char* title) {
+    //notify(fz("{}", title));
+}
+
+static void handle_toplevel_app_id(void* data, zwlr_foreign_toplevel_handle_v1*, const char* app_id) {
+    //notify(fz("{}", app_id));
+}
+
+static void handle_toplevel_state(void* data, zwlr_foreign_toplevel_handle_v1*, wl_array* state) {
+
+}
+
+static void handle_toplevel_closed(void* data, zwlr_foreign_toplevel_handle_v1* handle) {
+    //zwlr_foreign_toplevel_handle_v1_destroy(handle);
+}
+
+static void output_enter(void *data,
+             struct zwlr_foreign_toplevel_handle_v1 *zwlr_foreign_toplevel_handle_v1,
+             struct wl_output *output) {
+
+}
+
+static void output_leave(void *data,
+             struct zwlr_foreign_toplevel_handle_v1 *zwlr_foreign_toplevel_handle_v1,
+             struct wl_output *output) {
+
+}
+
+static void done(void *data,
+         struct zwlr_foreign_toplevel_handle_v1 *zwlr_foreign_toplevel_handle_v1) {
+
+}
+
+static void parent(void *data,
+           struct zwlr_foreign_toplevel_handle_v1 *zwlr_foreign_toplevel_handle_v1,
+           struct zwlr_foreign_toplevel_handle_v1 *parent) {
+
+}
+
+static const zwlr_foreign_toplevel_handle_v1_listener toplevel_listener = {
+    .title = handle_toplevel_title,
+    .app_id = handle_toplevel_app_id,
+    .output_enter = output_enter,
+    .output_leave = output_leave,
+    .state = handle_toplevel_state,
+    .done = done,
+    .closed = handle_toplevel_closed,
+    .parent = parent
+};
+
+static void handle_manager_toplevel(void*d, zwlr_foreign_toplevel_manager_v1*, zwlr_foreign_toplevel_handle_v1* toplevel_handle) {
+    zwlr_foreign_toplevel_handle_v1_add_listener(toplevel_handle, &toplevel_listener, d);
+}
+
+static void handle_manager_finished(void*, zwlr_foreign_toplevel_manager_v1*) {
+    //std::cout << "Toplevel manager finished\n";
+}
+
+static const zwlr_foreign_toplevel_manager_v1_listener manager_listener = {
+    .toplevel = handle_manager_toplevel,
+    .finished = handle_manager_finished,
+};
+
+void out_geometry(void *data,
+    struct wl_output *wl_output,
+    int32_t x,
+    int32_t y,
+    int32_t physical_width,
+    int32_t physical_height,
+    int32_t subpixel,
+    const char *make,
+    const char *model,
+    int32_t transform) {
+}
+
+void out_mode(void *data,
+    struct wl_output *wl_output,
+    uint32_t flags,
+    int32_t width,
+    int32_t height,
+    int32_t refresh) {
+    auto ctx = (wl_context *) data;
+    for (int i = ctx->outputs.size() - 1; i >= 0; i--) {
+        if (ctx->outputs[i]->output == wl_output) {
+            auto mon = ctx->outputs[i];
+            mon->received_geom = true;
+            mon->physical_width = width;
+            mon->physical_height = height;
+        }
+    }
+}
+
+void out_done(void *data,
+	     struct wl_output *wl_output) {
+
+}
+
+void out_scale(void *data,
+	      struct wl_output *wl_output,
+	      int32_t factor) {
+    	      
+}
+
+void out_name(void *data,
+	     struct wl_output *wl_output,
+	     const char *name) {
+    auto ctx = (wl_context *) data;
+    for (int i = ctx->outputs.size() - 1; i >= 0; i--) {
+        if (ctx->outputs[i]->output == wl_output) {
+            auto mon = ctx->outputs[i];
+            mon->name = name;
+        }
+    }
+}
+
+void out_description(void *data,
+		    struct wl_output *wl_output,
+		    const char *description) {
+     //notify(description);
+}
+
+static const wl_output_listener output_listener = {
+    .geometry = out_geometry,
+    .mode = out_mode,
+    .done = out_done,
+    .scale = out_scale,
+    .name = out_name,
+    .description = out_description,
+};
+
+
+/* ---- registry ---- */
+static void registry_handle_global(void *data, struct wl_registry *registry,
+                                   uint32_t id, const char *interface, uint32_t version) {
+    wl_context *d = (wl_context *)data;
+    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        d->compositor = (wl_compositor *) wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
+        d->shm = (wl_shm *) wl_registry_bind(registry, id, &wl_shm_interface, 1);
+        d->shm_format = WL_SHM_FORMAT_ARGB8888;
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        d->seat = (wl_seat *) wl_registry_bind(registry, id, &wl_seat_interface, 5);
+        wl_seat_add_listener(d->seat, &seat_listener, d);
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+        const uint32_t wm_base_version = version < 3 ? version : 3;
+        d->wm_base = (xdg_wm_base *) wl_registry_bind(registry, id, &xdg_wm_base_interface, wm_base_version);
+        xdg_wm_base_add_listener(d->wm_base, &wm_base_listener, d);
+    } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+        d->layer_shell = (zwlr_layer_shell_v1 *) wl_registry_bind(registry, id, &zwlr_layer_shell_v1_interface, 5);
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        auto output_raw = (wl_output *) wl_registry_bind(registry, id, &wl_output_interface, 4);
+        auto mon = new output;
+        mon->id = id;
+        mon->output = output_raw;
+        d->outputs.push_back(mon);
+        wl_output_add_listener(output_raw, &output_listener, d);
+    } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
+        d->fractional_scale_manager = (wp_fractional_scale_manager_v1 *) wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+        d->viewporter = (wp_viewporter*) wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
+    } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
+        d->shape_manager = (wp_cursor_shape_manager_v1 *) wl_registry_bind(registry, id, &wp_cursor_shape_manager_v1_interface, 1);
+        if (d->shape_manager && d->pointer)
+            d->shape_device = wp_cursor_shape_manager_v1_get_pointer(d->shape_manager, d->pointer);
+    } else if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
+        d->top_level_manager = (zwlr_foreign_toplevel_manager_v1*) wl_registry_bind(registry, id, &zwlr_foreign_toplevel_manager_v1_interface, 3);
+        zwlr_foreign_toplevel_manager_v1_add_listener(d->top_level_manager, &manager_listener, d);
+    }
+}
+
+static void registry_handle_global_remove(void *data, struct wl_registry *registry, uint32_t id) {
+    wl_context *d = (wl_context *)data;
+    for (int i = d->outputs.size() - 1; i >= 0; i--) {
+        if (d->outputs[i]->id == id) {
+            delete d->outputs[i];
+            d->outputs.erase(d->outputs.begin() + i) ;
+        }
+    }
+}
+
+static const struct wl_registry_listener registry_listener = {
+    .global = registry_handle_global,
+    .global_remove = registry_handle_global_remove
+};
+
+struct wl_context *wl_context_create(void) {
+    wl_context *ctx = new wl_context;
+    ctx->display = wl_display_connect(NULL);
+    if (!ctx->display) {
+        fprintf(stderr, "Failed to connect to Wayland display\n");
+        free(ctx);
+        return NULL;
+    }
+
+    ctx->registry = wl_display_get_registry(ctx->display);
+    wl_registry_add_listener(ctx->registry, &registry_listener, ctx);
+    wl_display_roundtrip(ctx->display); // populate globals
+
+    ctx->xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    ctx->shm_format = WL_SHM_FORMAT_ARGB8888; // default; discover if needed
+    return ctx;
+}
+
+void wl_window_destroy(struct wl_window *win) {
+    if (!win) return;
+
+    if (win->xdg_popup) xdg_popup_destroy(win->xdg_popup);
+    if (win->xdg_toplevel) xdg_toplevel_destroy(win->xdg_toplevel);
+    if (win->xdg_surface) xdg_surface_destroy(win->xdg_surface);
+    if (win->layer_surface) zwlr_layer_surface_v1_destroy(win->layer_surface);
+
+    destroy_shm_buffer(win);
+
+    if (win->surface) wl_surface_destroy(win->surface);
+
+    for (int i = windows.size() - 1; i >= 0; i--)
+        if (windows[i] == win)
+            windows.erase(windows.begin() + i);
+
+    delete win;
+}
+
+void wl_context_destroy(struct wl_context *ctx) {
+    if (!ctx) return;
+
+    for (auto w : ctx->windows)
+        wl_window_destroy(w); 
+
+    if (ctx->keyboard) wl_keyboard_release(ctx->keyboard);
+    if (ctx->xkb_state) xkb_state_unref(ctx->xkb_state);
+    if (ctx->keymap) xkb_keymap_unref(ctx->keymap);
+    if (ctx->pointer) wl_pointer_release(ctx->pointer);
+    if (ctx->seat) wl_seat_release(ctx->seat);
+    if (ctx->shm) wl_shm_destroy(ctx->shm);
+    if (ctx->compositor) wl_compositor_destroy(ctx->compositor);
+    if (ctx->wm_base) xdg_wm_base_destroy(ctx->wm_base);
+    if (ctx->layer_shell) zwlr_layer_shell_v1_destroy(ctx->layer_shell);
+    if (ctx->xkb_ctx) xkb_context_unref(ctx->xkb_ctx);
+
+    wl_registry_destroy(ctx->registry);
+    wl_display_disconnect(ctx->display);
+
+    for (const auto &pf : ctx->polled_fds)
+        if (pf.fd >= 0 && pf.fd != ctx->wake_pipe[0])
+            close(pf.fd);
+    close(ctx->wake_pipe[0]);
+    close(ctx->wake_pipe[1]);
+
+    for (int i = apps.size() - 1; i >= 0; i--)
+        if (apps[i] == ctx)
+            apps.erase(apps.begin() + i);
+
+    delete ctx;
+}
+
+int wake_pipe[2];
+
+void windowing::main_loop(RawApp *app) {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == app->id)
+            ctx = c;
+    if (!ctx)
+        return;
+
+    bool need_flush = false;
+    const int wayland_fd = wl_display_get_fd(ctx->display);
+
+    PolledFunction wake_pf;
+    wake_pf.fd = ctx->wake_pipe[0];
+    wake_pf.name = "wake pipe";
+    wake_pf.func = [ctx](PolledFunction pf) {
+        if (pf.revents & POLLIN) {
+            char buf[64];
+            read(ctx->wake_pipe[0], buf, sizeof buf);
+            for (auto w : ctx->windows) {
+                if (w->on_render) {
+                    w->on_render(w);
+                }
+            }
+            // wake simply interrupts the poll
+        }
+    };
+
+    ctx->polled_fds.push_back(wake_pf);
+
+    // Keep one stable repeat descriptor in the poll set. Creating/removing it
+    // from a Wayland callback would invalidate the poll snapshot being walked.
+    ctx->key_repeat_timer_fd = create_timerfd_ms(0);
+    timerfd_stop(ctx->key_repeat_timer_fd);
+    if (ctx->key_repeat_timer_fd >= 0) {
+        PolledFunction repeat_pf;
+        repeat_pf.fd = ctx->key_repeat_timer_fd;
+        repeat_pf.name = "key repeat";
+        repeat_pf.func = [ctx](PolledFunction pf) {
+            uint64_t expirations = 0;
+            if (!(pf.revents & POLLIN) || read(pf.fd, &expirations, sizeof expirations) < 0)
+                return;
+            if (ctx->most_recently_pressed < 0 || ctx->key_repeat_rate <= 0) {
+                timerfd_stop(pf.fd);
+                return;
+            }
+            keyboard_emit_key(ctx, static_cast<uint32_t>(ctx->most_recently_pressed),
+                              WL_KEYBOARD_KEY_STATE_PRESSED, false);
+            const uint32_t interval_ms = std::max(1, 1000 / ctx->key_repeat_rate);
+            timerfd_update(pf.fd, interval_ms);
+        };
+        ctx->polled_fds.push_back(repeat_pf);
+    }
+
+    while (ctx->running) {
+        // A Wayland read must always be paired: prepare_read() before poll(),
+        // then read_events() when readable or cancel_read() otherwise.  In
+        // particular, never begin a read after the display has been woken for
+        // shutdown.
+        while (ctx->running && wl_display_prepare_read(ctx->display) != 0) {
+            std::lock_guard<std::recursive_mutex> lock(ctx->dispatch_mut);
+            if (!ctx->running || wl_display_dispatch_pending(ctx->display) < 0) {
+                ctx->running = false;
+                break;
+            }
+        }
+        if (!ctx->running)
+            break;
+
+        if (wl_display_flush(ctx->display) < 0) {
+            if (errno == EAGAIN) {
+                need_flush = true;
+            } else {
+                wl_display_cancel_read(ctx->display);
+                ctx->running = false;
+                break;
+            }
+        } else {
+            need_flush = false;
+        }
+
+        // Build pollfds based on ctx->polled_fds
+        std::vector<struct pollfd> pfds;
+        pfds.reserve(ctx->polled_fds.size());
+
+        for (auto &p : ctx->polled_fds) {
+            short ev = POLLIN | POLLERR | POLLHUP | POLLNVAL;
+            if (p.fd == wayland_fd && need_flush)
+                ev |= POLLOUT;
+            pfds.push_back({ p.fd, ev, 0 });
+        }
+        pfds.insert(pfds.begin(), { wayland_fd,
+                                    static_cast<short>(POLLIN | POLLERR | POLLHUP | POLLNVAL |
+                                                       (need_flush ? POLLOUT : 0)),
+                                    0 });
+
+        const int poll_result = poll(pfds.data(), pfds.size(), -1);
+        if (poll_result < 0) {
+            wl_display_cancel_read(ctx->display);
+            if (errno == EINTR)
+                continue;
+            ctx->running = false;
+            break;
+        }
+
+        const short wayland_revents = pfds[0].revents;
+        if (wayland_revents & POLLIN) {
+            if (wl_display_read_events(ctx->display) < 0) {
+                ctx->running = false;
+                break;
+            }
+        } else {
+            wl_display_cancel_read(ctx->display);
+        }
+
+        // The wake pipe is the cross-thread stop notification.  Handle it
+        // before dispatching any newly received Wayland events: poll can
+        // report both descriptors in the same iteration.
+        for (size_t i = 0; i < ctx->polled_fds.size(); ++i) {
+            if (ctx->polled_fds[i].fd == ctx->wake_pipe[0] &&
+                (pfds[i + 1].revents & POLLIN)) {
+                char buf[64];
+                while (read(ctx->wake_pipe[0], buf, sizeof buf) > 0) {}
+                break;
+            }
+        }
+
+        // close_app() sets this flag and writes the wake pipe.  Once the
+        // outstanding read is cancelled, leave without dispatching callbacks
+        // against an application that is shutting down.
+        if (!ctx->running)
+            break;
+
+        if (wayland_revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            ctx->running = false;
+            break;
+        }
+        if ((wayland_revents & POLLOUT) && wl_display_flush(ctx->display) == 0)
+            need_flush = false;
+
+        {
+            // Do not allow close_app() to return while this call is executing:
+            // its caller is then free to release the objects referenced by
+            // Wayland listener callbacks.
+            std::lock_guard<std::recursive_mutex> lock(ctx->dispatch_mut);
+            if (!ctx->running || wl_display_get_error(ctx->display) != 0 ||
+                wl_display_dispatch_pending(ctx->display) < 0) {
+                ctx->running = false;
+                break;
+            }
+        }
+
+        // The Wayland display is owned entirely by the code above.  Dispatch
+        // the auxiliary descriptors only after its read transaction is closed.
+        const size_t end = ctx->polled_fds.size();
+        for (size_t i = 0; i < end; i++) {
+            auto &p = ctx->polled_fds[i];
+            p.revents = pfds[i + 1].revents;
+
+            if (p.revents && p.func)
+                p.func(p);  // call the polled handler
+        }
+
+        if (!ctx->running)
+            break;
+
+        // should technically be atomic<bool> but should be fine?
+        if (ctx->have_functions_to_execute) { 
+            std::lock_guard<std::mutex> lock(ctx->functions_mut);
+            for (auto &func : ctx->functions_to_call) {
+                func();
+            }
+            ctx->functions_to_call.clear();
+        }
+
+        // ---- Application-level window cleanup ----
+
+        for (int i = ctx->windows.size() - 1; i >= 0; i--) {
+            auto win = ctx->windows[i];
+            if (win->marked_for_closing) {
+                if (win->rw->on_close)
+                    win->rw->on_close(win->rw);
+                wl_window_destroy(win);
+                ctx->windows.erase(ctx->windows.begin() + i);
+            }
+        }
+
+        bool any_keepers = false;
+        for (auto w : ctx->windows) {
+            if (w->keeper_of_life) {
+                any_keepers = true;
+                break;
+            }
+        }
+        ctx->running = any_keepers;
+    }
+
+    // 4. Cleanup
+    wl_context_destroy(ctx);
+}
+
+RawApp *windowing::open_app() {
+    auto ra = new RawApp;
+    ra->id = unique_id++;
+    
+    struct wl_context *ctx = wl_context_create();
+    ctx->id = ra->id;
+    ctx->ra = ra;
+    
+    pipe2(ctx->wake_pipe, O_CLOEXEC | O_NONBLOCK);
+
+    apps.push_back(ctx);
+    
+    while (still_need_work(ctx))
+        wl_display_dispatch(ctx->display); 
+
+    return ra;
+}
+
+static wl_context *find_context(RawApp *app) {
+    if (!app)
+        return nullptr;
+    for (auto c : apps)
+        if (c->id == app->id)
+            return c;
+    return nullptr;
+}
+
+static wl_window *find_window(RawWindow *window) {
+    if (!window)
+        return nullptr;
+    for (auto w : windows)
+        if (w->id == window->id)
+            return w;
+    return nullptr;
+}
+
+static uint32_t to_xdg_popup_anchor(RawWindowSettings::PopupAnchor anchor) {
+    switch (anchor) {
+        case RawWindowSettings::PopupAnchor::NONE: return XDG_POSITIONER_ANCHOR_NONE;
+        case RawWindowSettings::PopupAnchor::TOP: return XDG_POSITIONER_ANCHOR_TOP;
+        case RawWindowSettings::PopupAnchor::BOTTOM: return XDG_POSITIONER_ANCHOR_BOTTOM;
+        case RawWindowSettings::PopupAnchor::LEFT: return XDG_POSITIONER_ANCHOR_LEFT;
+        case RawWindowSettings::PopupAnchor::RIGHT: return XDG_POSITIONER_ANCHOR_RIGHT;
+        case RawWindowSettings::PopupAnchor::TOP_LEFT: return XDG_POSITIONER_ANCHOR_TOP_LEFT;
+        case RawWindowSettings::PopupAnchor::BOTTOM_LEFT: return XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
+        case RawWindowSettings::PopupAnchor::TOP_RIGHT: return XDG_POSITIONER_ANCHOR_TOP_RIGHT;
+        case RawWindowSettings::PopupAnchor::BOTTOM_RIGHT: return XDG_POSITIONER_ANCHOR_BOTTOM_RIGHT;
+    }
+    return XDG_POSITIONER_ANCHOR_TOP_LEFT;
+}
+
+static uint32_t to_xdg_popup_gravity(RawWindowSettings::PopupGravity gravity) {
+    switch (gravity) {
+        case RawWindowSettings::PopupGravity::NONE: return XDG_POSITIONER_GRAVITY_NONE;
+        case RawWindowSettings::PopupGravity::TOP: return XDG_POSITIONER_GRAVITY_TOP;
+        case RawWindowSettings::PopupGravity::BOTTOM: return XDG_POSITIONER_GRAVITY_BOTTOM;
+        case RawWindowSettings::PopupGravity::LEFT: return XDG_POSITIONER_GRAVITY_LEFT;
+        case RawWindowSettings::PopupGravity::RIGHT: return XDG_POSITIONER_GRAVITY_RIGHT;
+        case RawWindowSettings::PopupGravity::TOP_LEFT: return XDG_POSITIONER_GRAVITY_TOP_LEFT;
+        case RawWindowSettings::PopupGravity::BOTTOM_LEFT: return XDG_POSITIONER_GRAVITY_BOTTOM_LEFT;
+        case RawWindowSettings::PopupGravity::TOP_RIGHT: return XDG_POSITIONER_GRAVITY_TOP_RIGHT;
+        case RawWindowSettings::PopupGravity::BOTTOM_RIGHT: return XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+    }
+    return XDG_POSITIONER_GRAVITY_TOP_LEFT;
+}
+
+static void apply_popup_positioner_settings(
+    xdg_positioner *positioner,
+    const wl_window *win,
+    int popup_w,
+    int popup_h)
+{
+    if (!positioner || !win)
+        return;
+
+    const auto &popup = win->popup_positioner;
+    xdg_positioner_set_size(positioner, popup_w, popup_h);
+
+    if (popup.use_explicit_anchor_rect) {
+        xdg_positioner_set_anchor_rect(
+            positioner,
+            popup.anchor_rect_x,
+            popup.anchor_rect_y,
+            popup.anchor_rect_w > 0 ? popup.anchor_rect_w : 1,
+            popup.anchor_rect_h > 0 ? popup.anchor_rect_h : 1
+        );
+    } else if (win->popup_use_fallback_anchor_rect) {
+        xdg_positioner_set_anchor_rect(positioner, win->popup_fallback_anchor_x, win->popup_fallback_anchor_y, 1, 1);
+    } else {
+        xdg_positioner_set_anchor_rect(positioner, 0, 0, 1, 1);
+    }
+
+    xdg_positioner_set_anchor(positioner, to_xdg_popup_anchor(popup.anchor));
+    xdg_positioner_set_gravity(positioner, to_xdg_popup_gravity(popup.gravity));
+
+    if (popup.use_offset)
+        xdg_positioner_set_offset(positioner, popup.offset_x, popup.offset_y);
+
+    if (popup.constraint_adjustment != RawWindowSettings::POPUP_CONSTRAINT_NONE)
+        xdg_positioner_set_constraint_adjustment(positioner, popup.constraint_adjustment);
+
+    if (popup.reactive)
+        xdg_positioner_set_reactive(positioner);
+
+    if (popup.use_parent_size)
+        xdg_positioner_set_parent_size(positioner, popup.parent_w, popup.parent_h);
+
+    if (popup.use_parent_configure)
+        xdg_positioner_set_parent_configure(positioner, popup.parent_configure_serial);
+}
+
+static xdg_popup *create_popup_role(wl_window *win, wl_window *parent_win, xdg_positioner *positioner) {
+    if (!win || !parent_win || !positioner || !win->xdg_surface)
+        return nullptr;
+
+    if (win->xdg_popup)
+        return win->xdg_popup;
+
+    struct xdg_surface *popup_parent = parent_win->xdg_surface;
+    if (parent_win->layer_surface)
+        popup_parent = nullptr;
+
+    win->xdg_popup = xdg_surface_get_popup(win->xdg_surface, popup_parent, positioner);
+    if (!win->xdg_popup)
+        return nullptr;
+
+    xdg_popup_add_listener(win->xdg_popup, &xdg_popup_listener, win);
+
+    if (parent_win->layer_surface)
+        zwlr_layer_surface_v1_get_popup(parent_win->layer_surface, win->xdg_popup);
+    return win->xdg_popup;
+}
+
+RawWindow *windowing::open_window(RawApp *app, WindowType type, RawWindowSettings settings) {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == app->id)
+            ctx = c;
+    if (!ctx)
+        return nullptr;
+    
+    auto rw = new RawWindow;
+    rw->creator = app;
+    rw->id = unique_id++;
+
+    if (type == WindowType::NORMAL) {
+        auto window = wl_window_create(ctx, settings.pos.w, settings.pos.h, settings.pos.min_w, settings.pos.min_h, settings.name.c_str(), rw);
+        rw->cr = window->cr;
+        window->id = rw->id;
+        window->on_render = on_window_render;  // set now that rw is set (resize_buffer skipped it)
+        if (window->on_render)
+            window->on_render(window);  // paint first frame so window is not blank on first show
+        windows.push_back(window);
+    }
+    if (type == WindowType::DOCK) {
+        auto window = wl_layer_window_create(ctx, settings.pos.w, settings.pos.h, ZWLR_LAYER_SHELL_V1_LAYER_TOP, settings.name.c_str(), settings.alignment, settings.monitor_name, true, rw);
+        rw->cr = window->cr;
+        window->id = rw->id;
+        window->on_render = on_window_render;
+        if (window->on_render)
+            window->on_render(window);
+        windows.push_back(window);        
+    }
+    auto window = windows[windows.size() - 1];
+    
+    return rw;
+}
+
+RawWindow *windowing::open_popup(RawWindow *parent, RawWindowSettings settings) {
+    if (!parent || !parent->creator)
+        return nullptr;
+
+    wl_context *ctx = find_context(parent->creator);
+    if (!ctx || !ctx->wm_base)
+        return nullptr;
+
+    auto rw = new RawWindow;
+    rw->creator = parent->creator;
+    rw->id = unique_id++;
+
+    auto window = wl_popup_window_create(ctx, settings.pos.w, settings.pos.h, settings.name.c_str(), rw);
+    if (!window) {
+        delete rw;
+        return nullptr;
+    }
+
+    rw->cr = window->cr;
+    window->id = rw->id;
+    window->on_render = on_window_render;
+    window->popup_positioner = settings.popup;
+    window->popup_use_fallback_anchor_rect = !settings.popup.use_explicit_anchor_rect;
+    window->popup_fallback_anchor_x = settings.pos.x;
+    window->popup_fallback_anchor_y = settings.pos.y;
+    windows.push_back(window);
+
+    xdg_positioner *positioner = xdg_wm_base_create_positioner(ctx->wm_base);
+    if (!positioner) {
+        wl_window_destroy(window);
+        delete rw;
+        return nullptr;
+    }
+
+    const int popup_w = settings.pos.w > 0 ? settings.pos.w : 1;
+    const int popup_h = settings.pos.h > 0 ? settings.pos.h : 1;
+    apply_popup_positioner_settings(positioner, window, popup_w, popup_h);
+
+    wl_window *window_wl = find_window(rw);
+    wl_window *parent_wl = find_window(parent);
+    if (!create_popup_role(window_wl, parent_wl, positioner)) {
+        xdg_positioner_destroy(positioner);
+        wl_window_destroy(window);
+        delete rw;
+        return nullptr;
+    }
+
+    if (window_wl->xdg_popup && ctx->seat && ctx->last_pointer_button_serial != 0) {
+        xdg_popup_grab(window_wl->xdg_popup, ctx->seat, ctx->last_pointer_button_serial);
+    }
+
+    wl_surface_attach(window_wl->surface, get_attach_buffer(window_wl), 0, 0);
+    wl_surface_commit(window_wl->surface);
+
+    xdg_positioner_destroy(positioner);
+
+    rw->parent = parent;
+    parent->children.push_back(rw);
+
+    if (window->on_render)
+        window->on_render(window);
+
+    return rw;
+}
+
+void windowing::wake_up(RawWindow *window) {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == window->creator->id)
+            ctx = c;
+    if (!ctx)
+        return;
+    wl_window *win = nullptr;
+    for (auto w : windows)
+        if (w->id == window->id)
+            win = w;
+    if (!win)
+        return;
+    write(ctx->wake_pipe[1], "x", 1);
+}
+
+void windowing::redraw(RawWindow *window) {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == window->creator->id)
+            ctx = c;
+    if (!ctx)
+        return;
+    wl_window *win = nullptr;
+    for (auto w : windows)
+        if (w->id == window->id)
+            win = w;
+    if (!win)
+        return;
+    write(ctx->wake_pipe[1], "x", 1);
+}
+
+void windowing::set_size(RawWindow *window, int width, int height) {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == window->creator->id)
+            ctx = c;
+    if (!ctx)
+        return;
+    wl_window *win = nullptr;
+    for (auto w : windows)
+        if (w->id == window->id)
+            win = w;
+    if (!win)
+        return;
+    
+    std::lock_guard<std::mutex> lock(ctx->functions_mut);
+    ctx->functions_to_call.push_back([win, width, height]() {
+        zwlr_layer_surface_v1_set_size(win->layer_surface, width, height);
+        wl_surface_commit(win->surface);
+    });
+    ctx->have_functions_to_execute = true;
+    write(ctx->wake_pipe[1], "x", 1);
+};
+
+static void set_popup_size_impl(
+    RawWindow *window,
+    int width,
+    int height,
+    const RawWindowSettings *settings)
+{
+    if (!window || !window->creator)
+        return;
+
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == window->creator->id)
+            ctx = c;
+    if (!ctx)
+        return;
+
+    wl_window *win = nullptr;
+    for (auto w : windows)
+        if (w->id == window->id)
+            win = w;
+    if (!win || !win->xdg_popup || !ctx->wm_base)
+        return;
+
+    const int popup_w = width > 0 ? width : 1;
+    const int popup_h = height > 0 ? height : 1;
+    const bool has_settings = settings != nullptr;
+    const auto updated_popup_positioner = has_settings ? settings->popup : RawWindowSettings::PopupPositioner{};
+    const bool updated_use_fallback_anchor_rect = has_settings ? !settings->popup.use_explicit_anchor_rect : false;
+    const int updated_fallback_anchor_x = has_settings ? settings->pos.x : 0;
+    const int updated_fallback_anchor_y = has_settings ? settings->pos.y : 0;
+
+    std::lock_guard<std::mutex> lock(ctx->functions_mut);
+    ctx->functions_to_call.push_back([
+        ctx,
+        win,
+        popup_w,
+        popup_h,
+        has_settings,
+        updated_popup_positioner,
+        updated_use_fallback_anchor_rect,
+        updated_fallback_anchor_x,
+        updated_fallback_anchor_y
+    ]() {
+        if (!ctx || !win || !win->xdg_popup || !ctx->wm_base)
+            return;
+
+        if (has_settings) {
+            win->popup_positioner = updated_popup_positioner;
+            win->popup_use_fallback_anchor_rect = updated_use_fallback_anchor_rect;
+            win->popup_fallback_anchor_x = updated_fallback_anchor_x;
+            win->popup_fallback_anchor_y = updated_fallback_anchor_y;
+        }
+
+        const uint32_t popup_version = xdg_popup_get_version(win->xdg_popup);
+        if (popup_version >= XDG_POPUP_REPOSITION_SINCE_VERSION) {
+            xdg_positioner *positioner = xdg_wm_base_create_positioner(ctx->wm_base);
+            if (!positioner)
+                return;
+
+            apply_popup_positioner_settings(positioner, win, popup_w, popup_h);
+            xdg_popup_reposition(win->xdg_popup, positioner, popup_reposition_token++);
+            xdg_positioner_destroy(positioner);
+        }
+
+        win->pending_width = popup_w;
+        win->pending_height = popup_h;
+        wl_window_resize_buffer(win, popup_w, popup_h);
+        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+        wl_surface_commit(win->surface);
+    });
+    ctx->have_functions_to_execute = true;
+    write(ctx->wake_pipe[1], "x", 1);
+}
+
+void windowing::set_popup_size(RawWindow *window, int width, int height) {
+    set_popup_size_impl(window, width, height, nullptr);
+}
+
+void windowing::set_popup_size(RawWindow *window, int width, int height, const RawWindowSettings &settings) {
+    set_popup_size_impl(window, width, height, &settings);
+}
+
+bool windowing::has_window(RawWindow *window) {
+    for (auto w : windows)
+        if (w->rw == window)
+            return true;
+    return false;
+}
+
+bool windowing::close_window(RawWindow *window) {
+    bool found = false;
+    for (auto w : windows)
+        if (w->rw == window)
+            found = true;
+    if (!found)
+        return false;
+ 
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == window->creator->id)
+            ctx = c;
+    if (!ctx)
+        return false;
+    wl_window *win = nullptr;
+    for (auto w : windows)
+        if (w->id == window->id)
+            win = w;
+    if (!win)
+        return false;
+    win->marked_for_closing = true;
+    write(ctx->wake_pipe[1], "x", 1);
+    return true;
+}
+
+void windowing::close_app(RawApp *app) {
+    if (!app)
+        return;
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == app->id)
+            ctx = c;
+    if (!ctx)
+        return;
+
+    // This can be called from another thread.  Set the stop flag *before*
+    // touching any windows: otherwise the event thread can wake between
+    // close_window() calls and dispatch a queued Wayland callback for an
+    // object that is in the middle of being torn down.  main_loop() owns the
+    // actual Wayland destruction after it observes this flag.
+    {
+        std::lock_guard<std::recursive_mutex> lock(ctx->dispatch_mut);
+        ctx->running = false;
+    }
+    write(ctx->wake_pipe[1], "x", 1);
+}
+
+void RawApp::update_monitor_information() {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == id)
+            ctx = c;
+
+    monitor_names.clear();
+    
+    for (auto o : ctx->outputs) {
+        monitor_names.push_back({o->id, o->name, o->physical_width, o->physical_height});
+    }
+}
+
+void RawApp::print_monitors() {
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == id)
+            ctx = c;
+    
+    //notify(fz("{}", ctx->outputs.size())); 
+    for (auto o : ctx->outputs) {
+        //notify(fz("{} {} {}", o->name, o->physical_width, o->physical_height)); 
+    }
+}
+
+// returns file descriptor takes the function that will be called after ms time
+int windowing::timer(RawApp *app, int ms, std::function<void(void *data)> actual_function, void *data) {
+    if (!app)
+        return -1;
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == app->id)
+            ctx = c;
+    if (!ctx)
+        return -1;
+    PolledFunction pf;
+    pf.fd = create_timerfd_ms(ms);
+    pf.data = data;
+    pf.func = [ctx, actual_function](PolledFunction f) {
+        for (int i = 0; i < ctx->polled_fds.size(); i++) {
+            if (ctx->polled_fds[i].fd == f.fd) {
+                close(f.fd);
+                ctx->polled_fds.erase(ctx->polled_fds.begin() + i);
+                break;
+            }
+        }
+        if (actual_function)
+            actual_function(f.data);
+    };
+    ctx->polled_fds.push_back(pf);
+
+    return pf.fd;
+}
+
+// updates the file descriptor to pop in ms amount of time
+void windowing::timer_update(int fd, int ms) {
+    if (fd == -1)
+        return;
+    timerfd_update(fd, ms);
+}
+
+void windowing::timer_stop(RawApp *app, int fd) {
+   if (fd == -1)
+        return;
+   if (!app)
+        return;
+    wl_context *ctx = nullptr;
+    for (auto c : apps)
+        if (c->id == app->id)
+            ctx = c;
+    if (!ctx)
+        return;
+    for (int i = 0; i < ctx->polled_fds.size(); i++) {
+        if (ctx->polled_fds[i].fd == fd) {
+            close(fd);
+            ctx->polled_fds.erase(ctx->polled_fds.begin() + i);
+            break;
+        }
+    }
+}
