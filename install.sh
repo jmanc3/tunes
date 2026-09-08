@@ -4,8 +4,8 @@
 set -e
 
 #make and enter the build directory if it doesn't exist already
-mkdir -p installbuild
-cd installbuild
+mkdir -p ibuild
+cd ibuild
 
 #let cmake find dependencies on system
 # NEEDS TO BE SUDO SO IT CAN INSTALL RESOURCES

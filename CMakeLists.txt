@@ -38,6 +38,7 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
     libpulse
     gtk+-3.0
     libmagic
+    taglib
 )
 
 target_link_libraries(tunes PRIVATE PkgConfig::DEPS)

@@ -30,7 +30,8 @@ PKGS := \
 	libpipewire-0.3 \
 	libpulse \
 	gtk+-3.0 \
-	libmagic
+	libmagic \
+	taglib
 
 CPPFLAGS := -Iinclude $(shell pkg-config --cflags $(PKGS))
 CFLAGS := -std=c11
@@ -58,4 +59,3 @@ $(TARGET): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(TARGET)
-

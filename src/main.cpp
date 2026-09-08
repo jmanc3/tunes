@@ -4,6 +4,7 @@
 #include "player.h"
 #include "client/windowing.h"
 #include "utility.h"
+#include "audio_data.h"
 
 #include <chrono>
 #include <filesystem>
@@ -263,33 +264,10 @@ static void fill_root(Container *root) {
         c->real_bounds = b;
         c->wanted_bounds = b;
     };
-    
-    const char* home = std::getenv("HOME");
-    if (!home) {
-        throw std::runtime_error("HOME environment variable not set");
-    }
 
-    // Target path
-    std::filesystem::path path = std::filesystem::path(home) / "Music";
-
-    struct Possible {
-        fs::path path;
-        bool is_audio = false;
-    };
-
-    std::vector<Possible> possible_files;
-    for (auto const& entry : fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied))
-        if (entry.is_regular_file())
-            possible_files.push_back({entry, false});
-
-    for (auto& file : possible_files)
-        file.is_audio = is_audio(file.path);
-
-    for (auto& file : possible_files) {
-        if (file.is_audio) {
-            //std::cout << file.path.string() << std::endl;
-            add_option(root, file.path);
-        }
+    const auto playable = load_library();
+    for (auto& option : playable) {
+        add_option(root, option.full);
     }
 }
 
@@ -319,147 +297,4 @@ int main() {
     cleanup_cached_fonts();
     
     return 0;
-    /*
-
-    // Queue an album.
-    player.queue() = {
-        "/home/jmanc3/speak.flac",
-        "/home/jmanc3/breathe.flac",
-    };
-
-    // Start playing song_01.
-    if (!player.start()) {
-        std::cerr << "Failed to start: "
-                  << player.last_error() << '\n';
-        return 1;
-    }
-
-    player.set_volume(0.8f);
-
-    std::cout << "Commands:\n"
-              << "  p          pause/resume\n"
-              << "  s          stop\n"
-              << "  r          restart current song\n"
-              << "  h          seek halfway\n"
-              << "  f          force-play single\n"
-              << "  0-9        play queued item\n"
-              << "  q          quit\n";
-
-    bool paused = false;
-
-    while (true) {
-        std::cout
-            << "\nPlaying: " << player.current_path()
-            << "\nTime: "
-            << player.current_time_seconds()
-            << " / "
-            << player.total_time_seconds()
-            << "\nQueue index: "
-            << player.current_index()
-            << "\n> ";
-
-        std::string command;
-        std::getline(std::cin, command);
-
-        if (command == "q") {
-            break;
-        }
-
-        if (command == "p") {
-            if (player.is_playing()) {
-                player.pause();
-                paused = true;
-            } else {
-                player.start();
-                paused = false;
-            }
-        }
-
-        else if (command == "s") {
-            player.stop();
-        }
-
-        else if (command == "r") {
-            player.seek_to_start();
-        }
-
-        else if (command == "m") {
-            // Seek to 50% through current song.
-            player.seek(0.5f);
-        }
-
-        else if (command == "l") {
-            // Seek to 50% through current song.
-            player.seek_relative_seconds(10);
-        }
-
-
-        else if (command == "h") {
-            // Seek to 50% through current song.
-            player.seek_relative_seconds(-10);
-        }
-
-        else if (command == "f") {
-            // Imagine the user clicked a single from somewhere else
-            // while listening to the album.
-            //
-            // If song_01 is currently playing:
-            //
-            // Before:
-            //   song_01
-            //   song_02
-            //   song_03
-            //   song_04
-            //
-            // After:
-            //   song_01
-            //   random_single
-            //   song_02
-            //   song_03
-            //   song_04
-            //
-            // random_single starts IMMEDIATELY.
-            // When it finishes, song_02 plays next.
-
-            if (!player.play_track("/home/jmanc3/time.flac")) {
-                std::cerr
-                    << "Could not force-play track: "
-                    << player.last_error()
-                    << '\n';
-            }
-
-            std::cout << "\nQueue is now:\n";
-
-            for (std::size_t i = 0; i < player.queue().size(); ++i) {
-                std::cout
-                    << i << ": "
-                    << player.queue()[i];
-
-                if (i == player.current_index())
-                    std::cout << "  <-- PLAYING";
-
-                std::cout << '\n';
-            }
-        }
-
-        else if (
-            command.size() == 1 &&
-            command[0] >= '0' &&
-            command[0] <= '9'
-        ) {
-            const std::size_t index =
-                static_cast<std::size_t>(command[0] - '0');
-
-            if (!player.play_queued_item(index)) {
-                std::cerr
-                    << "Could not play queue item: "
-                    << player.last_error()
-                    << '\n';
-            }
-        }
-    }
-
-    player.stop();
-    return 0;
-    */
 }
