@@ -466,7 +466,7 @@ std::vector<Option> load_library() {
     const char *home = getenv("HOME");
     if (!home)
         return options;
-    const std::string cache_path = std::string(home) + "/.cache/tunes.cache";
+    const std::string cache_path = std::string(home) + "/.cache/tunes/tunes.cache";
     try {
         if (std::filesystem::exists(cache_path))
             load_from_cache(cache_path, options);
@@ -502,97 +502,113 @@ static std::string get_extension_from_mime(const std::string& mime) {
     return (it != mimeToExt.end()) ? it->second : ".bin";
 }
 
-bool extract_album_art(const std::string& filePath, const std::string& outputBase) {
-    TagLib::FileRef ref(filePath.c_str());
-    if (!ref.file() || !ref.file()->isValid()) {
-        std::cerr << "Invalid or unsupported file: " << filePath << std::endl;
-        return false;
-    }
+EmbeddedArtwork read_album_art(const std::string& filePath) {
+    TagLib::FileRef ref(filePath.c_str(), false);
+    if (!ref.file() || !ref.file()->isValid())
+        return {};
 
-    std::string extension = ".bin";
     TagLib::ByteVector imageData;
     std::string mime;
+    bool selected_front = false;
+    auto consider = [&](const TagLib::ByteVector &bytes, const std::string &type, bool front) {
+        if (!bytes.isEmpty() && (imageData.isEmpty() || (front && !selected_front) ||
+            (front == selected_front && bytes.size() > imageData.size()))) {
+            imageData = bytes;
+            mime = type;
+            selected_front = front;
+        }
+    };
 
-    // Try MP3 (ID3v2)
-    if (auto* mpeg = dynamic_cast<TagLib::MPEG::File*>(ref.file())) {
-        auto* id3 = mpeg->ID3v2Tag();
-        if (id3) {
-            auto frames = id3->frameListMap()["APIC"];
-            if (!frames.isEmpty()) {
-                auto* pic = dynamic_cast<TagLib::ID3v2::AttachedPictureFrame*>(frames.front());
-                if (pic) {
-                    imageData = pic->picture();
-                    mime = pic->mimeType().to8Bit(true);
-                }
+    // Open the audio file once, without reading its audio properties. Prefer a
+    // front cover over other artwork, and preserve the encoded image verbatim.
+    if (auto *mpeg = dynamic_cast<TagLib::MPEG::File *>(ref.file())) {
+        if (auto *tag = mpeg->ID3v2Tag()) {
+            for (auto *frame : tag->frameListMap()["APIC"]) {
+                if (auto *pic = dynamic_cast<TagLib::ID3v2::AttachedPictureFrame *>(frame))
+                    consider(pic->picture(), pic->mimeType().to8Bit(true),
+                             pic->type() == TagLib::ID3v2::AttachedPictureFrame::FrontCover);
             }
         }
-    }
-
-    // Try FLAC
-    if (imageData.isEmpty()) {
-        TagLib::FLAC::File flac(filePath.c_str());
-        if (flac.isValid()) {
-            auto pics = flac.pictureList();
-            if (!pics.isEmpty()) {
-                auto* pic = pics.front();
-                if (pic) {
-                    imageData = pic->data();
-                    mime = pic->mimeType().to8Bit(true);
-                }
-            }
+    } else if (auto *flac = dynamic_cast<TagLib::FLAC::File *>(ref.file())) {
+        for (auto *pic : flac->pictureList())
+            consider(pic->data(), pic->mimeType().to8Bit(true), pic->type() == TagLib::FLAC::Picture::FrontCover);
+    } else if (auto *mp4 = dynamic_cast<TagLib::MP4::File *>(ref.file())) {
+        if (auto *tag = mp4->tag(); tag && tag->itemMap().contains("covr")) {
+            for (const auto &art : tag->itemMap()["covr"].toCoverArtList())
+                consider(art.data(), art.format() == TagLib::MP4::CoverArt::PNG ? "image/png" : "image/jpeg", true);
         }
+    } else if (auto *xiph = dynamic_cast<TagLib::Ogg::XiphComment *>(ref.file()->tag())) {
+        for (auto *pic : xiph->pictureList())
+            consider(pic->data(), pic->mimeType().to8Bit(true), pic->type() == TagLib::FLAC::Picture::FrontCover);
     }
 
-    // Try MP4/M4A
-    if (imageData.isEmpty()) {
-        TagLib::MP4::File mp4(filePath.c_str());
-        if (mp4.isValid()) {
-            auto tag = mp4.tag();
-            if (tag && tag->itemMap().contains("covr")) {
-                const auto covr = tag->itemMap()["covr"].toCoverArtList();
-                if (!covr.isEmpty()) {
-                    const auto& art = covr.front();
-                    imageData = art.data();
-                    mime = art.format() == TagLib::MP4::CoverArt::PNG ? "image/png" : "image/jpeg";
-                }
-            }
-        }
-    }
+    if (imageData.isEmpty())
+        return {};
+    const auto *bytes = reinterpret_cast<const unsigned char *>(imageData.data());
+    return {{bytes, bytes + imageData.size()}, get_extension_from_mime(mime)};
+}
 
-
-    // Try OGG Vorbis/Opus
-    if (imageData.isEmpty()) {
-        TagLib::Ogg::Vorbis::File ogg(filePath.c_str());
-        if (ogg.isValid()) {
-            auto tag = ogg.tag();
-            auto xiph = dynamic_cast<TagLib::Ogg::XiphComment*>(tag);
-            if (xiph && xiph->pictureList().size() > 0) {
-                auto* pic = xiph->pictureList().front();
-                if (pic) {
-                    imageData = pic->data();
-                    mime = pic->mimeType().to8Bit(true);
-                }
-            }
-        }
-    }
-
-
-    if (imageData.isEmpty()) {
-        std::cerr << "No album art found in file: " << filePath << std::endl;
+bool extract_album_art(const std::string& filePath, const std::string& outputBase) {
+    const auto art = read_album_art(filePath);
+    if (art.bytes.empty())
         return false;
-    }
-
-    extension = get_extension_from_mime(mime);
-    std::string outputPath = outputBase + extension;
-
-    std::ofstream outFile(outputPath, std::ios::binary);
-    if (!outFile) {
-        std::cerr << "Failed to write to: " << outputPath << std::endl;
-        return false;
-    }
-
-    outFile.write(imageData.data(), imageData.size());
+    std::ofstream outFile(outputBase + art.extension, std::ios::binary);
+    outFile.write(reinterpret_cast<const char *>(art.bytes.data()), art.bytes.size());
     outFile.close();
-
     return static_cast<bool>(outFile);
+}
+
+std::vector<AlbumOption> to_albums(std::vector<Option> &playable) {
+    struct DiscFolders {
+        std::unordered_map<int, std::string> disc_owners;
+        std::string first_folder;
+        bool has_multiple_folders = false;
+        bool valid = true;
+    };
+    std::unordered_map<std::string, std::unordered_map<std::string, DiscFolders>> sibling_albums;
+    for (const auto &option : playable) {
+        const auto folder = std::filesystem::path(option.full).lexically_normal().parent_path();
+        const std::string album = option.album.empty() ? "Unknown" : option.album;
+        auto &siblings = sibling_albums[folder.parent_path().string()][album];
+        const auto folder_name = folder.string();
+        if (siblings.first_folder.empty())
+            siblings.first_folder = folder_name;
+        else if (siblings.first_folder != folder_name)
+            siblings.has_multiple_folders = true;
+
+        int disc = 0;
+        std::istringstream disc_tag(option.disc);
+        if (!(disc_tag >> disc) || disc <= 0) {
+            siblings.valid = false;
+            continue;
+        }
+        auto [it, inserted] = siblings.disc_owners.try_emplace(disc, folder_name);
+        if (!inserted && it->second != folder_name)
+            siblings.valid = false;
+    }
+
+    std::vector<AlbumOption> album_options;
+    std::unordered_map<std::string, std::unordered_map<std::string, std::size_t>> album_indices;
+
+    for (const auto &option : playable) {
+        const std::string album = option.album.empty() ? "Unknown" : option.album;
+        auto folder = std::filesystem::path(option.full).lexically_normal().parent_path();
+        const auto &siblings = sibling_albums.at(folder.parent_path().string()).at(album);
+        // Combine sibling folders only when their disc numbers do not overlap.
+        if (siblings.valid && siblings.has_multiple_folders)
+            folder = folder.parent_path();
+        auto &folder_albums = album_indices[folder.string()];
+        auto [it, inserted] = folder_albums.try_emplace(album, album_options.size());
+        if (inserted)
+            album_options.emplace_back();
+
+        auto &songs = album_options[it->second].songs;
+        songs.push_back(option);
+        if (option.album.empty()) {
+            songs.back().album = album;
+            songs.back().album_all_lower = toLower(album);
+        }
+    }
+
+    return album_options;
 }

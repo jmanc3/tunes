@@ -5,6 +5,7 @@
 #include "client/windowing.h"
 #include "utility.h"
 #include "audio_data.h"
+#include "album_art.h"
 
 #include <chrono>
 #include <charconv>
@@ -21,6 +22,7 @@
 #include <pango/pango-types.h>
 #include <pango/pangocairo.h>
 #include <cmath>
+#include <gdk/gdk.h>
 
 
 static std::string mylar_font = "Segoe UI";
@@ -49,9 +51,40 @@ bool is_audio(const std::filesystem::path& path) {
     return audio;
 }
 
+struct ArtRefresh {
+    RawApp *app = nullptr;
+    RawWindow *window = nullptr;
+    std::weak_ptr<AlbumArtCache> cache;
+    int timer = -1;
+};
+
+// Workers publish only immutable images. Window access and redraws stay on the
+// event thread, with one coalesced refresh while artwork jobs are outstanding.
+static void poll_artwork(const std::shared_ptr<ArtRefresh> &refresh) {
+    if (refresh->timer >= 0 || !refresh->app)
+        return;
+    refresh->timer = windowing::timer(refresh->app, 16, [refresh](void *) {
+        refresh->timer = -1;
+        auto cache = refresh->cache.lock();
+        if (!cache || !windowing::has_window(refresh->window))
+            return;
+        // Read pending first: the last worker publishes its change before
+        // decrementing the job count, so its final redraw cannot be lost.
+        const bool pending = cache->pending();
+        if (cache->take_changed())
+            windowing::redraw(refresh->window);
+        if (pending)
+            poll_artwork(refresh);
+    }, nullptr);
+}
+
 struct RootData : UserData {
     RawApp *app = nullptr;
     MylarWindow *window = nullptr;
+    std::shared_ptr<AlbumArtCache> artwork;
+    std::shared_ptr<ArtRefresh> artwork_refresh;
+    std::size_t album_first = 0;
+    std::size_t album_end = 0;
 };
 
 struct CachedFont {
@@ -184,7 +217,94 @@ static void paint_button_bg(Container *root, Container *c) {
 
 constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
 
-static void add_option(Container *parent, const Option &option) {
+struct AlbumData : UserData {
+    AlbumOption album;
+    std::string name;
+    std::string artist;
+    AlbumArtCache::Handle art;
+};
+
+static void add_album(Container *parent, const AlbumOption &option) {
+    if (option.songs.empty())
+        return;
+    auto data = new AlbumData;
+    data->album = option;
+    std::vector<std::string> tracks;
+    tracks.reserve(option.songs.size());
+    for (const auto &song : option.songs)
+        tracks.push_back(song.full);
+    data->art = static_cast<RootData *>(parent->user_data)->artwork->create(std::move(tracks));
+    data->name = option.songs.front().album.empty() ? "Unknown" : option.songs.front().album;
+    data->artist = option.songs.front().artist;
+    for (const auto &song : option.songs) {
+        if (song.artist != data->artist) {
+            data->artist = "Various Artists";
+            break;
+        }
+    }
+    if (data->artist.empty())
+        data->artist = "Unknown Artist";
+
+    auto c = parent->child(FILL_SPACE, FILL_SPACE);
+    c->user_data = data;
+    c->exists = false;
+    c->when_paint = [](Container *root, Container *c) {
+        auto data = static_cast<AlbumData *>(c->user_data);
+        auto window = static_cast<RootData *>(root->user_data)->window->raw_window;
+        auto cr = window->cr;
+        const double dpi = window->dpi;
+        if (c->real_bounds.intersection(root->real_bounds).empty())
+            return;
+        const auto art = static_cast<RootData *>(root->user_data)->artwork->image(data->art);
+
+        cairo_save(cr);
+        set_rect(cr, root->real_bounds);
+        cairo_clip(cr);
+        set_rect(cr, c->real_bounds);
+        cairo_clip(cr);
+        paint_button_bg(root, c);
+        const double pad = 8 * dpi;
+        const double x = c->real_bounds.x + pad;
+        const double y = c->real_bounds.y + pad;
+        const double size = std::max(0.0, c->real_bounds.w - 2 * pad);
+        cairo_rectangle(cr, x, y, size, size);
+        cairo_set_source_rgb(cr, .9, .91, .93);
+        cairo_fill(cr);
+        if (art && size > 0) {
+            const int width = art->width;
+            const int height = art->height;
+            const double scale = std::min(size / width, size / height);
+            cairo_save(cr);
+            cairo_translate(cr, x + (size - width * scale) / 2, y + (size - height * scale) / 2);
+            cairo_scale(cr, scale, scale);
+            cairo_set_source_surface(cr, art->surface, 0, 0);
+            cairo_paint(cr);
+            cairo_restore(cr);
+        } else {
+            draw_text(cr, x, y + size / 2 - 12 * dpi, "♫", 24 * dpi, true,
+                      mylar_font, size, -1, RGBA(.45, .47, .5, 1), false, PANGO_ALIGN_CENTER);
+        }
+        draw_text(cr, x, y + size + 8 * dpi, data->name, 12 * dpi, true,
+                  mylar_font, size, 20 * dpi * PANGO_SCALE, RGBA(0, 0, 0, 1), true);
+        draw_text(cr, x, y + size + 30 * dpi, data->artist, 10 * dpi, true,
+                  mylar_font, size, 18 * dpi * PANGO_SCALE, RGBA(.4, .4, .4, 1), false);
+        cairo_restore(cr);
+    };
+    c->when_clicked = [](Container *, Container *c) {
+        if (c->state.mouse_button_pressed != BTN_LEFT)
+            return;
+        auto data = static_cast<AlbumData *>(c->user_data);
+        auto &queue = player->queue();
+        queue.clear();
+        for (const auto &song : data->album.songs)
+            queue.push_back(song.full);
+        if (!player->play_queued_item(0))
+            std::cerr << "Album playback failed: " << player->last_error() << '\n';
+    };
+
+}
+
+static void add_song(Container *parent, const Option &option) {
     auto c = parent->child(FILL_SPACE, FILL_SPACE);
     struct OptionData : UserData {
         std::string name;
@@ -248,10 +368,7 @@ static void add_option(Container *parent, const Option &option) {
     };
 }
 
-static void fill_root(Container *root) {
-    namespace fs = std::filesystem;
-
-    root->type = ::vbox;
+static void fill_out_for_songs(Container *root, const std::vector<Option> &playable) {
     root->type = ::fullycustom;
     root->when_paint = [](Container *root, Container *c) {
         auto root_data = (RootData *) root->user_data;
@@ -263,33 +380,108 @@ static void fill_root(Container *root) {
         // windowing::redraw(mylar_window->raw_window);
     };    
     root->receive_events_even_if_obstructed = true;
-    static float yoff = 0;
     root->when_fine_scrolled = [](Container *root, Container *container, double scroll_x, double scroll_y, bool came_from_touchpad) {
-        yoff += scroll_y;
-        yoff += scroll_y;
+        container->scroll_v_real += 2 * scroll_y;
     };
     root->pre_layout = [](Container *root, Container *c, const Bounds &b) {
-        auto root_data = (RootData*) root->user_data;
-        float screen_h = b.h;
-
+        // The vbox pass clamps its own scroll fields while measuring each row.
+        const double scroll_offset = c->scroll_v_real;
+        c->scroll_v_real = 0;
         c->type = ::vbox;
         layout(root, c, b);
         c->type = ::fullycustom;
 
-        float content_h = actual_true_height(c);
-
-        // yoff is 0 at the top and negative while scrolling down.
-        // If content fits on screen, don't allow scrolling at all.
-        float min_yoff = std::min(0.0f, screen_h - content_h);
-        yoff = std::clamp(yoff, min_yoff, 0.0f);
+        const double content_h = reserved_height(c) + c->wanted_pad.y + c->wanted_pad.h;
+        c->scroll_v_real = std::clamp(scroll_offset, std::min(0.0, b.h - content_h), 0.0);
 
         for (auto child : c->children) {
-            modify_all(child, 0, yoff);
+            modify_all(child, 0, c->scroll_v_real);
         }
 
         c->real_bounds = b;
-        c->wanted_bounds = b;
     };
+
+    for (const auto &option : playable)
+        add_song(root, option);
+}
+
+static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> &albums) {
+    auto data = static_cast<RootData *>(root->user_data);
+    data->artwork = std::make_shared<AlbumArtCache>();
+    data->artwork_refresh = std::make_shared<ArtRefresh>();
+    data->artwork_refresh->app = data->app;
+    data->artwork_refresh->window = data->window->raw_window;
+    data->artwork_refresh->cache = data->artwork;
+    root->automatically_paint_children = false;
+    root->type = ::fullycustom;
+    root->clip = true;
+    root->receive_events_even_if_obstructed = true;
+    root->when_paint = [](Container *root, Container *c) {
+        auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->cr;
+        set_rect(cr, c->real_bounds);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_fill(cr);
+        const auto data = static_cast<RootData *>(root->user_data);
+        for (auto i = data->album_first; i < data->album_end; ++i) {
+            auto child = c->children[i];
+            if (child->exists)
+                child->when_paint(root, child);
+        }
+    };
+    root->when_fine_scrolled = [](Container *, Container *c, double, double scroll_y, bool) {
+        c->scroll_v_real += 2 * scroll_y;
+    };
+    root->pre_layout = [](Container *root, Container *c, const Bounds &b) {
+        auto data = static_cast<RootData *>(root->user_data);
+        const double dpi = data->window->raw_window->dpi;
+        const double pad = std::min(16 * dpi, std::max(0.0, b.w / 2));
+        const double gap = 16 * dpi;
+        const double width = std::max(0.0, b.w - 2 * pad);
+        const double card_w = std::min(192 * dpi, width);
+        const double card_h = card_w + 56 * dpi;
+        const auto columns = std::max<std::size_t>(1, std::floor((width + gap) / (card_w + gap)));
+        // Share remaining width across the outer margins and every column gap.
+        const double column_gap = std::max(0.0, b.w - columns * card_w) / (columns + 1);
+        const auto rows = (c->children.size() + columns - 1) / columns;
+        const double content_h = rows ? 2 * pad + rows * card_h + (rows - 1) * gap : 0;
+        c->scroll_v_real = std::clamp(c->scroll_v_real, std::min(0.0, b.h - content_h), 0.0);
+        // Lay out and preload the viewport plus one row on either side.
+        // Paint and image requests now scale with visible cards, not library size.
+        const double row_h = card_h + gap;
+        const auto first_row = static_cast<std::size_t>(std::max(0.0,
+            std::floor((-c->scroll_v_real - pad) / row_h) - 1));
+        const auto end_row = static_cast<std::size_t>(std::max(0.0,
+            std::ceil((b.h - c->scroll_v_real - pad) / row_h) + 1));
+        const auto first = std::min(c->children.size(), first_row * columns);
+        const auto end = std::min(c->children.size(), end_row * columns);
+        for (auto i = data->album_first; i < data->album_end; ++i) {
+            if (i >= first && i < end)
+                continue;
+            auto child = c->children[i];
+            child->exists = false;
+            data->artwork->release(static_cast<AlbumData *>(child->user_data)->art);
+        }
+        data->album_first = first;
+        data->album_end = end;
+        for (auto i = first; i < end; ++i) {
+            auto child = c->children[i];
+            layout(root, child, Bounds(
+                b.x + column_gap + (i % columns) * (card_w + column_gap),
+                b.y + pad + (i / columns) * row_h + c->scroll_v_real, card_w, card_h));
+            child->exists = !child->real_bounds.intersection(b).empty();
+            auto art = static_cast<AlbumData *>(child->user_data)->art;
+            if (!child->exists)
+                data->artwork->release(art);
+            data->artwork->request(art, child->exists ? std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi))) : 0);
+        }
+        if (data->artwork->pending() || data->artwork->take_changed())
+            poll_artwork(data->artwork_refresh);
+    };
+    for (const auto &album : albums)
+        add_album(root, album);
+}
+
+static void fill_root(Container *root) {
 
     auto playable = load_library();
     auto parse_number = [](const std::string &text, int fallback) {
@@ -313,9 +505,9 @@ static void fill_root(Container *root) {
         return std::tie(a.album_all_lower, a.disc_num, a.track_num, a.name, a.full)
              < std::tie(b.album_all_lower, b.disc_num, b.track_num, b.name, b.full);
     });
-    for (auto& option : playable) {
-        add_option(root, option);
-    }
+
+    auto albums = to_albums(playable);
+    fill_out_for_albums(root, albums);
 }
 
 void open_window() {
@@ -333,6 +525,8 @@ void open_window() {
     fill_root(root);
     
     windowing::main_loop(app);
+    delete root; // Cancels queued artwork work and joins the workers before exit.
+    window->root = nullptr;
 }
 
 int main() {

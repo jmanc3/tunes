@@ -43,5 +43,13 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
 
 target_link_libraries(tunes PRIVATE PkgConfig::DEPS)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(tunes_album_art_test tests/album_art_test.cpp src/album_art.cpp)
+    target_include_directories(tunes_album_art_test PRIVATE include)
+    target_link_libraries(tunes_album_art_test PRIVATE PkgConfig::DEPS)
+    add_test(NAME album_art_cache COMMAND tunes_album_art_test)
+endif()
+
 install(TARGETS tunes
         DESTINATION /usr/local/bin/)

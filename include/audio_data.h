@@ -24,9 +24,16 @@ struct AlbumOption {
 };
 
 std::vector<Option> load_library();
+std::vector<AlbumOption> to_albums(std::vector<Option> &playable);
 std::vector<Option> rescan_library(const std::string &music_path, const std::string &cache_path);
 int getDiscNumber(const std::string &filePath);
 std::string seconds_to_mmss(int seconds);
+struct EmbeddedArtwork {
+    std::vector<unsigned char> bytes;
+    std::string extension;
+};
+// Original embedded bytes, without decoding or recompressing the image.
+EmbeddedArtwork read_album_art(const std::string &filePath);
 // Writes embedded artwork to outputBase plus its image extension.
 bool extract_album_art(const std::string &filePath, const std::string &outputBase);
 
