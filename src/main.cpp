@@ -7,6 +7,10 @@
 #include "audio_data.h"
 
 #include <chrono>
+#include <charconv>
+#include <cctype>
+#include <algorithm>
+#include <tuple>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -180,15 +184,37 @@ static void paint_button_bg(Container *root, Container *c) {
 
 constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
 
-static void add_option(Container *parent, std::filesystem::path file) {
+static void add_option(Container *parent, const Option &option) {
     auto c = parent->child(FILL_SPACE, FILL_SPACE);
     struct OptionData : UserData {
         std::string name;
         std::string full_path;
     };
     auto option_data = new OptionData;
-    option_data->name = file.filename();
-    option_data->full_path = file.string();
+    option_data->name = option.name.empty()
+        ? std::filesystem::path(option.full).filename().string()
+        : option.name;
+    auto append_info = [&](const std::string &value, const std::string &label = "") {
+        if (!value.empty())
+            option_data->name += " | " + label + value;
+    };
+    append_info(option.album);
+    if (option.year != "0")
+        append_info(option.year);
+    append_info(option.artist);
+    int duration = 0;
+    const auto [end, error] = std::from_chars(
+        option.length.data(), option.length.data() + option.length.size(), duration);
+    if (error == std::errc{} && end == option.length.data() + option.length.size() && duration >= 0)
+        append_info(seconds_to_mmss(duration));
+    else
+        append_info(option.length);
+    append_info(option.genre);
+    if (option.track != "0")
+        append_info(option.track, "Track ");
+    if (option.disc != "0")
+        append_info(option.disc, "Disc ");
+    option_data->full_path = option.full;
     c->user_data = option_data;
     
     c->pre_layout = [](Container *root, Container *c, const Bounds &b) {
@@ -265,9 +291,30 @@ static void fill_root(Container *root) {
         c->wanted_bounds = b;
     };
 
-    const auto playable = load_library();
+    auto playable = load_library();
+    auto parse_number = [](const std::string &text, int fallback) {
+        int number = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
+        if (error != std::errc{} || number <= 0 ||
+            (end != text.data() + text.size() && *end != '/'))
+            return fallback;
+        return number;
+    };
+    for (auto &option : playable) {
+        option.album_all_lower = option.album;
+        std::transform(option.album_all_lower.begin(), option.album_all_lower.end(),
+                       option.album_all_lower.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        option.disc_num = parse_number(option.disc, 1);
+        option.track_num = parse_number(option.track, std::numeric_limits<int>::max());
+    }
+    std::sort(playable.begin(), playable.end(), [](const Option &a, const Option &b) {
+        return std::tie(a.album_all_lower, a.disc_num, a.track_num, a.name, a.full)
+             < std::tie(b.album_all_lower, b.disc_num, b.track_num, b.name, b.full);
+    });
     for (auto& option : playable) {
-        add_option(root, option.full);
+        add_option(root, option);
     }
 }
 
