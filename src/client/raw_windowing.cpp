@@ -5,6 +5,8 @@
 
 #include <cairo-deprecated.h>
 #include <cstddef>
+#include <chrono>
+#include <cmath>
 #include <wayland-client-core.h>
 #include <wayland-client-protocol.h>
 #include <wayland-cursor.h>
@@ -99,6 +101,7 @@ struct pending_pointer_axis_event {
     bool has_event = false;
     bool has_delta = false;
     double delta = 0.0;
+    uint32_t time = 0;
     bool has_discrete = false;
     int32_t discrete = 0;
     bool has_value120 = false;
@@ -112,6 +115,7 @@ struct pending_pointer_axis_event {
         has_event = false;
         has_delta = false;
         delta = 0.0;
+        time = 0;
         has_discrete = false;
         discrete = 0;
         has_value120 = false;
@@ -131,6 +135,60 @@ struct pending_pointer_frame_event {
     pending_pointer_frame_event() {
         axes[0].axis = WL_POINTER_AXIS_VERTICAL_SCROLL;
         axes[1].axis = WL_POINTER_AXIS_HORIZONTAL_SCROLL;
+    }
+};
+
+// Wayland axis units per second. Raise this to prevent small motions from gliding.
+static constexpr double touchpad_glide_min_velocity = 35.0;
+
+struct pointer_scroll_axis {
+    bool tracking = false;
+    bool coasting = false;
+    uint32_t time = 0;
+    int direction = 0;
+    double velocity = 0.0; // Wayland axis units per second.
+    double pending_delta = 0.0;
+
+    void sample(double delta, uint32_t now) {
+        // A compositor may send axis(0) with axis_stop when fingers lift.
+        // It is a terminator, not a measurement of the release velocity.
+        if (delta == 0.0) return;
+        const uint32_t elapsed = now - time; // Handles Wayland timestamp wraparound.
+        if (!tracking || elapsed > 100) {
+            velocity = 0.0;
+            pending_delta = 0.0;
+        } else if (elapsed == 0) {
+            pending_delta += delta;
+            return;
+        } else {
+            const double speed = (delta + pending_delta) * 1000.0 / elapsed;
+            // Follow reversals immediately; smooth small speed variations over 30 ms.
+            const double weight = 1.0 - std::exp(-static_cast<double>(elapsed) / 30.0);
+            velocity = velocity * speed <= 0.0 ? speed :
+                velocity + weight * (speed - velocity);
+            pending_delta = 0.0;
+        }
+        tracking = true;
+        coasting = false;
+        time = now;
+    }
+
+    void stop(uint32_t now) {
+        coasting = tracking && now - time <= 100 &&
+            std::abs(velocity) >= touchpad_glide_min_velocity;
+        tracking = false;
+        if (!coasting) velocity = 0.0;
+    }
+
+    double advance(double seconds) {
+        if (!coasting) return 0.0;
+        // Integrate exponential friction so distance is independent of timer cadence.
+        constexpr double friction = 4.5;
+        const double decay = std::exp(-friction * seconds);
+        const double delta = velocity * (1.0 - decay) / friction;
+        velocity *= decay;
+        if (std::abs(velocity) < 5.0) coasting = false;
+        return delta;
     }
 };
 
@@ -182,6 +240,10 @@ struct wl_context {
     int key_repeat_delay = 100;
     uint32_t last_pointer_button_serial = 0;
     pending_pointer_frame_event pointer_axis_pending;
+    pointer_scroll_axis pointer_scroll_axes[2];
+    wl_window *pointer_scroll_window = nullptr;
+    int pointer_scroll_timer_fd = -1;
+    std::chrono::steady_clock::time_point pointer_scroll_tick;
 
     std::vector<output *> outputs;
     uint32_t shm_format;
@@ -951,6 +1013,50 @@ struct wl_buffer *create_shm_buffer_with_cairo(struct wl_context *ctx,
 }
 
 /* ---- pointer callbacks ---- */
+static bool pointer_scroll_coasting(wl_context *ctx) {
+    return ctx->pointer_scroll_axes[0].coasting || ctx->pointer_scroll_axes[1].coasting;
+}
+
+static void pointer_scroll_cancel(wl_context *ctx) {
+    timerfd_stop(ctx->pointer_scroll_timer_fd);
+    for (auto &axis : ctx->pointer_scroll_axes) axis = {};
+    ctx->pointer_scroll_window = nullptr;
+}
+
+static void pointer_scroll_tick(wl_context *ctx) {
+    auto w = ctx->pointer_scroll_window;
+    if (!ctx->running || !w || !w->has_pointer_focus || w->marked_for_closing) {
+        pointer_scroll_cancel(ctx);
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - ctx->pointer_scroll_tick).count();
+    ctx->pointer_scroll_tick = now;
+    // Don't deliver a large jump after a stalled event loop.
+    if (seconds > 0.1) {
+        pointer_scroll_cancel(ctx);
+        return;
+    }
+    for (int i = 0; i < 2; ++i) {
+        auto &axis = ctx->pointer_scroll_axes[i];
+        const double delta = axis.advance(seconds);
+        if (delta != 0.0 && w->rw->on_scrolled) {
+            const uint32_t kind = ctx->pointer_axis_pending.axes[i].axis;
+            w->rw->on_scrolled(w->rw, WL_POINTER_AXIS_SOURCE_FINGER, kind,
+                axis.direction, kind == WL_POINTER_AXIS_HORIZONTAL_SCROLL ? -delta : delta,
+                0, false);
+        }
+        if (!ctx->running || w->marked_for_closing) {
+            pointer_scroll_cancel(ctx);
+            return;
+        }
+    }
+    if (w->on_render) w->on_render(w);
+    if (pointer_scroll_coasting(ctx))
+        timerfd_update(ctx->pointer_scroll_timer_fd, 8);
+}
+
 static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
                                  uint32_t serial, struct wl_surface *surface,
                                  wl_fixed_t sx, wl_fixed_t sy) {
@@ -958,6 +1064,7 @@ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
     double dy = wl_fixed_to_double(sy);
     // printf("pointer: enter at %.2f, %.2f\n", dx, dy);
     auto ctx = (wl_context *) data;
+    pointer_scroll_cancel(ctx);
     for (auto w : ctx->windows) {
         if (w->surface == surface) {
             // printf("pointer: enter at %.2f, %.2f for %s\n", dx, dy, w->title.data());
@@ -981,6 +1088,8 @@ static void pointer_handle_leave(void *data, struct wl_pointer *wl_pointer,
                                  uint32_t serial, struct wl_surface *surface) {
     // printf("pointer: leave\n");
     auto ctx = (wl_context *) data;
+    pointer_scroll_cancel(ctx);
+    ctx->pointer_axis_pending = {};
     for (auto w : ctx->windows) {
         if (w->surface == surface) {
             w->has_pointer_focus = false;
@@ -998,6 +1107,7 @@ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
     double dx = wl_fixed_to_double(sx);
     double dy = wl_fixed_to_double(sy);
     auto ctx = (wl_context *) data;
+    pointer_scroll_cancel(ctx);
     auto windows_snapshot = ctx->windows;
     for (auto w : windows_snapshot) {
         if (w->has_pointer_focus) {
@@ -1020,8 +1130,10 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     // printf("pointer: button %u %s\n", button, st);
     //win->marked_for_closing = true;
     auto ctx = (wl_context *) data;
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED)
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        pointer_scroll_cancel(ctx);
         ctx->last_pointer_button_serial = serial;
+    }
 
     auto windows_snapshot = ctx->windows;
     for (auto w : windows_snapshot) {
@@ -1048,7 +1160,8 @@ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
 
     pending->has_event = true;
     pending->has_delta = true;
-    pending->delta = wl_fixed_to_double(value);
+    pending->delta += wl_fixed_to_double(value);
+    pending->time = time;
 }
 
 static void pointer_handle_frame(void *data,
@@ -1056,10 +1169,28 @@ static void pointer_handle_frame(void *data,
     auto ctx = (wl_context *) data;
     auto windows_snapshot = ctx->windows;
 
+    bool has_delta = false;
+    bool has_event = false;
+    for (const auto &pending : ctx->pointer_axis_pending.axes) {
+        has_delta |= pending.has_delta && pending.delta != 0.0;
+        has_event |= pending.has_event;
+    }
+    if ((has_delta && pointer_scroll_coasting(ctx)) ||
+        (has_event && ctx->pointer_axis_pending.has_source &&
+         ctx->pointer_axis_pending.source != WL_POINTER_AXIS_SOURCE_FINGER))
+        pointer_scroll_cancel(ctx);
+
+    const bool was_coasting = pointer_scroll_coasting(ctx);
+
     auto dispatch_axis = [&](pending_pointer_axis_event &pending) {
         if (!pending.has_event) return;
 
+        auto &motion = ctx->pointer_scroll_axes[&pending - ctx->pointer_axis_pending.axes];
         int source = ctx->pointer_axis_pending.has_source ? (int)ctx->pointer_axis_pending.source : (int)WL_POINTER_AXIS_SOURCE_WHEEL;
+        // Some compositors omit source on the frame containing only axis_stop.
+        if (!ctx->pointer_axis_pending.has_source && pending.has_stop &&
+            (!pending.has_delta || pending.delta == 0.0) && motion.tracking)
+            source = WL_POINTER_AXIS_SOURCE_FINGER;
         int direction = pending.has_relative_direction ? (int)pending.relative_direction : 0;
         double delta = pending.has_delta ? pending.delta : 0.0;
         int discrete = 0;
@@ -1072,7 +1203,15 @@ static void pointer_handle_frame(void *data,
                      source == WL_POINTER_AXIS_SOURCE_WHEEL_TILT;
 
         for (auto w : windows_snapshot) {
-            if (!w->has_pointer_focus) continue;
+            if (!w->has_pointer_focus || w->marked_for_closing) continue;
+            if (source == WL_POINTER_AXIS_SOURCE_FINGER) {
+                ctx->pointer_scroll_window = w;
+                if (pending.has_relative_direction) motion.direction = direction;
+                if (pending.has_delta) motion.sample(delta, pending.time);
+                if (pending.has_stop) motion.stop(pending.stop_time);
+            } else {
+                motion = {};
+            }
             if (w->rw->on_scrolled) {
                 if (pending.axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
                     w->rw->on_scrolled(w->rw, source, pending.axis, direction, -delta, discrete, mouse);
@@ -1092,6 +1231,10 @@ static void pointer_handle_frame(void *data,
         dispatch_axis(pending);
     }
     ctx->pointer_axis_pending.has_source = false;
+    if (!was_coasting && pointer_scroll_coasting(ctx) && ctx->pointer_scroll_timer_fd >= 0) {
+        ctx->pointer_scroll_tick = std::chrono::steady_clock::now();
+        timerfd_update(ctx->pointer_scroll_timer_fd, 8);
+    }
 }
 
 static void pointer_handle_axis_source(void *data,
@@ -1380,6 +1523,8 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t 
         if (d->shape_manager && d->pointer)
             d->shape_device = wp_cursor_shape_manager_v1_get_pointer(d->shape_manager, d->pointer);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+        pointer_scroll_cancel(d);
+        d->pointer_axis_pending = {};
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
     }
@@ -1620,6 +1765,8 @@ struct wl_context *wl_context_create(void) {
 
 void wl_window_destroy(struct wl_window *win) {
     if (!win) return;
+    if (win->ctx->pointer_scroll_window == win)
+        pointer_scroll_cancel(win->ctx);
 
     if (win->xdg_popup) xdg_popup_destroy(win->xdg_popup);
     if (win->xdg_toplevel) xdg_toplevel_destroy(win->xdg_toplevel);
@@ -1723,6 +1870,21 @@ void windowing::main_loop(RawApp *app) {
             timerfd_update(pf.fd, interval_ms);
         };
         ctx->polled_fds.push_back(repeat_pf);
+    }
+
+    ctx->pointer_scroll_timer_fd = create_timerfd_ms(0);
+    timerfd_stop(ctx->pointer_scroll_timer_fd);
+    if (ctx->pointer_scroll_timer_fd >= 0) {
+        PolledFunction scroll_pf;
+        scroll_pf.fd = ctx->pointer_scroll_timer_fd;
+        scroll_pf.name = "touchpad momentum";
+        scroll_pf.func = [ctx](PolledFunction pf) {
+            std::lock_guard<std::recursive_mutex> lock(ctx->dispatch_mut);
+            uint64_t expirations = 0;
+            if ((pf.revents & POLLIN) && read(pf.fd, &expirations, sizeof expirations) > 0)
+                pointer_scroll_tick(ctx);
+        };
+        ctx->polled_fds.push_back(scroll_pf);
     }
 
     while (ctx->running) {

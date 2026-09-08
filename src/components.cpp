@@ -334,12 +334,12 @@ public:
 
 void fine_scrollpane_scrolled(Container *root,
                               Container *container,
-                              int scroll_x,
-                              int scroll_y,
+                              double scroll_x,
+                              double scroll_y,
                               bool came_from_touchpad) {
     auto scroll = (ScrollContainer *) container;
     if (bounds_contains(scroll->bottom->real_bounds, root->mouse_current_x, root->mouse_current_y)) {
-        float temp = scroll_y;
+        double temp = scroll_y;
         scroll_y = scroll_x;
         scroll_x = temp;
     }

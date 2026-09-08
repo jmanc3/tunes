@@ -237,7 +237,7 @@ static void fill_root(Container *root) {
     };    
     root->receive_events_even_if_obstructed = true;
     static float yoff = 0;
-    root->when_fine_scrolled = [](Container *root, Container *container, int scroll_x, int scroll_y, bool came_from_touchpad) {
+    root->when_fine_scrolled = [](Container *root, Container *container, double scroll_x, double scroll_y, bool came_from_touchpad) {
         yoff += scroll_y;
         yoff += scroll_y;
     };
