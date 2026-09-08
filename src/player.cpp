@@ -22,9 +22,8 @@ constexpr ma_format format = ma_format_f32;
 constexpr ma_uint32 channels = 2;
 constexpr ma_uint32 sample_rate = 48000;
 constexpr ma_uint64 max_chunk = 4096;
-
-constexpr double pause_fade_ms = 230.0;
-constexpr ma_uint64 transport_fade_frames =
+constexpr double pause_fade_ms = 5.0;
+constexpr ma_uint64 pause_fade_frames =
     static_cast<ma_uint64>(sample_rate * pause_fade_ms / 1000.0);
 
 constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
@@ -221,26 +220,28 @@ struct Player::Impl {
         const float volume_gain = volume.load(std::memory_order_relaxed);
 
         for (ma_uint32 frame = 0; frame < frame_count; ++frame) {
-            float transport_gain = transport_gain_current;
+            float transport_gain = pause_gain;
 
-            if (transport_fade_direction != 0 && transport_fade_remaining != 0) {
-                const float remaining =
-                    static_cast<float>(transport_fade_remaining) /
-                    static_cast<float>(transport_fade_frames);
+            if (pause_fade_direction != 0 && pause_fade_remaining != 0) {
+                if (pause_fade_direction < 0) {
+                    transport_gain =
+                        static_cast<float>(pause_fade_remaining) /
+                        static_cast<float>(pause_fade_frames);
+                } else {
+                    transport_gain =
+                        1.0f -
+                        static_cast<float>(pause_fade_remaining) /
+                        static_cast<float>(pause_fade_frames);
+                }
 
-                transport_gain = transport_fade_direction < 0
-                    ? remaining
-                    : 1.0f - remaining;
+                --pause_fade_remaining;
 
-                --transport_fade_remaining;
+                if (pause_fade_remaining == 0) {
+                    pause_gain = pause_fade_direction < 0 ? 0.0f : 1.0f;
+                    pause_fade_direction = 0;
 
-                if (transport_fade_remaining == 0) {
-                    transport_gain_current =
-                        transport_fade_direction < 0 ? 0.0f : 1.0f;
-                    transport_fade_direction = 0;
-
-                    if (transport_gain_current == 0.0f) {
-                        fade_out_complete = true;
+                    if (pause_gain == 0.0f) {
+                        pause_fade_out_complete = true;
                         cv.notify_all();
                     }
                 }
@@ -650,16 +651,24 @@ struct Player::Impl {
         }
     }
 
-    bool start_device() {
+    bool start_device(bool fade_in = false) {
         if (!device_initialized)
             return false;
 
         {
             std::lock_guard<std::mutex> lock(mutex);
-            transport_gain_current = 0.0f;
-            transport_fade_direction = 1;
-            transport_fade_remaining = transport_fade_frames;
-            fade_out_complete = false;
+
+            pause_fade_out_complete = false;
+
+            if (fade_in && pause_fade_frames != 0) {
+                pause_gain = 0.0f;
+                pause_fade_direction = 1;
+                pause_fade_remaining = pause_fade_frames;
+            } else {
+                pause_gain = 1.0f;
+                pause_fade_direction = 0;
+                pause_fade_remaining = 0;
+            }
         }
 
         if (ma_device_start(&device) != MA_SUCCESS) {
@@ -671,21 +680,37 @@ struct Player::Impl {
         return true;
     }
 
-    void pause_device() {
+    void stop_device_raw() {
         if (!device_initialized ||
             !playing.load(std::memory_order_acquire)) {
             return;
         }
 
-        {
+        ma_device_stop(&device);
+        playing.store(false, std::memory_order_release);
+
+        std::lock_guard<std::mutex> lock(mutex);
+        pause_gain = 1.0f;
+        pause_fade_direction = 0;
+        pause_fade_remaining = 0;
+        pause_fade_out_complete = false;
+    }
+
+    void pause_device_with_fade() {
+        if (!device_initialized ||
+            !playing.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        if (pause_fade_frames != 0) {
             std::unique_lock<std::mutex> lock(mutex);
 
-            transport_fade_direction = -1;
-            transport_fade_remaining = transport_fade_frames;
-            fade_out_complete = false;
+            pause_fade_out_complete = false;
+            pause_fade_direction = -1;
+            pause_fade_remaining = pause_fade_frames;
 
             cv.wait(lock, [&] {
-                return fade_out_complete;
+                return pause_fade_out_complete || quitting;
             });
         }
 
@@ -716,15 +741,22 @@ struct Player::Impl {
             }
         }
 
-        return start_device();
+        const bool fade_in = resume_after_pause;
+        resume_after_pause = false;
+        return start_device(fade_in);
     }
 
     void pause() {
-        pause_device();
+        if (!playing.load(std::memory_order_acquire))
+            return;
+
+        pause_device_with_fade();
+        resume_after_pause = true;
     }
 
     void stop() {
-        pause_device();
+        stop_device_raw();
+        resume_after_pause = false;
 
         std::lock_guard<std::mutex> lock(mutex);
 
@@ -743,7 +775,7 @@ struct Player::Impl {
 
         const bool was_playing = playing.load(std::memory_order_acquire);
         if (was_playing)
-            pause_device();
+            stop_device_raw();
 
         bool ok = false;
 
@@ -837,7 +869,7 @@ struct Player::Impl {
 
         const bool was_playing = playing.load(std::memory_order_acquire);
         if (was_playing)
-            pause_device();
+            stop_device_raw();
 
         bool ok = false;
 
@@ -859,7 +891,36 @@ struct Player::Impl {
             return false;
         }
 
+        // Selecting a different track is always a raw start, even if the
+        // previous track had been paused with a resume fade pending.
+        resume_after_pause = false;
         return start_device();
+    }
+
+    bool play_next(const std::vector<std::string>& editable_queue) {
+        std::size_t index = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+
+            if (current_decoder && current_index != no_index)
+                index = current_index + 1;
+        }
+
+        if (index >= editable_queue.size()) {
+            set_error("There is no next queued track.");
+            return false;
+        }
+
+        // Manual next-track switching fades out only the currently audible
+        // track to avoid a discontinuity/click. The next track itself starts
+        // raw at full transport gain -- there is intentionally no fade-in.
+        if (playing.load(std::memory_order_acquire)) {
+            pause_device_with_fade();
+            resume_after_pause = false;
+        }
+
+        return play_queue_index(editable_queue, index);
     }
 
     void queue_changed(const std::vector<std::string>& editable_queue) {
@@ -884,7 +945,7 @@ struct Player::Impl {
 
         const bool was_playing = playing.load(std::memory_order_acquire);
         if (was_playing)
-            pause_device();
+            stop_device_raw();
 
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1040,10 +1101,13 @@ struct Player::Impl {
     std::atomic<float> volume{1.0f};
     std::atomic<bool> playing{false};
 
-    float transport_gain_current = 1.0f;
-    int transport_fade_direction = 0;
-    ma_uint64 transport_fade_remaining = 0;
-    bool fade_out_complete = false;
+    // Pause/resume is the only manual transport operation that ramps audio.
+    // Track changes, seeks, first starts and explicit queue jumps are raw cuts.
+    float pause_gain = 1.0f;
+    int pause_fade_direction = 0;
+    ma_uint64 pause_fade_remaining = 0;
+    bool pause_fade_out_complete = false;
+    bool resume_after_pause = false;
 
     std::string error;
 };
@@ -1101,6 +1165,10 @@ float Player::seek_position() const {
 
 bool Player::play_queued_item(std::size_t index) {
     return impl_->play_queue_index(queue_, index);
+}
+
+bool Player::play_next() {
+    return impl_->play_next(queue_);
 }
 
 bool Player::play_track(const std::string& path) {

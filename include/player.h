@@ -24,12 +24,13 @@ public:
     void queue_changed();
 
     // Starts playback or resumes after pause().
+    // First start is raw. Resuming the same track after pause() fades in.
     bool start();
 
-    // Smoothly fades out and pauses at the current position.
+    // Pauses the same track with a short fade-out to avoid a click.
     void pause();
 
-    // Pauses and returns the current song to 0:00.
+    // Hard-stops and returns the current song to 0:00.
     void stop();
 
     bool is_playing() const noexcept;
@@ -50,7 +51,14 @@ public:
     float seek_position() const;
 
     // Immediately jumps to an existing queue item and starts it.
+    // Track changes are hard cuts: no fade-out, crossfade or fade-in.
     bool play_queued_item(std::size_t index);
+
+    // Immediately plays the next queued item.
+    // If a track is currently audible, it is briefly faded to silence first
+    // to avoid a click; the next track then hard-starts with no fade-in.
+    // If idle, the next/first queued item starts raw immediately.
+    bool play_next();
 
     // Force-plays a path now while preserving queue continuation.
     //
@@ -60,7 +68,7 @@ public:
     // becomes:
     //   [album_1, single.flac, album_2, album_3]
     //
-    // single.flac starts immediately, then album_2 follows normally.
+    // single.flac starts immediately with a hard cut, then album_2 follows normally.
     bool play_track(const std::string& path);
 
     // Linear gain: 0.0 = silent, 1.0 = normal.

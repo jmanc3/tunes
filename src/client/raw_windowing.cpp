@@ -237,6 +237,7 @@ struct wl_window {
     int cur_y = 0;
 
     std::string title;
+    std::string app_id;
     bool has_pointer_focus = false;
     bool has_keyboard_focus = false;
     bool is_layer = true;
@@ -652,7 +653,7 @@ bool still_need_work(wl_context *ctx) {
 struct wl_window *wl_window_create(struct wl_context *ctx,
                                    int width, int height,
                                    int min_width, int min_height,
-                                   const char *title, RawWindow *rw)
+                                   const char *title, RawWindow *rw, std::string app_id)
 {
     struct wl_window *win = new wl_window;
     win->ctx = ctx;
@@ -667,6 +668,7 @@ struct wl_window *wl_window_create(struct wl_context *ctx,
     win->min_height = min_height;
     win->pool = NULL;
     win->rw = rw;
+    win->app_id = app_id;
 
     // 1️⃣ Create surface
     win->surface = wl_compositor_create_surface(ctx->compositor);
@@ -705,6 +707,8 @@ struct wl_window *wl_window_create(struct wl_context *ctx,
 
     // 6️⃣ Set metadata (min_size set after first configure so window opens at requested w×h)
     xdg_toplevel_set_title(win->xdg_toplevel, title ? title : "Wayland Window");
+    
+    xdg_toplevel_set_app_id(win->xdg_toplevel, win->app_id.c_str()); 
 
     // 7️⃣ Single initial commit
     log("surface commit");
@@ -2014,7 +2018,7 @@ RawWindow *windowing::open_window(RawApp *app, WindowType type, RawWindowSetting
     rw->id = unique_id++;
 
     if (type == WindowType::NORMAL) {
-        auto window = wl_window_create(ctx, settings.pos.w, settings.pos.h, settings.pos.min_w, settings.pos.min_h, settings.name.c_str(), rw);
+        auto window = wl_window_create(ctx, settings.pos.w, settings.pos.h, settings.pos.min_w, settings.pos.min_h, settings.name.c_str(), rw, settings.app_id);
         rw->cr = window->cr;
         window->id = rw->id;
         window->on_render = on_window_render;  // set now that rw is set (resize_buffer skipped it)

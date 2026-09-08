@@ -41,3 +41,6 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
 )
 
 target_link_libraries(tunes PRIVATE PkgConfig::DEPS)
+
+install(TARGETS tunes
+        DESTINATION /usr/local/bin/)

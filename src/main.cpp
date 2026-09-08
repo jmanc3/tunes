@@ -177,8 +177,10 @@ static void paint_button_bg(Container *root, Container *c) {
     }
 }
 
+constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
+
 static void add_option(Container *parent, std::filesystem::path file) {
-    auto c = parent->child(FILL_SPACE, 40);
+    auto c = parent->child(FILL_SPACE, FILL_SPACE);
     struct OptionData : UserData {
         std::string name;
         std::string full_path;
@@ -191,7 +193,7 @@ static void add_option(Container *parent, std::filesystem::path file) {
     c->pre_layout = [](Container *root, Container *c, const Bounds &b) {
         auto root_data = (RootData *) root->user_data;
         auto dpi = root_data->window->raw_window->dpi;
-        c->wanted_bounds.h  = 40 * dpi;
+        c->wanted_bounds.h  = 32 * dpi;
     };
     c->when_paint = [](Container *root, Container *c) {
         auto root_data = (RootData *) root->user_data;
@@ -200,8 +202,8 @@ static void add_option(Container *parent, std::filesystem::path file) {
         auto cr = root_data->window->raw_window->cr;
         paint_button_bg(root, c);
 //static Bounds draw_text(cairo_t *cr, int x, int y, std::string text, int size, bool draw, std::string font, int wrap, int h, RGBA color, bool bold, int align = 0) {
-        auto b = draw_text(cr, 0, 0, option_data->name, 14 * dpi, false, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
-        draw_text(cr, 10, center_y(c, b.h), option_data->name, 14 * dpi, true, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
+        auto b = draw_text(cr, 0, 0, option_data->name, 12 * dpi, false, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
+        draw_text(cr, 10, center_y(c, b.h), option_data->name, 12 * dpi, true, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
     };
     c->when_clicked = [](Container *root, Container *c) {
         auto option_data = (OptionData *) c->user_data;
@@ -212,7 +214,9 @@ static void add_option(Container *parent, std::filesystem::path file) {
             player->start();
             // printf(fz("{}\n", option_data->full_path).c_str());
         } else if (btn == BTN_RIGHT) {
-            
+            printf("%s queued\n", option_data->full_path.c_str());
+            player->queue().push_back(option_data->full_path);
+            player->queue_changed();
         }
     };
 }
@@ -292,6 +296,7 @@ static void fill_root(Container *root) {
 void open_window() {
     RawWindowSettings settings;
     settings.name = "Tunes";
+    settings.app_id = "Tunes";
     
     auto app = windowing::open_app();
     auto window = open_mylar_window(app, WindowType::NORMAL, settings);
