@@ -72,11 +72,11 @@ int main() {
             AlbumArtCache cache(cache_path);
             auto entry = cache.create({track.string()});
             blocked = true;
-            cache.request(entry, 256);
+            cache.request(entry, 0);
             wait_for([] { return reads.load() > 0; });
             const auto start = std::chrono::steady_clock::now();
             for (int i = 0; i < 1000; ++i) {
-                cache.request(entry, 256);
+                cache.request(entry, 0);
                 check(!cache.image(entry), "image published before decoding");
             }
             const auto elapsed = std::chrono::steady_clock::now() - start;
@@ -88,6 +88,11 @@ int main() {
                 blocked = false;
             }
             gate.notify_all();
+            wait_for([&] { return !cache.pending(); });
+            check(cache.image(entry) && cache.image(entry)->pixels == 128,
+                  "cold preview request loaded detail prematurely");
+            cache.request(entry, 256);
+            check(cache.image(entry) != nullptr, "detail request discarded the preview");
             wait_for([&] { return !cache.pending(); });
             auto image = cache.image(entry);
             check(image && image->width == 256 && image->height == 192, "display texture dimensions");
@@ -102,7 +107,7 @@ int main() {
                   "lossless cache changed pixels");
             g_object_unref(full);
             cache.release(entry);
-            check(cache.image(entry)->pixels == 128, "offscreen detail texture retained");
+            check(cache.image(entry) == image, "offscreen detail texture was unloaded");
         }
 
         {
@@ -128,7 +133,7 @@ int main() {
                 cache.request(entry, 384);
                 return !cache.pending();
             });
-            check(cache.image(entry)->width == 384, "resize/release race published a stale texture");
+            check(cache.image(entry)->width == 1024, "smaller request discarded higher quality artwork");
             auto preview = cache.create_preview(entry);
             cache.release(entry);
             wait_for([&] { return !cache.pending(); });
@@ -137,7 +142,16 @@ int main() {
                   "overlay did not receive original-resolution artwork");
             check(reads == 1, "overlay bypassed the existing album cache");
             cache.release(preview);
-            check(cache.image(preview)->pixels == 128, "closed overlay retained full texture");
+            check(cache.image(preview) == full, "closed overlay unloaded full texture");
+            std::weak_ptr<AlbumArtCache::Entry> retained = entry;
+            entry.reset();
+            preview.reset();
+            check(!retained.expired(), "cache forgot artwork when all UI handles were dropped");
+            auto reopened = cache.create({track.string()});
+            cache.request(reopened, 128);
+            check(cache.image(reopened) == full && !cache.pending(), "reopening artwork reloaded from disk");
+            auto cloned = cache.clone(reopened);
+            check(cache.image(cloned) == full, "playback handle did not share resident artwork");
         }
 
         std::ofstream(track, std::ios::app) << "changed";

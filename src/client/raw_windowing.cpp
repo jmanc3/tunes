@@ -276,6 +276,7 @@ struct wl_window {
     wp_viewport *viewport = nullptr;
     wl_buffer_slot slots[WL_TRIPLE_BUFFER_COUNT];
     bool dropped_frame = false;
+    wl_callback *frame_callback = nullptr;
     bool resize_next = false;
 
     struct wl_cursor_theme *cursor_theme = nullptr;
@@ -547,6 +548,22 @@ void on_window_render(wl_window *win) {
         if (win->rw->on_render) {
             win->rw->on_render(win->rw, win->scaled_w, win->scaled_h);
         }
+    }
+    if (win->rw && win->rw->on_render && win->rw->fractional_scale_set_once &&
+        win->rw->on_next_frame && !win->frame_callback) {
+        static const wl_callback_listener listener = {
+            .done = [](void *data, wl_callback *callback, uint32_t) {
+                auto win = static_cast<wl_window *>(data);
+                wl_callback_destroy(callback);
+                win->frame_callback = nullptr;
+                auto notify = std::move(win->rw->on_next_frame);
+                win->rw->on_next_frame = nullptr;
+                if (notify)
+                    notify(win->rw);
+            },
+        };
+        win->frame_callback = wl_surface_frame(win->surface);
+        wl_callback_add_listener(win->frame_callback, &listener, win);
     }
     wl_surface_attach(win->surface, slot->buffer, 0, 0);
     wl_surface_damage_buffer(win->surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -1749,6 +1766,8 @@ struct wl_context *wl_context_create(void) {
 
 void wl_window_destroy(struct wl_window *win) {
     if (!win) return;
+    if (win->frame_callback)
+        wl_callback_destroy(win->frame_callback);
     if (win->ctx->pointer_scroll_window == win)
         pointer_scroll_cancel(win->ctx);
 

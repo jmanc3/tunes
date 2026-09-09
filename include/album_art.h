@@ -25,11 +25,12 @@ public:
     ~AlbumArtCache();
     Handle create(std::vector<std::string> tracks);
     Handle clone(const Handle &source);
-    // Independent request sharing the same disk cache, unaffected by grid eviction.
+    // Shares resident artwork with the grid and requests original resolution.
     Handle create_preview(const Handle &source);
     // UI-thread calls: enqueue only, with no filesystem access or decoding.
     // pixels == 0 preloads just the preview; -1 loads the original resolution.
     void request(const Handle &entry, int pixels);
+    // Retains loaded textures and pending requests for reuse until cache destruction.
     void release(const Handle &entry);
     std::shared_ptr<const AlbumTexture> image(const Handle &entry) const;
     bool take_changed();

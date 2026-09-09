@@ -149,6 +149,9 @@ struct RawWindow {
 
     std::function<void(RawWindow *, int w, int h)> on_render = nullptr;
 
+    // One-shot notification from the compositor after the next rendered frame.
+    std::function<void(RawWindow *)> on_next_frame = nullptr;
+
     std::function<void(RawWindow *, int w, int h)> on_resize = nullptr;
     
     std::function<void(RawWindow *, float dpi)> on_scale_change = nullptr;

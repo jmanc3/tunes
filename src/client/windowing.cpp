@@ -113,10 +113,16 @@ void on_render(RawWindow *rw, int w, int h) {
     log("on_render");
     if (!rw->cr)
         return;
-    if (!rw->fractional_scale_set_once)
-        return;
     auto m = mylar(rw);
     if (!m) return;
+    if (!rw->fractional_scale_set_once) {
+        cairo_save(rw->cr);
+        cairo_set_operator(rw->cr, CAIRO_OPERATOR_SOURCE);
+        set_argb(rw->cr, m->bg_color);
+        cairo_paint(rw->cr);
+        cairo_restore(rw->cr);
+        return;
+    }
     m->root->real_bounds = Bounds(0, 0, w, h);
     m->root->wanted_bounds = m->root->real_bounds;
     ::layout(m->root, m->root, m->root->real_bounds);

@@ -76,6 +76,9 @@ SessionState load_session(const std::filesystem::path &path) {
     unsigned rate = 0;
     if (in >> rate && rate >= 8000 && rate <= 384000)
         state.sample_rate = rate;
+    int rescan = 1;
+    if (in >> rescan && (rescan == 0 || rescan == 1))
+        state.rescan_on_launch = rescan != 0;
     return state;
 }
 
@@ -98,7 +101,8 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
     out << state.scroll_offsets.size() << '\n';
     for (const auto &[root, offset] : state.scroll_offsets)
         out << std::quoted(root) << ' ' << offset << '\n';
-    out << state.window_width << ' ' << state.window_height << '\n' << state.sample_rate << '\n';
+    out << state.window_width << ' ' << state.window_height << '\n' << state.sample_rate << '\n'
+        << state.rescan_on_launch << '\n';
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)

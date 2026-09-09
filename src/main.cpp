@@ -136,18 +136,18 @@ static void initialize_playback(StartupState &startup) {
     player->set_volume(startup.session.volume);
     if (!player->set_sample_rate(startup.session.sample_rate))
         std::cerr << player->last_error() << '\n';
-    // if (startup.defer_queue_until_scan)
-    //     return;
+    if (startup.defer_queue_until_scan)
+        return;
     // Opening a library restores paused playback; explicit files request playback.
-    // if (startup.explicit_files) {
-    //     const bool loaded = player->restore_session(std::move(startup.queue), 0, 0);
-    //     if (!player->queue().empty() && (!loaded || !player->start()))
-    //         std::cerr << "Could not start playback: " << player->last_error() << '\n';
-    // } else {
-    //     remove_missing_tracks(startup.session);
-    //     if (!player->restore_session(startup.session.queue, startup.session.current_index, startup.session.seconds))
-    //         std::cerr << "Could not restore playback: " << player->last_error() << '\n';
-    // }
+    if (startup.explicit_files) {
+        const bool loaded = player->restore_session(std::move(startup.queue), 0, 0);
+        if (!player->queue().empty() && (!loaded || !player->start()))
+            std::cerr << "Could not start playback: " << player->last_error() << '\n';
+    } else {
+        remove_missing_tracks(startup.session);
+        if (!player->restore_session(startup.session.queue, startup.session.current_index, startup.session.seconds))
+            std::cerr << "Could not restore playback: " << player->last_error() << '\n';
+    }
 }
 
 struct ArtRefresh {
@@ -215,6 +215,7 @@ struct RootData : UserData {
     StartupState *startup = nullptr;
     double dpi = 1;
     bool scroll_restored = false;
+    bool first_frame_shown = false;
     std::chrono::steady_clock::time_point last_session_save;
     std::future<LibraryScanResult> scan;
     bool scan_failed = false;
@@ -626,7 +627,12 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
             auto art = static_cast<AlbumData *>(child->user_data)->art;
             if (!child->exists)
                 data->artwork->release(art);
-            data->artwork->request(art, child->exists ? std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi))) : 0);
+            if (data->first_frame_shown) {
+                // Load a small preview first; subsequent layouts request detail
+                // while the preview remains available to paint.
+                const bool detail = child->exists && data->artwork->image(art);
+                data->artwork->request(art, detail ? std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi))) : 0);
+            }
         }
         if (data->artwork->pending() || data->artwork->take_changed())
             poll_artwork(data->artwork_refresh);
@@ -668,7 +674,7 @@ static PlaybackData *playback_data(Container *root) {
 
 static void checkpoint_session(Container *root, bool force = false) {
     auto data = static_cast<RootData *>(root->user_data);
-    if (!data->startup)
+    if (!data->startup || !data->first_frame_shown)
         return;
     const auto now = std::chrono::steady_clock::now();
     if (!force && now - data->last_session_save < std::chrono::seconds(2))
@@ -1374,7 +1380,6 @@ static void fill_playback_bar(Container *root, Container *bar) {
         cairo_restore(cr);
     };
     sync_playback(root);
-    poll_playback(root);
 }
 
 static void close_settings_menu(Container *root) {
@@ -1397,7 +1402,7 @@ static double settings_scale(Container *root) {
     const auto data = static_cast<RootData *>(root->user_data);
     const auto window = data->window->raw_window;
     const double width = data->settings_information ? 840 : 680;
-    const double height = data->settings_information ? 644 : 440 + settings_extra_height(root);
+    const double height = data->settings_information ? 644 : 488 + settings_extra_height(root);
     return std::max(.1, std::min({static_cast<double>(window->dpi),
         root->real_bounds.w / width, root->real_bounds.h / height}));
 }
@@ -1548,6 +1553,42 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         if (c->state.mouse_button_pressed == BTN_LEFT && c->interactable)
             start_library_rescan(root);
     };
+    auto auto_rescan = overlay->child(FILL_SPACE, FILL_SPACE);
+    auto_rescan->name = "rescan-on-launch";
+    auto_rescan->z_index = 1;
+    auto_rescan->when_paint = [](Container *root, Container *c) {
+        auto data = static_cast<RootData *>(root->user_data);
+        auto cr = data->window->raw_window->cr;
+        const double dpi = settings_scale(root);
+        const auto &b = c->real_bounds;
+        const bool enabled = data->startup->session.rescan_on_launch;
+        cairo_save(cr);
+        draw_text(cr, b.x, b.y + 10 * dpi, "Rescan on launch", 10 * dpi, true,
+                  mylar_font, b.w - 100 * dpi, -1, RGBA(.12, .22, .29, 1), false, PANGO_ALIGN_LEFT);
+        draw_text(cr, b.right() - 96 * dpi, b.y + 10 * dpi, enabled ? "On" : "Off", 10 * dpi, true,
+                  mylar_font, 36 * dpi, -1, RGBA(.38, .47, .53, 1), false, PANGO_ALIGN_CENTER);
+        const double x = b.right() - 48 * dpi, y = b.y + b.h / 2;
+        cairo_set_line_width(cr, 24 * dpi);
+        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+        if (enabled) cairo_set_source_rgb(cr, .04, .62, .79);
+        else cairo_set_source_rgb(cr, .66, .73, .77);
+        cairo_move_to(cr, x + 12 * dpi, y);
+        cairo_line_to(cr, x + 36 * dpi, y);
+        cairo_stroke(cr);
+        cairo_set_source_rgb(cr, 1, 1, 1);
+        cairo_arc(cr, x + (enabled ? 36 : 12) * dpi, y, 9 * dpi, 0, 2 * M_PI);
+        cairo_fill(cr);
+        cairo_restore(cr);
+    };
+    auto_rescan->when_clicked = [](Container *root, Container *c) {
+        if (c->state.mouse_button_pressed != BTN_LEFT)
+            return;
+        auto data = static_cast<RootData *>(root->user_data);
+        auto &enabled = data->startup->session.rescan_on_launch;
+        enabled = !enabled;
+        checkpoint_session(root, true);
+        playback_changed(root);
+    };
     auto force_clock = make_button("pipewire-force-clock", [] {
         return "Force clock to " + std::to_string(player->sample_rate()) + " Hz";
     });
@@ -1577,17 +1618,17 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         });
         playback_changed(root);
     };
-    overlay->pre_layout = [close, information, rates, rescan, force_clock, auto_clock, rate_config](Container *root, Container *, const Bounds &b) {
+    overlay->pre_layout = [close, information, rates, rescan, auto_rescan, force_clock, auto_clock, rate_config](Container *root, Container *, const Bounds &b) {
         auto data = static_cast<RootData *>(root->user_data);
         const double dpi = settings_scale(root);
         const double extra = settings_extra_height(root);
         const bool details = data->settings_information;
         const double width = (details ? 800 : 640) * dpi;
-        const double height = (details ? 604 : 400 + extra) * dpi;
+        const double height = (details ? 604 : 448 + extra) * dpi;
         const Bounds panel(b.x + (b.w - width) / 2, b.y + (b.h - height) / 2, width, height);
         data->settings_bounds = panel;
         layout(root, close, Bounds(panel.right() - 108 * dpi, panel.y + 24 * dpi, 80 * dpi, 36 * dpi));
-        information->exists = rescan->exists = !details;
+        information->exists = rescan->exists = auto_rescan->exists = !details;
         for (std::size_t i = 0; i < rates.size(); ++i) {
             rates[i]->exists = !details;
             if (!details)
@@ -1603,6 +1644,7 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         } else if (!details) {
             layout(root, information, Bounds(panel.x + 28 * dpi, panel.y + 140 * dpi, 188 * dpi, 36 * dpi));
             layout(root, rescan, Bounds(panel.x + 28 * dpi, panel.y + (332 + extra) * dpi, 188 * dpi, 40 * dpi));
+            layout(root, auto_rescan, Bounds(panel.x + 28 * dpi, panel.y + (380 + extra) * dpi, 240 * dpi, 40 * dpi));
         }
     };
 }
@@ -1620,15 +1662,6 @@ static void fill_root(Container *root) {
     root_data->library = library;
     library->name = "album-library";
     fill_out_for_albums(library, albums);
-    // A restored queue or an explicitly opened file may be outside this library.
-    // Read its metadata during startup, never from the paint callback.
-    for (const auto &path : player->queue()) {
-        if (root_data->tracks.contains(path))
-            continue;
-        const auto track = read_track(path);
-        root_data->tracks[path] = {track.name.empty() ? std::filesystem::path(path).stem().string() : track.name,
-                                  track.artist, root_data->artwork->create({path})};
-    }
     auto bar = root->child(FILL_SPACE, FILL_SPACE);
     fill_playback_bar(root, bar);
     root->when_key_event = playback_key_event;
@@ -1659,6 +1692,7 @@ void open_window(StartupState &startup) {
     
     auto app = windowing::open_app();
     auto window = open_mylar_window(app, WindowType::NORMAL, settings);
+    window->bg_color = RGBA(1, 1, 1, 1);
     auto resize = window->raw_window->on_resize;
     window->raw_window->on_resize = [&startup, resize](RawWindow *window, int w, int h) {
         if (w > 0 && h > 0 && window->dpi > 0) {
@@ -1675,7 +1709,29 @@ void open_window(StartupState &startup) {
     root_data->startup = &startup;
     root->user_data = root_data;
     fill_root(root);
-    start_library_rescan(root);
+    window->raw_window->on_next_frame = [root, root_data, &startup](RawWindow *rw) {
+        root_data->first_frame_shown = true;
+        // Start preview workers now that the placeholder frame is committed.
+        layout(root, root, root->real_bounds);
+        initialize_playback(startup);
+        // Queued files can live outside the cached library. Metadata reads also
+        // belong after the first frame, never inside a paint callback.
+        for (const auto &path : player->queue()) {
+            if (root_data->tracks.contains(path))
+                continue;
+            const auto track = read_track(path);
+            root_data->tracks[path] = {
+                track.name.empty() ? std::filesystem::path(path).stem().string() : track.name,
+                track.artist, root_data->artwork->create({path})};
+        }
+        sync_playback(root);
+        // Explicit mixed file/folder inputs require discovery to build their queue.
+        if (startup.session.rescan_on_launch || startup.defer_queue_until_scan)
+            start_library_rescan(root);
+        poll_playback(root);
+        windowing::redraw(rw);
+    };
+    windowing::redraw(window->raw_window);
     windowing::main_loop(app);
     player->pause();
     checkpoint_session(root, true);
@@ -1693,7 +1749,6 @@ int main(int argc, char **argv) {
         configure_startup(startup, argc, argv);
         auto owned_player = std::make_unique<Player>();
         player = owned_player.get();
-        initialize_playback(startup);
         open_window(startup);
         player->stop();
         cleanup_cached_fonts();

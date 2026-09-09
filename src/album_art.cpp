@@ -8,6 +8,7 @@
 #include <fstream>
 #include <gdk/gdk.h>
 #include <set>
+#include <map>
 #include <unistd.h>
 
 namespace {
@@ -133,7 +134,6 @@ struct AlbumArtCache::Entry {
     std::atomic<bool> preview_ready{false};
     std::atomic<bool> detail_loading{false};
     std::atomic<bool> detail_failed{false};
-    std::atomic<bool> wanted{false};
     std::atomic<int> desired_pixels{0};
     std::atomic<std::shared_ptr<const AlbumTexture>> preview;
     std::atomic<std::shared_ptr<const AlbumTexture>> detail;
@@ -141,6 +141,9 @@ struct AlbumArtCache::Entry {
 
 struct AlbumArtCache::Impl {
     fs::path directory;
+    // UI-thread ownership keeps loaded artwork alive for this cache's lifetime,
+    // even after cards or the full-size preview drop their handles.
+    std::map<std::vector<std::string>, Handle> entries;
     std::atomic<bool> stopping{false};
     std::atomic<bool> changed{false};
     std::atomic<unsigned> jobs{0};
@@ -173,11 +176,11 @@ struct AlbumArtCache::Impl {
         if (pixels == 0 || stopping)
             return;
         auto scaled = pixels < 0 ? Pixbuf(static_cast<GdkPixbuf *>(g_object_ref(image)), g_object_unref) : resized(image, pixels);
-        if (scaled && entry->desired_pixels == pixels) {
-            entry->detail.store(texture(scaled.get(), pixels));
-            if (entry->desired_pixels != pixels)
-                entry->detail.store(nullptr);
-            changed = true;
+        if (scaled) {
+            if (auto loaded = texture(scaled.get(), pixels)) {
+                entry->detail.store(std::move(loaded));
+                changed = true;
+            }
         }
     }
 
@@ -211,10 +214,6 @@ struct AlbumArtCache::Impl {
     }
 
     void build(const Handle &entry, const std::vector<fs::path> &sidecars) {
-        if (!entry->wanted) {
-            entry->requested = false;
-            return;
-        }
         auto image = source(entry, sidecars);
         if (image) {
             auto preview = resized(image.get(), preview_pixels);
@@ -233,6 +232,7 @@ struct AlbumArtCache::Impl {
             save_bytes({}, entry->directory / "missing");
         }
         entry->preview_ready = true;
+        detail(entry);
     }
 
     void detail(const Handle &entry) {
@@ -250,21 +250,19 @@ struct AlbumArtCache::Impl {
                     if (image && !stopping)
                         save_png(image.get(), entry->directory / "full.png");
                 }
-                if (image && entry->desired_pixels == pixels)
+                if (image)
                     publish_detail(entry, image.get(), pixels);
                 if (!image)
                     entry->detail_failed = true;
             }
             entry->detail_loading = false;
+            if (entry->desired_pixels != pixels)
+                detail(entry);
         });
     }
 
     void preview(const Handle &entry) {
         submit(preview_pool, [this, entry] {
-            if (!entry->wanted) {
-                entry->requested = false;
-                return;
-            }
             const auto sidecars = covers(entry->tracks);
             entry->directory = directory / fingerprint(entry->tracks, sidecars);
             auto image = load_image(entry->directory / "preview.png", preview_pixels);
@@ -291,8 +289,11 @@ AlbumArtCache::AlbumArtCache(fs::path directory)
 AlbumArtCache::~AlbumArtCache() = default;
 
 AlbumArtCache::Handle AlbumArtCache::create(std::vector<std::string> tracks) {
+    if (auto found = impl_->entries.find(tracks); found != impl_->entries.end())
+        return found->second;
     auto entry = std::make_shared<Entry>();
     entry->tracks = std::move(tracks);
+    impl_->entries.emplace(entry->tracks, entry);
     return entry;
 }
 
@@ -303,22 +304,22 @@ AlbumArtCache::Handle AlbumArtCache::create_preview(const Handle &source) {
 }
 
 AlbumArtCache::Handle AlbumArtCache::clone(const Handle &source) {
-    return create(source->tracks);
+    return source;
 }
 
 void AlbumArtCache::request(const Handle &entry, int pixels) {
-    entry->wanted = true;
-    entry->desired_pixels = pixels;
+    const int current = entry->desired_pixels;
+    if (current != -1 && (pixels == -1 || pixels > current))
+        entry->desired_pixels = pixels;
     if (!entry->requested.exchange(true))
         impl_->preview(entry);
     else
         impl_->detail(entry);
 }
 
-void AlbumArtCache::release(const Handle &entry) {
-    entry->wanted = false;
-    entry->desired_pixels = 0;
-    entry->detail.store(nullptr);
+void AlbumArtCache::release(const Handle &) {
+    // Requests and both image sizes stay resident until the cache is destroyed.
+    // In-flight work also finishes so revisiting an album never restarts it.
 }
 
 std::shared_ptr<const AlbumTexture> AlbumArtCache::image(const Handle &entry) const {
