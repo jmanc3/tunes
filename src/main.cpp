@@ -31,6 +31,8 @@
 #include <utility>
 
 
+static float artwork_fade_duration_ms = 100.0f;
+
 static std::string mylar_font = "SF Pro";
 static Player *player = nullptr;
 
@@ -145,7 +147,6 @@ static void initialize_playback(StartupState &startup) {
         if (!player->queue().empty() && (!loaded || !player->start()))
             std::cerr << "Could not start playback: " << player->last_error() << '\n';
     } else {
-        remove_missing_tracks(startup.session);
         if (!player->restore_session(startup.session.queue, startup.session.current_index, startup.session.seconds))
             std::cerr << "Could not restore playback: " << player->last_error() << '\n';
     }
@@ -184,6 +185,7 @@ struct TrackDisplay {
     std::string title;
     std::string artist;
     AlbumArtCache::Handle art;
+    std::string album;
 };
 
 struct LibraryScanResult {
@@ -213,11 +215,15 @@ struct RootData : UserData {
     bool pipewire_config_exists = false;
     bool settings_information = false;
     AlbumArtCache::Handle current_art;
+    std::optional<std::chrono::steady_clock::time_point> current_art_fade;
+    bool current_art_startup_fade = true;
     AlbumArtCache::Handle preview_art;
     Bounds preview_bounds;
     StartupState *startup = nullptr;
     double dpi = 1;
+    double initial_scroll_offset = 0;
     bool scroll_restored = false;
+    bool scroll_restored_at_preferred_scale = false;
     bool first_frame_shown = false;
     std::chrono::steady_clock::time_point artwork_frame_time;
     std::chrono::steady_clock::time_point last_session_save;
@@ -370,6 +376,53 @@ struct AlbumData : UserData {
     std::optional<std::chrono::steady_clock::time_point> detail_fade;
 };
 
+// Grid cards and the playback cover use the same preview and crossfade path.
+static void paint_artwork(RootData *rd, cairo_t *cr, const AlbumArtCache::Handle &handle,
+                          const std::shared_ptr<const AlbumTexture> &art,
+                          const std::optional<std::chrono::steady_clock::time_point> &fade,
+                          double x, double y, double size, bool fade_preview = true) {
+    const auto preview = rd->artwork->preview(handle);
+    const bool detailed = preview && art != preview;
+    double blend = fade_preview ? 0 : 1;
+    if (fade_preview && detailed && fade) {
+        blend = artwork_fade_duration_ms <= 0 ? 1.0 : std::clamp(
+            std::chrono::duration<double, std::milli>(rd->artwork_frame_time - *fade).count() /
+            artwork_fade_duration_ms, 0.0, 1.0);
+        if (blend < 1) {
+            rd->artwork_refresh->animating = true;
+            poll_artwork(rd->artwork_refresh);
+        }
+    }
+    auto paint_art = [&](const auto &image, double alpha) {
+        cairo_save(cr);
+        const double scale = std::min(size / image->width, size / image->height);
+        cairo_translate(cr, x + (size - image->width * scale) / 2,
+                        y + (size - image->height * scale) / 2);
+        // Stretch the tiny preview to the same display size as the detail.
+        cairo_scale(cr, scale, scale);
+        cairo_set_source_surface(cr, image->surface, 0, 0);
+        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+        cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_PAD);
+        cairo_rectangle(cr, 0, 0, image->width, image->height);
+        cairo_clip(cr);
+        cairo_paint_with_alpha(cr, alpha);
+        cairo_restore(cr);
+    };
+    if (detailed && blend < 1) {
+        // Add weighted layers in a group for a true crossfade, including alpha.
+        cairo_push_group(cr);
+        paint_art(preview, 1 - blend);
+        cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+        paint_art(art, blend);
+        cairo_pop_group_to_source(cr);
+        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+        cairo_paint(cr);
+    } else {
+        paint_art(art, 1);
+    }
+
+}
+
 static void add_album(Container *parent, const AlbumOption &option, AlbumArtCache::Handle existing_art = {},
                       std::optional<std::chrono::steady_clock::time_point> detail_fade = {}) {
     if (option.songs.empty())
@@ -386,7 +439,7 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
     for (const auto &song : option.songs)
         root_data->tracks[song.full] = {
             song.name.empty() ? std::filesystem::path(song.full).stem().string() : song.name,
-            song.artist, data->art};
+            song.artist, data->art, song.album};
     data->name = option.songs.front().album.empty() ? "Unknown" : option.songs.front().album;
     data->artist = option.songs.front().artist;
     for (const auto &song : option.songs) {
@@ -425,44 +478,8 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
         cairo_set_source_rgb(cr, .9, .91, .93);
         cairo_fill(cr);
         if (art && size > 0) {
-            auto rd = static_cast<RootData *>(root->user_data);
-            const auto preview = rd->artwork->preview(data->art);
-            const bool detailed = preview && art != preview;
-            double blend = 0;
-            if (detailed && data->detail_fade) {
-                blend = std::clamp(std::chrono::duration<double>(rd->artwork_frame_time - *data->detail_fade).count() / .220, 0.0, 1.0);
-                if (blend < 1) {
-                    rd->artwork_refresh->animating = true;
-                    poll_artwork(rd->artwork_refresh);
-                }
-            }
-            auto paint_art = [&](const auto &image, double alpha) {
-                cairo_save(cr);
-                const double scale = std::min(size / image->width, size / image->height);
-                cairo_translate(cr, x + (size - image->width * scale) / 2,
-                                y + (size - image->height * scale) / 2);
-                // Stretch the tiny preview to the same display size as the detail.
-                cairo_scale(cr, scale, scale);
-                cairo_set_source_surface(cr, image->surface, 0, 0);
-                cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
-                cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_PAD);
-                cairo_rectangle(cr, 0, 0, image->width, image->height);
-                cairo_clip(cr);
-                cairo_paint_with_alpha(cr, alpha);
-                cairo_restore(cr);
-            };
-            if (detailed && blend < 1) {
-                // Add weighted layers in a group for a true crossfade, including alpha.
-                cairo_push_group(cr);
-                paint_art(preview, 1 - blend);
-                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
-                paint_art(art, blend);
-                cairo_pop_group_to_source(cr);
-                cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-                cairo_paint(cr);
-            } else {
-                paint_art(art, 1);
-            }
+            paint_artwork(static_cast<RootData *>(root->user_data), cr, data->art, art,
+                          data->detail_fade, x, y, size);
         } else {
             draw_text(cr, x, y + size / 2 - 12 * dpi, "♫", 24 * dpi, true,
                       mylar_font, size, -1, RGBA(.45, .47, .5, 1), false, PANGO_ALIGN_CENTER);
@@ -609,6 +626,9 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         // Inspect the whole viewport before painting any card. Every waiting
         // card gets the same start time once the last visible detail is ready.
         bool ready = data->first_frame_shown;
+        if (data->current_art_startup_fade && data->current_art &&
+            !data->artwork->detail_ready(data->current_art, 128))
+            ready = false;
         for (auto i = data->album_first; i < data->album_end; ++i) {
             auto child = c->children[i];
             if (!child->exists)
@@ -619,6 +639,8 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
                 ready = false;
         }
         if (ready) {
+            if (data->current_art_startup_fade && data->current_art && !data->current_art_fade)
+                data->current_art_fade = data->artwork_frame_time;
             for (auto i = data->album_first; i < data->album_end; ++i) {
                 auto child = c->children[i];
                 if (!child->exists)
@@ -639,15 +661,21 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
     };
     root->pre_layout = [](Container *root, Container *c, const Bounds &b) {
         auto data = static_cast<RootData *>(root->user_data);
-        const double dpi = data->window->raw_window->dpi;
-        data->dpi = dpi;
-        if (!data->scroll_restored && data->startup && !c->children.empty() && b.w > 0 && b.h > 0) {
-            const auto &offsets = data->startup->session.scroll_offsets;
-            const auto saved = offsets.find(data->startup->music_root);
-            if (saved != offsets.end())
-                c->scroll_v_real = saved->second * dpi;
+        const auto window = data->window->raw_window;
+        const double dpi = window->dpi;
+        const bool restore = !data->scroll_restored ||
+            (window->fractional_scale_set_once && !data->scroll_restored_at_preferred_scale);
+        if (restore && data->startup && !c->children.empty() && b.w > 0 && b.h > 0) {
+            // The provisional first layout may clamp the saved offset at DPI 1.
+            // Reapply the untouched session value once the preferred scale arrives.
+            c->scroll_v_real = data->initial_scroll_offset * dpi;
             data->scroll_restored = true;
+            data->scroll_restored_at_preferred_scale = window->fractional_scale_set_once;
+        } else if (data->scroll_restored && data->dpi > 0 && dpi != data->dpi) {
+            // Later monitor changes preserve the user's current logical offset.
+            c->scroll_v_real *= dpi / data->dpi;
         }
+        data->dpi = dpi;
         const double pad = std::min(16 * dpi, std::max(0.0, b.w / 2));
         const double gap = 16 * dpi;
         const double width = std::max(0.0, b.w - 2 * pad);
@@ -693,6 +721,8 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
                 data->artwork->request(art, detail ? std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi))) : 0);
             }
         }
+        if (data->first_frame_shown && data->current_art)
+            data->artwork->request(data->current_art, 128);
         if (data->artwork->pending() || data->artwork->take_changed())
             poll_artwork(data->artwork_refresh);
     };
@@ -764,7 +794,40 @@ static void checkpoint_session(Container *root, bool force = false) {
     });
 }
 
+// Prepare only display metadata and artwork. Audio restoration stays after the
+// first frame, and cached library metadata avoids reopening the selected file.
+static void prepare_session_display(Container *root, StartupState &startup) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    auto display = playback_data(root);
+    if (!startup.explicit_files)
+        remove_missing_tracks(startup.session);
+    const std::string path = startup.explicit_files
+        ? (startup.queue.empty() ? std::string() : startup.queue.front())
+        : startup.session.current_path;
+    display->path = path;
+    display->elapsed = startup.explicit_files ? 0 : startup.session.seconds;
+    display->gain = startup.session.volume;
+    display->previous->interactable = false;
+    display->play->interactable = false;
+    display->next->interactable = false;
+    display->seek->interactable = false;
+    if (path.empty())
+        return;
+    if (!rd->tracks.contains(path)) {
+        const auto track = read_track(path);
+        rd->tracks[path] = {
+            track.name.empty() ? std::filesystem::path(path).stem().string() : track.name,
+            track.artist, rd->artwork->create({path}), track.album};
+    }
+    rd->current_art = rd->artwork->clone(rd->tracks.at(path).art);
+    rd->artwork->request(rd->current_art, 0);
+    poll_artwork(rd->artwork_refresh);
+}
+
 static bool sync_playback(Container *root) {
+    // The saved-session display is authoritative until player initialization.
+    if (!static_cast<RootData *>(root->user_data)->first_frame_shown)
+        return false;
     auto data = playback_data(root);
     const auto path = player->current_path();
     const auto index = player->current_index();
@@ -785,8 +848,9 @@ static bool sync_playback(Container *root) {
         data->seeking = false;
         auto root_data = static_cast<RootData *>(root->user_data);
         if (root_data->artwork) {
-            if (root_data->current_art)
-                root_data->artwork->release(root_data->current_art);
+            const auto previous_art = root_data->current_art;
+            if (previous_art)
+                root_data->artwork->release(previous_art);
             root_data->current_art.reset();
             if (!path.empty()) {
                 const auto track = root_data->tracks.find(path);
@@ -794,6 +858,12 @@ static bool sync_playback(Container *root) {
                     ? root_data->artwork->clone(track->second.art) : root_data->artwork->create({path});
                 root_data->artwork->request(root_data->current_art, 128);
                 poll_artwork(root_data->artwork_refresh);
+            }
+            if (root_data->current_art != previous_art) {
+                // Only the restored startup cover joins the blurred reveal.
+                // Album changes show the best resident texture immediately.
+                root_data->current_art_startup_fade = false;
+                root_data->current_art_fade.reset();
             }
         }
     }
@@ -1424,13 +1494,9 @@ static void fill_playback_bar(Container *root, Container *bar) {
             cairo_set_source_rgb(cr, .87, .93, .96);
             cairo_fill(cr);
             if (art) {
-                const double scale = std::min(size / art->width, size / art->height);
-                cairo_save(cr);
-                cairo_translate(cr, b.x + (size - art->width * scale) / 2, b.y + (size - art->height * scale) / 2);
-                cairo_scale(cr, scale, scale);
-                cairo_set_source_surface(cr, art->surface, 0, 0);
-                cairo_paint(cr);
-                cairo_restore(cr);
+                paint_artwork(root_data, cr, root_data->current_art, art,
+                              root_data->current_art_fade, b.x, b.y, size,
+                              root_data->current_art_startup_fade);
             } else {
                 text(Bounds(b.x, b.y + 14 * dpi, size, 30 * dpi), "♫", 18,
                      RGBA(.20, .52, .64, 1), false, PANGO_ALIGN_CENTER);
@@ -1441,8 +1507,16 @@ static void fill_playback_bar(Container *root, Container *bar) {
                 ? track->second.title : std::filesystem::path(data->path).stem().string();
             text(Bounds(text_x, b.y + 7 * dpi, text_w, 22 * dpi), title, 10,
                  RGBA(.12, .22, .29, 1), true, PANGO_ALIGN_LEFT);
-            const std::string artist = track != root_data->tracks.end() ? track->second.artist : "";
-            text(Bounds(text_x, b.y + 31 * dpi, text_w, 18 * dpi), artist, 9,
+            std::string subtitle;
+            if (track != root_data->tracks.end()) {
+                subtitle = track->second.artist;
+                if (!track->second.album.empty()) {
+                    if (!subtitle.empty())
+                        subtitle += " · ";
+                    subtitle += track->second.album;
+                }
+            }
+            text(Bounds(text_x, b.y + 31 * dpi, text_w, 18 * dpi), subtitle, 9,
                  RGBA(.38, .47, .53, 1), false, PANGO_ALIGN_LEFT);
         }
         cairo_restore(cr);
@@ -1776,15 +1850,20 @@ void open_window(StartupState &startup) {
     root_data->app = app;
     root_data->window = window;
     root_data->startup = &startup;
+    if (const auto saved = startup.session.scroll_offsets.find(startup.music_root);
+        saved != startup.session.scroll_offsets.end())
+        root_data->initial_scroll_offset = saved->second;
     root->user_data = root_data;
     fill_root(root);
+    prepare_session_display(root, startup);
     window->raw_window->first_frame_ready = [root, root_data](RawWindow *rw, int w, int h) {
         if (w <= 0 || h <= 0)
             return false;
         root->real_bounds = Bounds(0, 0, w, h);
         root->wanted_bounds = root->real_bounds;
         layout(root, root, root->real_bounds);
-        bool ready = true;
+        // The bottom bar waits only for its tiny blurred preview, like the grid.
+        bool ready = !root_data->current_art || root_data->artwork->preview_ready(root_data->current_art);
         for (auto i = root_data->album_first; i < root_data->album_end; ++i) {
             auto child = root_data->library->children[i];
             if (child->exists && !root_data->artwork->preview_ready(static_cast<AlbumData *>(child->user_data)->art))
@@ -1797,15 +1876,15 @@ void open_window(StartupState &startup) {
         // Upgrade the blurred previews after their first frame is committed.
         layout(root, root, root->real_bounds);
         initialize_playback(startup);
-        // Queued files can live outside the cached library. Metadata reads also
-        // belong after the first frame, never inside a paint callback.
+        // Populate other queued tracks after the first frame. The selected
+        // track already has display metadata, even outside the cached library.
         for (const auto &path : player->queue()) {
             if (root_data->tracks.contains(path))
                 continue;
             const auto track = read_track(path);
             root_data->tracks[path] = {
                 track.name.empty() ? std::filesystem::path(path).stem().string() : track.name,
-                track.artist, root_data->artwork->create({path})};
+                track.artist, root_data->artwork->create({path}), track.album};
         }
         sync_playback(root);
         // Explicit mixed file/folder inputs require discovery to build their queue.
