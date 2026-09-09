@@ -115,7 +115,9 @@ void on_render(RawWindow *rw, int w, int h) {
         return;
     auto m = mylar(rw);
     if (!m) return;
-    if (!rw->fractional_scale_set_once) {
+    // A deferred first frame can render at the default scale before the
+    // compositor supplies its preferred scale for the mapped surface.
+    if (!rw->fractional_scale_set_once && !rw->first_frame_ready) {
         cairo_save(rw->cr);
         cairo_set_operator(rw->cr, CAIRO_OPERATOR_SOURCE);
         set_argb(rw->cr, m->bg_color);

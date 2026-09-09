@@ -77,6 +77,8 @@ int main() {
             const auto start = std::chrono::steady_clock::now();
             for (int i = 0; i < 1000; ++i) {
                 cache.request(entry, 0);
+                check(!cache.detail_ready(entry, 256), "detail gate opened during extraction");
+                check(!cache.preview_ready(entry), "startup gate opened during extraction");
                 check(!cache.image(entry), "image published before decoding");
             }
             const auto elapsed = std::chrono::steady_clock::now() - start;
@@ -89,13 +91,20 @@ int main() {
             }
             gate.notify_all();
             wait_for([&] { return !cache.pending(); });
-            check(cache.image(entry) && cache.image(entry)->pixels == 128,
+            check(cache.image(entry) && cache.image(entry)->pixels == 24,
                   "cold preview request loaded detail prematurely");
+            check(cache.preview_ready(entry), "loaded preview did not release startup gate");
+            check(!cache.detail_ready(entry, 256), "tiny preview released the detail gate");
+            const auto tiny = cache.preview(entry);
+            check(tiny && tiny->width == 24 && tiny->height == 18, "tiny preview dimensions");
             cache.request(entry, 256);
             check(cache.image(entry) != nullptr, "detail request discarded the preview");
             wait_for([&] { return !cache.pending(); });
             auto image = cache.image(entry);
             check(image && image->width == 256 && image->height == 192, "display texture dimensions");
+            check(cache.detail_ready(entry, 256), "loaded detail did not release the gate");
+            check(!cache.detail_ready(entry, 512), "undersized detail released a higher-DPI gate");
+            check(cache.preview(entry) == tiny, "detail discarded crossfade preview");
             check(reads == 1, "duplicate extraction jobs");
             album_path = fs::directory_iterator(cache_path)->path();
             check(bytes(album_path / "original.img") == embedded, "original artwork bytes changed");
@@ -116,7 +125,7 @@ int main() {
             const auto start = std::chrono::steady_clock::now();
             cache.request(entry, 0);
             wait_for([&] { return !cache.pending(); });
-            check(cache.image(entry) && cache.image(entry)->pixels == 128, "warm preview load");
+            check(cache.image(entry) && cache.image(entry)->pixels == 24, "warm preview load");
             check(reads == 1, "warm cache re-extracted source");
             std::cout << "Warm preview ready: " << std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count() << " ms\n";
@@ -171,6 +180,8 @@ int main() {
             cache.request(entry, 256);
             wait_for([&] { return !cache.pending(); });
             check(!cache.image(entry), "missing artwork should use a placeholder");
+            check(cache.preview_ready(entry), "missing artwork blocked startup");
+            check(cache.detail_ready(entry, 256), "missing artwork blocked the batch fade");
         }
         check(reads == 3, "missing artwork was repeatedly extracted");
 
@@ -188,6 +199,34 @@ int main() {
             for (int i = 0; i < 100; ++i)
                 cache.request(cache.create({track.string()}), 256);
             // Destruction cancels queued work; workers never access UI objects.
+        }
+        // A sharp edge must become a smooth transition in the worker's preview.
+        {
+            auto edge = gdk_pixbuf_new(GDK_COLORSPACE_RGB, false, 8, 24, 24);
+            gdk_pixbuf_fill(edge, 0x000000ff);
+            auto pixels = gdk_pixbuf_get_pixels(edge);
+            const int stride = gdk_pixbuf_get_rowstride(edge);
+            for (int y = 0; y < 24; ++y)
+                for (int x = 12; x < 24; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        pixels[y * stride + x * 3 + c] = 255;
+            gchar *encoded = nullptr;
+            gsize size = 0;
+            check(gdk_pixbuf_save_to_buffer(edge, &encoded, &size, "png", nullptr, nullptr), "encode blur fixture");
+            embedded.assign(encoded, encoded + size);
+            g_free(encoded);
+            g_object_unref(edge);
+            AlbumArtCache cache(base / "blur");
+            auto entry = cache.create({track.string()});
+            cache.request(entry, 0);
+            wait_for([&] { return !cache.pending(); });
+            auto preview = cache.preview(entry);
+            check(preview != nullptr, "blur preview missing");
+            const auto data = cairo_image_surface_get_data(preview->surface);
+            const int row = 12 * cairo_image_surface_get_stride(preview->surface);
+            check(data[row + 10 * 4] > 0 && data[row + 10 * 4] < data[row + 11 * 4] &&
+                  data[row + 11 * 4] < data[row + 12 * 4] && data[row + 13 * 4] < 255,
+                  "preview did not Gaussian blur the edge");
         }
         fs::remove_all(base);
         std::cout << "Album artwork cache checks passed\n";

@@ -54,6 +54,7 @@ struct PositioningInfo {
 };
 
 struct RawWindowSettings {
+    bool defer_initial_frame = false;
     enum struct PopupAnchor {
         NONE,
         TOP,
@@ -148,6 +149,10 @@ struct RawWindow {
     std::function<bool(RawWindow *, bool gained)> on_keyboard_focus = nullptr;
 
     std::function<void(RawWindow *, int w, int h)> on_render = nullptr;
+
+    bool defer_initial_frame = false;
+    // Returning false leaves the surface uncommitted; callers schedule a redraw.
+    std::function<bool(RawWindow *, int, int)> first_frame_ready = nullptr;
 
     // One-shot notification from the compositor after the next rendered frame.
     std::function<void(RawWindow *)> on_next_frame = nullptr;

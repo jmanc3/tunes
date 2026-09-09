@@ -28,6 +28,7 @@
 #include <gdk/gdk.h>
 #include <unordered_map>
 #include <optional>
+#include <utility>
 
 
 static std::string mylar_font = "SF Pro";
@@ -155,6 +156,7 @@ struct ArtRefresh {
     RawWindow *window = nullptr;
     std::weak_ptr<AlbumArtCache> cache;
     int timer = -1;
+    bool animating = false;
 };
 
 // Workers publish only immutable images. Window access and redraws stay on the
@@ -170,9 +172,10 @@ static void poll_artwork(const std::shared_ptr<ArtRefresh> &refresh) {
         // Read pending first: the last worker publishes its change before
         // decrementing the job count, so its final redraw cannot be lost.
         const bool pending = cache->pending();
-        if (cache->take_changed())
+        const bool animating = std::exchange(refresh->animating, false);
+        if (cache->take_changed() || animating)
             windowing::redraw(refresh->window);
-        if (pending)
+        if (pending || refresh->animating)
             poll_artwork(refresh);
     }, nullptr);
 }
@@ -216,6 +219,7 @@ struct RootData : UserData {
     double dpi = 1;
     bool scroll_restored = false;
     bool first_frame_shown = false;
+    std::chrono::steady_clock::time_point artwork_frame_time;
     std::chrono::steady_clock::time_point last_session_save;
     std::future<LibraryScanResult> scan;
     bool scan_failed = false;
@@ -363,13 +367,16 @@ struct AlbumData : UserData {
     std::string name;
     std::string artist;
     AlbumArtCache::Handle art;
+    std::optional<std::chrono::steady_clock::time_point> detail_fade;
 };
 
-static void add_album(Container *parent, const AlbumOption &option, AlbumArtCache::Handle existing_art = {}) {
+static void add_album(Container *parent, const AlbumOption &option, AlbumArtCache::Handle existing_art = {},
+                      std::optional<std::chrono::steady_clock::time_point> detail_fade = {}) {
     if (option.songs.empty())
         return;
     auto data = new AlbumData;
     data->album = option;
+    data->detail_fade = detail_fade;
     std::vector<std::string> tracks;
     tracks.reserve(option.songs.size());
     for (const auto &song : option.songs)
@@ -418,15 +425,44 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
         cairo_set_source_rgb(cr, .9, .91, .93);
         cairo_fill(cr);
         if (art && size > 0) {
-            const int width = art->width;
-            const int height = art->height;
-            const double scale = std::min(size / width, size / height);
-            cairo_save(cr);
-            cairo_translate(cr, x + (size - width * scale) / 2, y + (size - height * scale) / 2);
-            cairo_scale(cr, scale, scale);
-            cairo_set_source_surface(cr, art->surface, 0, 0);
-            cairo_paint(cr);
-            cairo_restore(cr);
+            auto rd = static_cast<RootData *>(root->user_data);
+            const auto preview = rd->artwork->preview(data->art);
+            const bool detailed = preview && art != preview;
+            double blend = 0;
+            if (detailed && data->detail_fade) {
+                blend = std::clamp(std::chrono::duration<double>(rd->artwork_frame_time - *data->detail_fade).count() / .220, 0.0, 1.0);
+                if (blend < 1) {
+                    rd->artwork_refresh->animating = true;
+                    poll_artwork(rd->artwork_refresh);
+                }
+            }
+            auto paint_art = [&](const auto &image, double alpha) {
+                cairo_save(cr);
+                const double scale = std::min(size / image->width, size / image->height);
+                cairo_translate(cr, x + (size - image->width * scale) / 2,
+                                y + (size - image->height * scale) / 2);
+                // Stretch the tiny preview to the same display size as the detail.
+                cairo_scale(cr, scale, scale);
+                cairo_set_source_surface(cr, image->surface, 0, 0);
+                cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+                cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_PAD);
+                cairo_rectangle(cr, 0, 0, image->width, image->height);
+                cairo_clip(cr);
+                cairo_paint_with_alpha(cr, alpha);
+                cairo_restore(cr);
+            };
+            if (detailed && blend < 1) {
+                // Add weighted layers in a group for a true crossfade, including alpha.
+                cairo_push_group(cr);
+                paint_art(preview, 1 - blend);
+                cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+                paint_art(art, blend);
+                cairo_pop_group_to_source(cr);
+                cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+                cairo_paint(cr);
+            } else {
+                paint_art(art, 1);
+            }
         } else {
             draw_text(cr, x, y + size / 2 - 12 * dpi, "♫", 24 * dpi, true,
                       mylar_font, size, -1, RGBA(.45, .47, .5, 1), false, PANGO_ALIGN_CENTER);
@@ -569,6 +605,29 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         cairo_set_source_rgb(cr, 1, 1, 1);
         cairo_fill(cr);
         const auto data = static_cast<RootData *>(root->user_data);
+        data->artwork_frame_time = std::chrono::steady_clock::now();
+        // Inspect the whole viewport before painting any card. Every waiting
+        // card gets the same start time once the last visible detail is ready.
+        bool ready = data->first_frame_shown;
+        for (auto i = data->album_first; i < data->album_end; ++i) {
+            auto child = c->children[i];
+            if (!child->exists)
+                continue;
+            const auto album = static_cast<AlbumData *>(child->user_data);
+            const int pixels = std::max(1, static_cast<int>(std::ceil(child->real_bounds.w - 16 * data->dpi)));
+            if (!data->artwork->detail_ready(album->art, pixels))
+                ready = false;
+        }
+        if (ready) {
+            for (auto i = data->album_first; i < data->album_end; ++i) {
+                auto child = c->children[i];
+                if (!child->exists)
+                    continue;
+                auto album = static_cast<AlbumData *>(child->user_data);
+                if (!album->detail_fade)
+                    album->detail_fade = data->artwork_frame_time;
+            }
+        }
         for (auto i = data->album_first; i < data->album_end; ++i) {
             auto child = c->children[i];
             if (child->exists)
@@ -627,10 +686,10 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
             auto art = static_cast<AlbumData *>(child->user_data)->art;
             if (!child->exists)
                 data->artwork->release(art);
-            if (data->first_frame_shown) {
-                // Load a small preview first; subsequent layouts request detail
-                // while the preview remains available to paint.
-                const bool detail = child->exists && data->artwork->image(art);
+            if (child->exists || data->first_frame_shown) {
+                // Once the preview frame is shown, request display-sized detail
+                // for every visible card; offscreen preloads do not hold the fade.
+                const bool detail = data->first_frame_shown && child->exists;
                 data->artwork->request(art, detail ? std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi))) : 0);
             }
         }
@@ -811,13 +870,17 @@ static void finish_library_rescan(Container *root) {
         // The worker publishes a complete snapshot. All container and artwork
         // mutations happen together on the event thread, between frames.
         auto library = data->library;
-        std::map<std::vector<std::string>, AlbumArtCache::Handle> retained_art;
+        struct RetainedArt {
+            AlbumArtCache::Handle art;
+            std::optional<std::chrono::steady_clock::time_point> detail_fade;
+        };
+        std::map<std::vector<std::string>, RetainedArt> retained_art;
         for (auto child : library->children) {
             auto album = static_cast<AlbumData *>(child->user_data);
             std::vector<std::string> paths;
             for (const auto &song : album->album.songs)
                 paths.push_back(song.full);
-            retained_art.emplace(std::move(paths), album->art);
+            retained_art.emplace(std::move(paths), RetainedArt{album->art, album->detail_fade});
             delete child;
         }
         library->children.clear();
@@ -832,12 +895,17 @@ static void finish_library_rescan(Container *root) {
             for (const auto &song : album.songs)
                 paths.push_back(song.full);
             auto previous = retained_art.find(paths);
-            add_album(library, album, previous != retained_art.end() ? previous->second : AlbumArtCache::Handle{});
+            // Rebuilding metadata must not restart a transition for resident artwork.
+            // Preserve even an in-progress fade so it continues from the same time.
+            if (previous != retained_art.end())
+                add_album(library, album, previous->second.art, previous->second.detail_fade);
+            else
+                add_album(library, album);
             if (previous != retained_art.end())
                 retained_art.erase(previous);
         }
-        for (const auto &[paths, art] : retained_art)
-            data->artwork->release(art);
+        for (const auto &[paths, retained] : retained_art)
+            data->artwork->release(retained.art);
         if (result.launch) {
             data->startup->defer_queue_until_scan = false;
             // A user may have chosen an album while the initial scan ran.
@@ -1684,6 +1752,7 @@ static void fill_root(Container *root) {
 void open_window(StartupState &startup) {
     RawWindowSettings settings;
     settings.name = "Tunes";
+    settings.defer_initial_frame = true;
     settings.app_id = "Tunes";
     if (startup.session.window_width > 0 && startup.session.window_height > 0) {
         settings.pos.w = startup.session.window_width;
@@ -1709,9 +1778,23 @@ void open_window(StartupState &startup) {
     root_data->startup = &startup;
     root->user_data = root_data;
     fill_root(root);
+    window->raw_window->first_frame_ready = [root, root_data](RawWindow *rw, int w, int h) {
+        if (w <= 0 || h <= 0)
+            return false;
+        root->real_bounds = Bounds(0, 0, w, h);
+        root->wanted_bounds = root->real_bounds;
+        layout(root, root, root->real_bounds);
+        bool ready = true;
+        for (auto i = root_data->album_first; i < root_data->album_end; ++i) {
+            auto child = root_data->library->children[i];
+            if (child->exists && !root_data->artwork->preview_ready(static_cast<AlbumData *>(child->user_data)->art))
+                ready = false;
+        }
+        return ready;
+    };
     window->raw_window->on_next_frame = [root, root_data, &startup](RawWindow *rw) {
         root_data->first_frame_shown = true;
-        // Start preview workers now that the placeholder frame is committed.
+        // Upgrade the blurred previews after their first frame is committed.
         layout(root, root, root->real_bounds);
         initialize_playback(startup);
         // Queued files can live outside the cached library. Metadata reads also

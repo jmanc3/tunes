@@ -33,6 +33,11 @@ public:
     // Retains loaded textures and pending requests for reuse until cache destruction.
     void release(const Handle &entry);
     std::shared_ptr<const AlbumTexture> image(const Handle &entry) const;
+    std::shared_ptr<const AlbumTexture> preview(const Handle &entry) const;
+    // Includes missing/failed artwork so startup can always finish.
+    bool preview_ready(const Handle &entry) const;
+    // True once display-sized detail is available, or artwork cannot be loaded.
+    bool detail_ready(const Handle &entry, int pixels) const;
     bool take_changed();
     bool pending() const;
 

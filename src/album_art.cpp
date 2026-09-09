@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <cmath>
 #include <gdk/gdk.h>
 #include <set>
 #include <map>
@@ -13,7 +14,7 @@
 
 namespace {
 namespace fs = std::filesystem;
-constexpr int preview_pixels = 128;
+constexpr int preview_pixels = 24;
 using Pixbuf = std::unique_ptr<GdkPixbuf, decltype(&g_object_unref)>;
 
 Pixbuf load_image(const fs::path &path, int pixels = 0) {
@@ -53,6 +54,40 @@ std::shared_ptr<const AlbumTexture> texture(GdkPixbuf *image, int pixels) {
     cairo_destroy(cr);
     cairo_surface_flush(result->surface);
     return ok ? result : nullptr;
+}
+
+// Separable Gaussian convolution on premultiplied pixels avoids alpha fringes.
+// At 24 pixels this is cheap enough to run once, before worker publication.
+std::shared_ptr<const AlbumTexture> blurred_preview(GdkPixbuf *image) {
+    auto result = texture(image, preview_pixels);
+    if (!result)
+        return {};
+    auto data = cairo_image_surface_get_data(result->surface);
+    const int stride = cairo_image_surface_get_stride(result->surface);
+    const int width = result->width, height = result->height;
+    constexpr int radius = 4;
+    double weights[2 * radius + 1], total = 0;
+    for (int i = -radius; i <= radius; ++i)
+        total += weights[i + radius] = std::exp(-i * i / (2.0 * 1.5 * 1.5));
+    for (auto &weight : weights)
+        weight /= total;
+    std::vector<double> horizontal(width * height * 4);
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+            for (int channel = 0; channel < 4; ++channel)
+                for (int i = -radius; i <= radius; ++i)
+                    horizontal[(y * width + x) * 4 + channel] +=
+                        weights[i + radius] * data[y * stride + std::clamp(x + i, 0, width - 1) * 4 + channel];
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+            for (int channel = 0; channel < 4; ++channel) {
+                double value = 0;
+                for (int i = -radius; i <= radius; ++i)
+                    value += weights[i + radius] * horizontal[(std::clamp(y + i, 0, height - 1) * width + x) * 4 + channel];
+                data[y * stride + x * 4 + channel] = static_cast<unsigned char>(std::lround(value));
+            }
+    cairo_surface_mark_dirty(result->surface);
+    return result;
 }
 
 // A unique staging file and rename prevent partial cache entries, including
@@ -218,14 +253,14 @@ struct AlbumArtCache::Impl {
         if (image) {
             auto preview = resized(image.get(), preview_pixels);
             if (preview) {
-                entry->preview.store(texture(preview.get(), preview_pixels));
+                entry->preview.store(blurred_preview(preview.get()));
                 changed = true;
             }
             publish_detail(entry, image.get(), entry->desired_pixels.load());
             // Publish before compression / disk writes so the first view is ready sooner.
             if (!stopping) {
                 if (preview)
-                    save_png(preview.get(), entry->directory / "preview.png");
+                    save_png(preview.get(), entry->directory / "tiny-24.png");
                 save_png(image.get(), entry->directory / "full.png");
             }
         } else if (!stopping) {
@@ -265,9 +300,14 @@ struct AlbumArtCache::Impl {
         submit(preview_pool, [this, entry] {
             const auto sidecars = covers(entry->tracks);
             entry->directory = directory / fingerprint(entry->tracks, sidecars);
-            auto image = load_image(entry->directory / "preview.png", preview_pixels);
+            auto image = load_image(entry->directory / "tiny-24.png", preview_pixels);
+            if (!image) {
+                image = load_image(entry->directory / "preview.png", preview_pixels);
+                if (image)
+                    save_png(image.get(), entry->directory / "tiny-24.png");
+            }
             if (image) {
-                entry->preview.store(texture(image.get(), preview_pixels));
+                entry->preview.store(blurred_preview(image.get()));
                 entry->preview_ready = true;
                 changed = true;
                 detail(entry);
@@ -325,6 +365,26 @@ void AlbumArtCache::release(const Handle &) {
 std::shared_ptr<const AlbumTexture> AlbumArtCache::image(const Handle &entry) const {
     auto image = entry->detail.load();
     return image ? image : entry->preview.load();
+}
+
+std::shared_ptr<const AlbumTexture> AlbumArtCache::preview(const Handle &entry) const {
+    return entry->preview.load();
+}
+
+bool AlbumArtCache::preview_ready(const Handle &entry) const {
+    return entry->preview.load() || entry->preview_ready.load() ||
+        (entry->requested.load() && !pending());
+}
+
+bool AlbumArtCache::detail_ready(const Handle &entry, int pixels) const {
+    const auto detail = entry->detail.load();
+    if (detail && (detail->pixels == -1 || detail->pixels >= pixels))
+        return true;
+    if (entry->preview_ready.load() && (!entry->preview.load() || entry->detail_failed.load()))
+        return true;
+    // A worker exception or texture-allocation failure must not hold the batch.
+    const int desired = entry->desired_pixels.load();
+    return entry->requested.load() && (desired == -1 || desired >= pixels) && !pending();
 }
 
 bool AlbumArtCache::take_changed() { return impl_->changed.exchange(false); }

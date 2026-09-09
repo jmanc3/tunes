@@ -437,9 +437,11 @@ static void handle_surface_configure(void *data,
         xdg_toplevel_set_min_size(win->xdg_toplevel, win->min_width, win->min_height);
     }
     win->configured = true;
-    wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-    log("surface commit");
-    wl_surface_commit(win->surface);
+    if (!win->rw || !win->rw->defer_initial_frame) {
+        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+        log("surface commit");
+        wl_surface_commit(win->surface);
+    }
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -530,6 +532,12 @@ void on_window_render(wl_window *win) {
         wl_window_resize_buffer(win, win->logical_width, win->logical_height);
         win->resize_next = false;
     }
+    if (win->rw && win->rw->defer_initial_frame) {
+        if (!win->rw->first_frame_ready ||
+            !win->rw->first_frame_ready(win->rw, win->scaled_w, win->scaled_h))
+            return;
+        win->rw->defer_initial_frame = false;
+    }
     log("on_window_render");
     wl_buffer_slot *slot = nullptr;
     for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
@@ -549,7 +557,7 @@ void on_window_render(wl_window *win) {
             win->rw->on_render(win->rw, win->scaled_w, win->scaled_h);
         }
     }
-    if (win->rw && win->rw->on_render && win->rw->fractional_scale_set_once &&
+    if (win->rw && win->rw->on_render && (win->rw->fractional_scale_set_once || win->rw->first_frame_ready) &&
         win->rw->on_next_frame && !win->frame_callback) {
         static const wl_callback_listener listener = {
             .done = [](void *data, wl_callback *callback, uint32_t) {
@@ -781,9 +789,11 @@ struct wl_window *wl_window_create(struct wl_context *ctx,
         wl_display_dispatch(ctx->display);
 
     wl_window_resize_buffer(win, win->scaled_w, win->scaled_h); // create shm buffer
-    wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-    log("surface commit");
-    wl_surface_commit(win->surface);
+    if (!win->rw || !win->rw->defer_initial_frame) {
+        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+        log("surface commit");
+        wl_surface_commit(win->surface);
+    }
 
     win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
     wp_fractional_scale_v1_add_listener(win->fractional_scale, &fractional_scale_listener, win);
@@ -939,9 +949,11 @@ struct wl_window *wl_layer_window_create(struct wl_context *ctx, int width, int 
         wl_display_dispatch(ctx->display);
 
     wl_window_resize_buffer(win, win->scaled_w, win->scaled_h); // create shm buffer
-    wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-    log("surface commit");
-    wl_surface_commit(win->surface);
+    if (!win->rw || !win->rw->defer_initial_frame) {
+        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
+        log("surface commit");
+        wl_surface_commit(win->surface);
+    }
 
     win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
     wp_fractional_scale_v1_add_listener(win->fractional_scale, &fractional_scale_listener, win);
@@ -2184,6 +2196,7 @@ RawWindow *windowing::open_window(RawApp *app, WindowType type, RawWindowSetting
     
     auto rw = new RawWindow;
     rw->creator = app;
+    rw->defer_initial_frame = settings.defer_initial_frame;
     rw->id = unique_id++;
 
     if (type == WindowType::NORMAL) {
