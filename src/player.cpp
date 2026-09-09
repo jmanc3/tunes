@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -15,17 +16,15 @@
 #include <vector>
 
 #include "miniaudio.h"
+#include <pulse/pulseaudio.h>
 
 namespace {
 
 constexpr ma_format format = ma_format_f32;
 constexpr ma_uint32 channels = 2;
-constexpr ma_uint32 sample_rate = 48000;
 constexpr ma_uint64 max_chunk = 4096;
 
 constexpr double transport_fade_ms = 5.0;
-constexpr ma_uint64 transport_fade_frames =
-    static_cast<ma_uint64>(sample_rate * transport_fade_ms / 1000.0);
 
 constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
 
@@ -48,6 +47,7 @@ struct prepared_decoder {
 
 prepared_decoder open_decoder(
     const std::string& path,
+    ma_uint32 sample_rate,
     ma_uint64 prefix_frames_wanted,
     ma_uint64 seek_frame = 0
 ) {
@@ -104,8 +104,11 @@ struct Player::Impl {
         done
     };
 
-    explicit Impl(double crossfade_ms)
-        : fade_frames(
+    explicit Impl(double crossfade_ms, ma_uint32 output_rate = 48000)
+        : sample_rate(output_rate),
+          transport_fade_frames(static_cast<ma_uint64>(output_rate * transport_fade_ms / 1000.0)),
+          crossfade_ms(crossfade_ms),
+          fade_frames(
               crossfade_ms <= 0.0
                   ? 0
                   : static_cast<ma_uint64>(
@@ -136,6 +139,28 @@ struct Player::Impl {
         }
 
         device_initialized = true;
+        // Query this device's server before the audio thread starts using its mainloop.
+        if (device.pContext && device.pContext->backend == ma_backend_pulseaudio &&
+            device.pulse.pPulseContext && device.pulse.pMainLoop) {
+            auto *context = static_cast<pa_context *>(device.pulse.pPulseContext);
+            auto *loop = static_cast<pa_mainloop *>(device.pulse.pMainLoop);
+            auto *operation = pa_context_get_server_info(context,
+                [](pa_context *, const pa_server_info *info, void *userdata) {
+                    *static_cast<bool *>(userdata) = info && info->server_name &&
+                        std::string_view(info->server_name).find("PipeWire") != std::string_view::npos;
+                }, &pipewire_backend);
+            if (operation) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                while (pa_operation_get_state(operation) == PA_OPERATION_RUNNING &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    if (pa_mainloop_iterate(loop, 0, nullptr) < 0)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                pa_operation_cancel(operation);
+                pa_operation_unref(operation);
+            }
+        }
         worker = std::thread(&Impl::prepare_loop, this);
     }
 
@@ -529,7 +554,7 @@ struct Player::Impl {
         std::size_t index,
         ma_uint64 seek_frame
     ) {
-        prepared_decoder prepared = open_decoder(path, fade_frames, seek_frame);
+        prepared_decoder prepared = open_decoder(path, sample_rate, fade_frames, seek_frame);
         if (!prepared.decoder)
             return false;
 
@@ -606,7 +631,7 @@ struct Player::Impl {
             std::string prepared_path;
 
             for (const auto& candidate : candidates) {
-                prepared = open_decoder(candidate.second, fade_frames);
+                prepared = open_decoder(candidate.second, sample_rate, fade_frames);
 
                 if (prepared.decoder) {
                     prepared_index = candidate.first;
@@ -862,6 +887,31 @@ struct Player::Impl {
         return start_device();
     }
 
+    bool restore_session(const std::vector<std::string> &tracks, std::size_t index, double seconds) {
+        pause_device();
+        std::lock_guard<std::mutex> lock(mutex);
+        clear_playback_locked();
+        live_queue = tracks;
+        if (tracks.empty())
+            return true;
+        if (index >= tracks.size())
+            index = 0;
+        if (!load_current_locked(tracks[index], index, 0)) {
+            if (!load_first_playable_locked()) {
+                set_error_locked("Could not restore any queued track.");
+                return false;
+            }
+            seconds = 0;
+        }
+        if (std::isfinite(seconds) && seconds > 0 && current_length_frames > 0) {
+            const double frames = std::min(seconds * sample_rate, static_cast<double>(current_length_frames - 1));
+            // Keep the successfully opened track at its beginning if seeking fails.
+            load_current_locked(current_path, current_index, static_cast<ma_uint64>(frames));
+        }
+        clear_error_locked();
+        return true;
+    }
+
     void queue_changed(const std::vector<std::string>& editable_queue) {
         if (!device_initialized)
             return;
@@ -997,7 +1047,11 @@ struct Player::Impl {
 
     ma_device device{};
     bool device_initialized = false;
+    bool pipewire_backend = false;
 
+    const ma_uint32 sample_rate;
+    const ma_uint64 transport_fade_frames;
+    const double crossfade_ms;
     const ma_uint64 fade_frames;
 
     mutable std::mutex mutex;
@@ -1053,6 +1107,43 @@ Player::Player(double crossfade_ms)
     : impl_(std::make_unique<Impl>(std::max(0.0, crossfade_ms))) {
 }
 
+unsigned Player::sample_rate() const noexcept {
+    return impl_->sample_rate;
+}
+
+bool Player::uses_pipewire() const noexcept {
+    return impl_->pipewire_backend;
+}
+
+bool Player::set_sample_rate(unsigned rate) {
+    if (rate < 8000 || rate > 384000) {
+        impl_->set_error("Sample rate must be between 8000 and 384000 Hz.");
+        return false;
+    }
+    if (rate == sample_rate())
+        return true;
+    auto candidate = std::make_unique<Impl>(impl_->crossfade_ms, rate);
+    if (!candidate->device_initialized) {
+        impl_->set_error("Could not open audio output at " + std::to_string(rate) + " Hz. Previous rate retained.");
+        return false;
+    }
+    const bool playing = is_playing();
+    pause();
+    const auto position = playback_position();
+    candidate->volume.store(volume());
+    if (!candidate->restore_session(queue_, position.index, position.seconds) ||
+        (playing && !candidate->start(queue_))) {
+        const auto error = candidate->get_last_error();
+        candidate.reset();
+        if (playing)
+            start();
+        impl_->set_error("Could not change output rate: " + error);
+        return false;
+    }
+    impl_.swap(candidate);
+    return true;
+}
+
 Player::~Player() = default;
 
 std::vector<std::string>& Player::queue() noexcept {
@@ -1101,6 +1192,17 @@ float Player::seek_position() const {
 
 bool Player::play_queued_item(std::size_t index) {
     return impl_->play_queue_index(queue_, index);
+}
+
+bool Player::restore_session(std::vector<std::string> tracks, std::size_t index, double seconds) {
+    queue_ = std::move(tracks);
+    return impl_->restore_session(queue_, index, seconds);
+}
+
+Player::Position Player::playback_position() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return {impl_->current_path, impl_->current_index,
+        static_cast<double>(impl_->current_time_frames) / impl_->sample_rate};
 }
 
 bool Player::play_track(const std::string& path) {

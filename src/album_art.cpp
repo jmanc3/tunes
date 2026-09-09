@@ -1,3 +1,4 @@
+#include "tunes_paths.h"
 #include "album_art.h"
 #include "audio_data.h"
 #include "ThreadPool.h"
@@ -169,9 +170,9 @@ struct AlbumArtCache::Impl {
     }
 
     void publish_detail(const Handle &entry, GdkPixbuf *image, int pixels) {
-        if (pixels <= 0 || stopping)
+        if (pixels == 0 || stopping)
             return;
-        auto scaled = resized(image, pixels);
+        auto scaled = pixels < 0 ? Pixbuf(static_cast<GdkPixbuf *>(g_object_ref(image)), g_object_unref) : resized(image, pixels);
         if (scaled && entry->desired_pixels == pixels) {
             entry->detail.store(texture(scaled.get(), pixels));
             if (entry->desired_pixels != pixels)
@@ -237,12 +238,12 @@ struct AlbumArtCache::Impl {
     void detail(const Handle &entry) {
         const int pixels = entry->desired_pixels;
         auto current = entry->detail.load();
-        if (stopping || entry->detail_failed || !entry->preview_ready || !entry->preview.load() || pixels <= 0 ||
-            (current && current->pixels >= pixels) || entry->detail_loading.exchange(true))
+        if (stopping || entry->detail_failed || !entry->preview_ready || !entry->preview.load() || pixels == 0 ||
+            (current && (current->pixels == -1 || (pixels > 0 && current->pixels >= pixels))) || entry->detail_loading.exchange(true))
             return;
         submit(detail_pool, [this, entry] {
             const int pixels = entry->desired_pixels;
-            if (pixels > 0) {
+            if (pixels != 0) {
                 auto image = load_image(entry->directory / "full.png", pixels);
                 if (!image) {
                     image = source(entry, covers(entry->tracks));
@@ -286,13 +287,23 @@ struct AlbumArtCache::Impl {
 
 AlbumArtCache::AlbumArtCache(fs::path directory)
     : impl_(std::make_unique<Impl>(directory.empty()
-          ? fs::path(g_get_user_cache_dir()) / "tunes" / "art-v1" : std::move(directory))) {}
+          ? tunes_cache_directory() / "art-v1" : std::move(directory))) {}
 AlbumArtCache::~AlbumArtCache() = default;
 
 AlbumArtCache::Handle AlbumArtCache::create(std::vector<std::string> tracks) {
     auto entry = std::make_shared<Entry>();
     entry->tracks = std::move(tracks);
     return entry;
+}
+
+AlbumArtCache::Handle AlbumArtCache::create_preview(const Handle &source) {
+    auto entry = clone(source);
+    request(entry, -1);
+    return entry;
+}
+
+AlbumArtCache::Handle AlbumArtCache::clone(const Handle &source) {
+    return create(source->tracks);
 }
 
 void AlbumArtCache::request(const Handle &entry, int pixels) {

@@ -129,6 +129,15 @@ int main() {
                 return !cache.pending();
             });
             check(cache.image(entry)->width == 384, "resize/release race published a stale texture");
+            auto preview = cache.create_preview(entry);
+            cache.release(entry);
+            wait_for([&] { return !cache.pending(); });
+            const auto full = cache.image(preview);
+            check(full && full->width == 1600 && full->height == 1200 && full->pixels == -1,
+                  "overlay did not receive original-resolution artwork");
+            check(reads == 1, "overlay bypassed the existing album cache");
+            cache.release(preview);
+            check(cache.image(preview)->pixels == 128, "closed overlay retained full texture");
         }
 
         std::ofstream(track, std::ios::app) << "changed";

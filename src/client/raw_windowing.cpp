@@ -479,32 +479,16 @@ static const struct xdg_popup_listener xdg_popup_listener = {
 
 /* ---- helper: create a simple shm buffer so surface is mapped ---- */
 static int create_shm_file(size_t size) {
-    char temp[] = "/tmp/wl-shm-XXXXXX";
-    int fd = mkstemp(temp);
-    if (fd >= 0) {
-        unlink(temp); // unlink so it is removed after close
-        if (ftruncate(fd, size) < 0) {
-            close(fd);
-            return -1;
-        }
+    int fd = memfd_create("tunes-wayland", MFD_CLOEXEC);
+    if (fd >= 0 && ftruncate(fd, size) < 0) {
+        close(fd);
+        return -1;
     }
     return fd;
 }
 
 static int create_anonymous_file(off_t size) {
-    char path[] = "/dev/shm/wayland-shm-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd < 0) {
-        fprintf(stderr, "mkstemp failed: %s\n", strerror(errno));
-        return -1;
-    }
-    unlink(path);
-    if (ftruncate(fd, size) < 0) {
-        fprintf(stderr, "ftruncate failed: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-    return fd;
+    return create_shm_file(size);
 }
 
 static void destroy_shm_buffer(struct wl_window *win) {

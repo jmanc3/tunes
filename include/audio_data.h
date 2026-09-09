@@ -23,7 +23,13 @@ struct AlbumOption {
     std::vector<Option> songs;
 };
 
-std::vector<Option> load_library();
+// Sorted output rates advertised by ALSA USB stream descriptors, with fallback.
+std::vector<unsigned> output_sample_rates(const std::string &asound_root = "/proc/asound");
+std::string default_music_directory();
+std::string normalize_music_directory(const std::string &path);
+std::string library_cache_path(const std::string &music_path);
+std::vector<Option> load_library(const std::string &music_path = {}, bool scan_if_missing = true);
+Option read_track(const std::string &path);
 std::vector<AlbumOption> to_albums(std::vector<Option> &playable);
 std::vector<Option> rescan_library(const std::string &music_path, const std::string &cache_path);
 int getDiscNumber(const std::string &filePath);

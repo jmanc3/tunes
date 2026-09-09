@@ -52,6 +52,15 @@ public:
     // Immediately jumps to an existing queue item and starts it.
     bool play_queued_item(std::size_t index);
 
+    // Loads a listening session without ever starting the audio device.
+    bool restore_session(std::vector<std::string> tracks, std::size_t index, double seconds);
+    struct Position {
+        std::string path;
+        std::size_t index;
+        double seconds;
+    };
+    Position playback_position() const;
+
     // Force-plays a path now while preserving queue continuation.
     //
     // Example, while album_1 is playing:
@@ -66,6 +75,11 @@ public:
     // Linear gain: 0.0 = silent, 1.0 = normal.
     void set_volume(float volume) noexcept;
     float volume() const noexcept;
+
+    // Reconfigures output and decoders, preserving playback; failure keeps the old rate.
+    bool set_sample_rate(unsigned rate);
+    unsigned sample_rate() const noexcept;
+    bool uses_pipewire() const noexcept;
 
     std::string current_path() const;
     std::size_t current_index() const;

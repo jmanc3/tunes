@@ -24,8 +24,11 @@ public:
     explicit AlbumArtCache(std::filesystem::path directory = {});
     ~AlbumArtCache();
     Handle create(std::vector<std::string> tracks);
+    Handle clone(const Handle &source);
+    // Independent request sharing the same disk cache, unaffected by grid eviction.
+    Handle create_preview(const Handle &source);
     // UI-thread calls: enqueue only, with no filesystem access or decoding.
-    // pixels == 0 preloads just the preview for a nearby, offscreen card.
+    // pixels == 0 preloads just the preview; -1 loads the original resolution.
     void request(const Handle &entry, int pixels);
     void release(const Handle &entry);
     std::shared_ptr<const AlbumTexture> image(const Handle &entry) const;

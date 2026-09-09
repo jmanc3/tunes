@@ -1,4 +1,6 @@
+#include "tunes_paths.h"
 #include "audio_data.h"
+#include <glib.h>
 
 #include <vector>
 
@@ -9,6 +11,8 @@
 #endif
 
 #include <algorithm>
+#include <charconv>
+#include <set>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -300,49 +304,42 @@ static void write_to(std::ofstream &file, std::string header, std::string body) 
     file << std::endl;
 }
 
+Option read_track(const std::string &path) {
+    Option o;
+    TagLib::FileRef tag_file(path.c_str());
+    if (tag_file.isNull() || !tag_file.file()->isValid())
+        return o;
+    o.full = path;
+    if (auto *tag = tag_file.tag()) {
+        o.name = tag->title().to8Bit(true);
+        o.artist = tag->artist().to8Bit(true);
+        o.album = tag->album().to8Bit(true);
+        o.album_all_lower = toLower(o.album);
+        o.genre = tag->genre().to8Bit(true);
+        o.disc = std::to_string(getDiscNumber(path));
+        o.year = std::to_string(tag->year());
+        o.track = std::to_string(tag->track());
+    }
+    if (o.name.empty())
+        o.name = std::filesystem::path(path).filename().string();
+    if (auto *properties = tag_file.audioProperties())
+        o.length = std::to_string(properties->lengthInSeconds());
+    return o;
+}
+
 static void cache_creation_thread(std::string cache_path, std::string path_to_search) {
     namespace fs = std::filesystem;
 
-    unsigned int threads = std::thread::hardware_concurrency();
-    if (threads == 0)
-        threads = 8;
+    const auto threads = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
     ThreadPool pool(threads);
     std::vector< std::future<Option> > results;
 
     std::vector<std::string> albums;
-    for (const auto& entry : fs::recursive_directory_iterator(path_to_search)) {
+    for (const auto& entry : fs::recursive_directory_iterator(path_to_search, fs::directory_options::skip_permission_denied)) {
         if (fs::is_regular_file(entry.path())) {
             std::string full_path = entry.path().string();
 
-            results.emplace_back(pool.enqueue([full_path, entry] {
-                Option o;
-                TagLib::FileRef tag_file(full_path.c_str());
-                if (tag_file.isNull()) {
-                   return o;
-                }
-                TagLib::Tag *tag = tag_file.tag();
-                if (tag) {
-                    o.full = full_path;
-                    o.name = tag->title().to8Bit(true);  // Convert to std::string
-                    if (o.name.empty()) {
-                        o.name = entry.path().filename().string();
-                    }
-                    o.artist = tag->artist().to8Bit(true);  // Convert to std::string
-                    o.album = tag->album().to8Bit(true);  // Convert to std::string
-                    o.genre = tag->genre().to8Bit(true);  // Convert to std::string
-                    o.disc = std::to_string(getDiscNumber(full_path));
-                    o.year = std::to_string((int) tag->year());  // Convert to std::string
-                    o.track = std::to_string((int) tag->track());  // Convert to std::string
-                }
-
-                TagLib::AudioProperties *properties = tag_file.audioProperties();
-                if (properties) {
-                   o.length = std::to_string(properties->lengthInSeconds());
-                }
-                return o;
-
-                //options.push_back(o);
-            }));
+            results.emplace_back(pool.enqueue([full_path] { return read_track(full_path); }));
         }
     }
 
@@ -461,17 +458,80 @@ std::vector<Option> rescan_library(const std::string &music_path, const std::str
     }
 }
 
-std::vector<Option> load_library() {
+std::vector<unsigned> output_sample_rates(const std::string &asound_root) {
+    namespace fs = std::filesystem;
+    const std::vector<unsigned> fallback{44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000};
+    std::set<unsigned> rates;
+    std::error_code error;
+    fs::directory_iterator cards(asound_root, fs::directory_options::skip_permission_denied, error);
+    const fs::directory_iterator end;
+    for (; !error && cards != end; cards.increment(error)) {
+        if (!cards->path().filename().string().starts_with("card"))
+            continue;
+        std::error_code stream_error;
+        fs::directory_iterator streams(cards->path(), fs::directory_options::skip_permission_denied, stream_error);
+        for (; !stream_error && streams != end; streams.increment(stream_error)) {
+            if (!streams->path().filename().string().starts_with("stream"))
+                continue;
+            std::ifstream input(streams->path());
+            std::string line;
+            bool capture = false;
+            while (std::getline(input, line)) {
+                const auto first = line.find_first_not_of(" \t");
+                if (first == std::string::npos)
+                    continue;
+                const std::string_view text(line.data() + first, line.size() - first);
+                if (text.starts_with("Playback:")) capture = false;
+                if (text.starts_with("Capture:")) capture = true;
+                if (capture || !text.starts_with("Rates:"))
+                    continue;
+                std::string values(text.substr(6));
+                std::replace(values.begin(), values.end(), ',', ' ');
+                std::istringstream tokens(values);
+                std::string token;
+                while (tokens >> token) {
+                    unsigned rate = 0;
+                    const auto [last, result] = std::from_chars(token.data(), token.data() + token.size(), rate);
+                    if (result == std::errc{} && last == token.data() + token.size() && rate >= 8000 && rate <= 384000)
+                        rates.insert(rate);
+                }
+            }
+        }
+    }
+    return rates.empty() ? fallback : std::vector<unsigned>(rates.begin(), rates.end());
+}
+
+std::string default_music_directory() {
+    return (std::filesystem::path(g_get_home_dir()) / "Music").string();
+}
+
+std::string normalize_music_directory(const std::string &path) {
+    namespace fs = std::filesystem;
+    const auto input = fs::path(path.empty() ? default_music_directory() : path);
+    std::error_code error;
+    auto normalized = fs::weakly_canonical(input, error);
+    if (error)
+        normalized = fs::absolute(input).lexically_normal();
+    return normalized.string();
+}
+
+std::string library_cache_path(const std::string &music_path) {
+    const auto root = normalize_music_directory(music_path);
+    auto hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, root.c_str(), root.size());
+    const auto path = tunes_cache_directory() / "libraries" / (std::string(hash) + ".cache");
+    g_free(hash);
+    return path.string();
+}
+
+std::vector<Option> load_library(const std::string &music_path, bool scan_if_missing) {
     std::vector<Option> options;
-    const char *home = getenv("HOME");
-    if (!home)
-        return options;
-    const std::string cache_path = std::string(home) + "/.cache/tunes/tunes.cache";
+    const auto root = normalize_music_directory(music_path);
+    const auto cache_path = library_cache_path(root);
     try {
         if (std::filesystem::exists(cache_path))
             load_from_cache(cache_path, options);
-        else
-            options = rescan_library(std::string(home) + "/Music", cache_path);
+        else if (scan_if_missing)
+            options = rescan_library(root, cache_path);
     } catch (const std::exception &e) {
         std::cerr << "Library load failed: " << e.what() << std::endl;
     }
@@ -567,8 +627,10 @@ std::vector<AlbumOption> to_albums(std::vector<Option> &playable) {
     };
     std::unordered_map<std::string, std::unordered_map<std::string, DiscFolders>> sibling_albums;
     for (const auto &option : playable) {
+        if (option.album.empty() || option.album == "Unknown")
+            continue;
         const auto folder = std::filesystem::path(option.full).lexically_normal().parent_path();
-        const std::string album = option.album.empty() ? "Unknown" : option.album;
+        const std::string &album = option.album;
         auto &siblings = sibling_albums[folder.parent_path().string()][album];
         const auto folder_name = folder.string();
         if (siblings.first_folder.empty())
@@ -588,10 +650,17 @@ std::vector<AlbumOption> to_albums(std::vector<Option> &playable) {
     }
 
     std::vector<AlbumOption> album_options;
+    AlbumOption unknown;
     std::unordered_map<std::string, std::unordered_map<std::string, std::size_t>> album_indices;
 
     for (const auto &option : playable) {
-        const std::string album = option.album.empty() ? "Unknown" : option.album;
+        if (option.album.empty() || option.album == "Unknown") {
+            unknown.songs.push_back(option);
+            unknown.songs.back().album = "Unknown";
+            unknown.songs.back().album_all_lower = "unknown";
+            continue;
+        }
+        const std::string &album = option.album;
         auto folder = std::filesystem::path(option.full).lexically_normal().parent_path();
         const auto &siblings = sibling_albums.at(folder.parent_path().string()).at(album);
         // Combine sibling folders only when their disc numbers do not overlap.
@@ -604,11 +673,9 @@ std::vector<AlbumOption> to_albums(std::vector<Option> &playable) {
 
         auto &songs = album_options[it->second].songs;
         songs.push_back(option);
-        if (option.album.empty()) {
-            songs.back().album = album;
-            songs.back().album_all_lower = toLower(album);
-        }
     }
 
+    if (!unknown.songs.empty())
+        album_options.push_back(std::move(unknown));
     return album_options;
 }

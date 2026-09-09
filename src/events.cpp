@@ -1,3 +1,4 @@
+#include "tunes_paths.h"
 
 #include "events.h"
 
@@ -449,22 +450,18 @@ void log_json(const std::string& msg) {
 
     std::lock_guard<std::mutex> lock(writeMutex);
 
+    std::error_code error;
+    std::filesystem::create_directories(tunes_cache_directory(), error);
+    if (error)
+        return;
+    const auto log_path = tunes_cache_directory() / "log.json";
     if (firstCall) {
-        ofs.open("/tmp/log.json", std::ios::out | std::ios::trunc);
+        ofs.open(log_path, std::ios::out | std::ios::trunc);
         firstCall = false;
 
-        // Replace "program" with something that displays a live-updating file.
-        // Example choices:
-        //   - `xterm -e "tail -f /tmp/log"`
-        //   - `gedit /tmp/log`
-        //   - `glow /tmp/log`
-        //std::thread t([]() {
-            //system("alacritty -e tail -f /tmp/log");
-        //});
-        //t.detach();
     } else if (!ofs.is_open()) {
         // If log is called after close, recover
-        ofs.open("/tmp/log.json", std::ios::out | std::ios::app);
+        ofs.open(log_path, std::ios::out | std::ios::app);
     }
 
     ofs << msg << '\n';
