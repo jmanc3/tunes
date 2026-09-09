@@ -146,11 +146,9 @@ int main() {
     check(save_session(old_session, state), "legacy fixture save failed");
     const auto old_library = old_session.parent_path() / "libraries" / "legacy.session";
     check(save_session(old_library, state_a), "legacy library fixture save failed");
-    migrate_legacy_sessions();
     check(load_session(session_state_path()) == state && !fs::exists(old_session), "global session migration failed");
     check(load_session(session_state_path().parent_path() / "libraries" / "legacy.session") == state_a &&
           !fs::exists(old_library), "library session migration failed");
-    migrate_legacy_sessions();
     check(load_session(session_state_path()) == state, "repeated migration changed saved state");
     const auto file = base / "state" / "session";
     check(save_session(file, state), "save failed");

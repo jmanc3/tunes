@@ -13,29 +13,6 @@ std::filesystem::path session_state_path() {
     return tunes_cache_directory() / "session-v1";
 }
 
-void migrate_legacy_sessions() {
-    namespace fs = std::filesystem;
-    const auto legacy = fs::path(g_get_user_state_dir()) / "tunes";
-    auto migrate = [&](const fs::path &source, const fs::path &destination) {
-        std::error_code error;
-        if (!fs::is_regular_file(source, error) || fs::exists(destination, error))
-            return;
-        fs::create_directories(destination.parent_path());
-        fs::rename(source, destination, error);
-        if (error) {
-            // State and cache directories may live on different filesystems.
-            fs::copy_file(source, destination);
-            fs::remove(source);
-        }
-    };
-    migrate(legacy / "session-v1", session_state_path());
-    std::error_code error;
-    for (const auto &entry : fs::directory_iterator(legacy / "libraries", error)) {
-        if (entry.path().extension() == ".session")
-            migrate(entry.path(), tunes_cache_directory() / "libraries" / entry.path().filename());
-    }
-}
-
 std::filesystem::path library_session_path(const std::string &music_root) {
     const auto root = normalize_music_directory(music_root);
     auto hash = g_compute_checksum_for_string(G_CHECKSUM_SHA256, root.c_str(), root.size());

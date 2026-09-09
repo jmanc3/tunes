@@ -136,18 +136,18 @@ static void initialize_playback(StartupState &startup) {
     player->set_volume(startup.session.volume);
     if (!player->set_sample_rate(startup.session.sample_rate))
         std::cerr << player->last_error() << '\n';
-    if (startup.defer_queue_until_scan)
-        return;
+    // if (startup.defer_queue_until_scan)
+    //     return;
     // Opening a library restores paused playback; explicit files request playback.
-    if (startup.explicit_files) {
-        const bool loaded = player->restore_session(std::move(startup.queue), 0, 0);
-        if (!player->queue().empty() && (!loaded || !player->start()))
-            std::cerr << "Could not start playback: " << player->last_error() << '\n';
-    } else {
-        remove_missing_tracks(startup.session);
-        if (!player->restore_session(startup.session.queue, startup.session.current_index, startup.session.seconds))
-            std::cerr << "Could not restore playback: " << player->last_error() << '\n';
-    }
+    // if (startup.explicit_files) {
+    //     const bool loaded = player->restore_session(std::move(startup.queue), 0, 0);
+    //     if (!player->queue().empty() && (!loaded || !player->start()))
+    //         std::cerr << "Could not start playback: " << player->last_error() << '\n';
+    // } else {
+    //     remove_missing_tracks(startup.session);
+    //     if (!player->restore_session(startup.session.queue, startup.session.current_index, startup.session.seconds))
+    //         std::cerr << "Could not restore playback: " << player->last_error() << '\n';
+    // }
 }
 
 struct ArtRefresh {
@@ -401,6 +401,7 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
         if (c->real_bounds.intersection(c->parent->real_bounds).empty())
             return;
         const auto art = static_cast<RootData *>(root->user_data)->artwork->image(data->art);
+        // AlbumTexture *art = nullptr;
 
         cairo_save(cr);
         set_rect(cr, c->parent->real_bounds);
@@ -660,6 +661,8 @@ struct PlaybackData : UserData {
 };
 
 static PlaybackData *playback_data(Container *root) {
+    //static PlaybackData *d = new PlaybackData;
+    //return d;
     return static_cast<PlaybackData *>(static_cast<RootData *>(root->user_data)->playback_bar->user_data);
 }
 
@@ -1686,7 +1689,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     try {
-        migrate_legacy_sessions();
         StartupState startup;
         configure_startup(startup, argc, argv);
         auto owned_player = std::make_unique<Player>();

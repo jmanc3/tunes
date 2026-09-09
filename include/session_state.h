@@ -24,7 +24,6 @@ struct SessionState {
 };
 
 std::filesystem::path session_state_path();
-void migrate_legacy_sessions();
 std::filesystem::path library_session_path(const std::string &music_root);
 SessionState load_library_session(const std::string &music_root, const SessionState &last_session);
 SessionState load_session(const std::filesystem::path &path);
