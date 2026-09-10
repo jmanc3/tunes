@@ -24,7 +24,6 @@ PKGS := \
 	xkbcommon \
 	libdrm \
 	pixman-1 \
-	hyprland \
 	libinput \
 	libudev \
 	gio-2.0 \

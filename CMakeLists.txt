@@ -36,15 +36,14 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
     xkbcommon
     libdrm
     pixman-1
-    hyprland
     libinput
     libudev
     gio-2.0
     dbus-1
     alsa
+    gtk+-3.0
     libpipewire-0.3
     libpulse
-    gtk+-3.0
     libmagic
     taglib
 )
