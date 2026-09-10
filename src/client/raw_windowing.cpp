@@ -1,9 +1,10 @@
 // wl_input.c
  
 #include "client/raw_windowing.h"
+#include "client/egl_window.h"
+#include <cstdlib>
 
 
-#include <cairo-deprecated.h>
 #include <cstddef>
 #include <chrono>
 #include <cmath>
@@ -29,10 +30,7 @@
 
 #include <wayland-client.h>
 #include <vector>
-#include <cairo.h>
-#include <pango/pangocairo.h>
 #include <wayland-client.h>
-#include <cairo/cairo.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -77,8 +75,7 @@ bool wl_window_resize_buffer(struct wl_window *win, int new_width, int new_heigh
 
 struct wl_buffer_slot {
     wl_buffer *buffer = nullptr;
-    cairo_surface_t *cairo_surface = nullptr;
-    cairo_t *cr = nullptr;
+    std::unique_ptr<drawing::Context> cr;
 
     void *data = nullptr;
     size_t size = 0;
@@ -275,6 +272,9 @@ struct wl_window {
     struct wp_fractional_scale_v1 *fractional_scale = nullptr;
     wp_viewport *viewport = nullptr;
     wl_buffer_slot slots[WL_TRIPLE_BUFFER_COUNT];
+    std::unique_ptr<EGLWindow> gpu;
+    bool gpu_failed = false;
+    bool redraw_pending = false;
     bool dropped_frame = false;
     wl_callback *frame_callback = nullptr;
     bool resize_next = false;
@@ -288,7 +288,7 @@ struct wl_window {
 
     std::function<void(wl_window *)> on_render = nullptr;
 
-    cairo_t *cr = nullptr;  // points to current slot's cr (e.g. slots[0]) for API use
+    drawing::Context *cr = nullptr;  // points to current slot's cr (e.g. slots[0]) for API use
     
     int pending_width, pending_height; // recieved from configured event
     int min_width = 0, min_height = 0; // applied after first configure so initial size is (w,h)
@@ -316,7 +316,7 @@ std::vector<wl_context *> apps;
 std::vector<wl_window *> windows;
 
 static struct wl_buffer *create_shm_buffer(struct wl_context *d, int width, int height);
-static struct wl_buffer *get_attach_buffer(struct wl_window *win);
+static void commit_buffer(struct wl_window *win);
 
 static void buffer_release(void *data, struct wl_buffer *wl_buffer) {
     log("buffer released and available");
@@ -438,9 +438,7 @@ static void handle_surface_configure(void *data,
     }
     win->configured = true;
     if (!win->rw || !win->rw->defer_initial_frame) {
-        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-        log("surface commit");
-        wl_surface_commit(win->surface);
+        commit_buffer(win);
     }
 }
 
@@ -497,14 +495,7 @@ static int create_anonymous_file(off_t size) {
 static void destroy_shm_buffer(struct wl_window *win) {
     for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
         wl_buffer_slot *slot = &win->slots[i];
-        if (slot->cairo_surface) {
-            cairo_surface_destroy(slot->cairo_surface);
-            slot->cairo_surface = nullptr;
-        }
-        if (slot->cr) {
-            cairo_destroy(slot->cr);
-            slot->cr = nullptr;
-        }
+        slot->cr.reset();
         if (slot->buffer) {
             wl_buffer_destroy(slot->buffer);
             slot->buffer = nullptr;
@@ -518,18 +509,33 @@ static void destroy_shm_buffer(struct wl_window *win) {
         slot->busy = false;
     }
     win->cr = nullptr;
+    if (win->rw) win->rw->drawing_context = nullptr;
 }
 
-static wl_buffer *get_attach_buffer(struct wl_window *win) {
-    return win->slots[0].buffer;
+void on_window_render(wl_window *win);
+
+static void commit_buffer(wl_window *win) {
+    if (win->gpu) {
+        if (win->configured && win->on_render) on_window_render(win);
+        else wl_surface_commit(win->surface); // Initial role/configure handshake.
+    } else {
+        if (win->slots[0].buffer) wl_surface_attach(win->surface, win->slots[0].buffer, 0, 0);
+        wl_surface_commit(win->surface);
+    }
 }
 
 void on_window_render(wl_window *win) {
 #ifdef TRACY_ENABLE
     ZoneScoped;
 #endif
+    if (!win->configured) return;
+    if (win->gpu && win->frame_callback) {
+        win->redraw_pending = true;
+        return;
+    }
+    win->redraw_pending = false;
     if (win->resize_next) {
-        wl_window_resize_buffer(win, win->logical_width, win->logical_height);
+        if (!wl_window_resize_buffer(win, win->logical_width, win->logical_height)) return;
         win->resize_next = false;
     }
     if (win->rw && win->rw->defer_initial_frame) {
@@ -540,25 +546,27 @@ void on_window_render(wl_window *win) {
     }
     log("on_window_render");
     wl_buffer_slot *slot = nullptr;
-    for (int i = 0; i < WL_TRIPLE_BUFFER_COUNT; i++) {
-        if (!win->slots[i].busy) {
+    for (int i = 0; !win->gpu && i < WL_TRIPLE_BUFFER_COUNT; i++) {
+        if (win->slots[i].cr && !win->slots[i].busy) {
             slot = &win->slots[i];
             break;
         }
     }
-    if (!slot) {
+    if (!win->gpu && !slot) {
         win->dropped_frame = true;
         return;
     }
 
+    if (win->gpu) win->gpu->begin_frame();
     if (win->rw) {
-        win->rw->cr = slot->cr;
+        win->rw->drawing_context = win->gpu ? win->gpu->context() : slot->cr.get();
         if (win->rw->on_render) {
             win->rw->on_render(win->rw, win->scaled_w, win->scaled_h);
         }
     }
-    if (win->rw && win->rw->on_render && (win->rw->fractional_scale_set_once || win->rw->first_frame_ready) &&
-        win->rw->on_next_frame && !win->frame_callback) {
+    if (slot) slot->cr->flush();
+    if (win->rw && win->rw->on_render && !win->frame_callback &&
+        (win->gpu || ((win->rw->fractional_scale_set_once || win->rw->first_frame_ready) && win->rw->on_next_frame))) {
         static const wl_callback_listener listener = {
             .done = [](void *data, wl_callback *callback, uint32_t) {
                 auto win = static_cast<wl_window *>(data);
@@ -568,10 +576,16 @@ void on_window_render(wl_window *win) {
                 win->rw->on_next_frame = nullptr;
                 if (notify)
                     notify(win->rw);
+                if (win->gpu && win->redraw_pending && !win->marked_for_closing)
+                    on_window_render(win);
             },
         };
         win->frame_callback = wl_surface_frame(win->surface);
         wl_callback_add_listener(win->frame_callback, &listener, win);
+    }
+    if (win->gpu) {
+        win->gpu->present();
+        return;
     }
     wl_surface_attach(win->surface, slot->buffer, 0, 0);
     wl_surface_damage_buffer(win->surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -586,13 +600,36 @@ bool wl_window_resize_buffer(struct wl_window *win, int _new_width, int _new_hei
 #endif
  
     log("wl_window_resize_buffer");
-    destroy_shm_buffer(win);
-
-    win->logical_width = _new_width;
-    win->logical_height = _new_height;
+    win->logical_width = std::max(1, _new_width);
+    win->logical_height = std::max(1, _new_height);
     win->scaled_w = win->logical_width * win->current_fractional_scale;
     win->scaled_h = win->logical_height * win->current_fractional_scale;
 
+    win->scaled_w = std::max(1, win->scaled_w);
+    win->scaled_h = std::max(1, win->scaled_h);
+    if (win->viewport) {
+        wl_surface_set_buffer_scale(win->surface, 1);
+        wp_viewport_set_destination(win->viewport, win->logical_width, win->logical_height);
+    }
+    const char *renderer = std::getenv("TUNES_RENDERER");
+    const bool want_gl = !renderer || std::string_view(renderer) != "cairo";
+    if (win->gpu || (want_gl && !win->gpu_failed)) {
+        try {
+            if (win->gpu) win->gpu->resize(win->scaled_w, win->scaled_h);
+            else win->gpu = std::make_unique<EGLWindow>(win->ctx->display, win->surface, win->scaled_w, win->scaled_h);
+            win->cr = win->gpu->context();
+            if (win->rw) {
+                win->rw->drawing_context = win->cr;
+                win->on_render = on_window_render;
+            }
+            return true;
+        } catch (const std::exception &error) {
+            // Keep a software path on machines without EGL/ES3 support.
+            win->gpu.reset(); win->gpu_failed = true;
+            fprintf(stderr, "OpenGL unavailable; using Cairo: %s\n", error.what());
+        }
+    }
+    destroy_shm_buffer(win);
     const int stride = win->scaled_w * 4;
     const size_t size = (size_t)stride * win->scaled_h;
 
@@ -631,34 +668,27 @@ bool wl_window_resize_buffer(struct wl_window *win, int _new_width, int _new_hei
         slot->size = size;
         slot->stride = stride;
 
-        slot->cairo_surface = cairo_image_surface_create_for_data(
-            (unsigned char*)data,
-            CAIRO_FORMAT_ARGB32,
-            win->scaled_w,
-            win->scaled_h,
-            stride
-        );
-
-        if (cairo_surface_status(slot->cairo_surface) != CAIRO_STATUS_SUCCESS) {
-            fprintf(stderr, "Failed to create cairo surface\n");
+        try {
+            slot->cr = drawing::create_cairo_context(static_cast<unsigned char *>(data),
+                win->scaled_w, win->scaled_h, stride);
+        } catch (const std::exception &error) {
+            fprintf(stderr, "Failed to create drawing context: %s\n", error.what());
             destroy_shm_buffer(win);
             return false;
         }
-
-        slot->cr = cairo_create(slot->cairo_surface);
         wl_buffer_add_listener(slot->buffer, &buffer_listener, win);
     }
 
-    win->cr = win->slots[0].cr;
+    win->cr = win->slots[0].cr.get();
     if (win->rw)
-        win->rw->cr = win->cr;
+        win->rw->drawing_context = win->cr;
 
     if (win->rw) {
         win->on_render = on_window_render;
     }
 
     if (win->viewport) {
-        wl_surface_set_buffer_scale(win->surface, std::ceil(win->current_fractional_scale * 120.0));
+        wl_surface_set_buffer_scale(win->surface, 1);
         
         wp_viewport_set_destination(win->viewport, win->logical_width, win->logical_height);
     }
@@ -693,7 +723,7 @@ static void handle_fractional_scale_preferred_scale(
 
     win->resize_next = true;
 
-    wl_surface_set_buffer_scale(win->surface, std::ceil(scale));
+    wl_surface_set_buffer_scale(win->surface, 1);
 
     wp_viewport_set_destination(win->viewport,
                                 win->logical_width,
@@ -790,9 +820,7 @@ struct wl_window *wl_window_create(struct wl_context *ctx,
 
     wl_window_resize_buffer(win, win->scaled_w, win->scaled_h); // create shm buffer
     if (!win->rw || !win->rw->defer_initial_frame) {
-        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-        log("surface commit");
-        wl_surface_commit(win->surface);
+        commit_buffer(win);
     }
 
     win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
@@ -864,8 +892,7 @@ static void configure_layer_shell(void *data,
     struct wl_window *win = (struct wl_window *)data;
     if (win->configured) {
         config_layer_shell(win, width, height);
-        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-        wl_surface_commit(win->surface);
+        commit_buffer(win);
     }
     win->configured = true;
 }
@@ -950,9 +977,7 @@ struct wl_window *wl_layer_window_create(struct wl_context *ctx, int width, int 
 
     wl_window_resize_buffer(win, win->scaled_w, win->scaled_h); // create shm buffer
     if (!win->rw || !win->rw->defer_initial_frame) {
-        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-        log("surface commit");
-        wl_surface_commit(win->surface);
+        commit_buffer(win);
     }
 
     win->fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(ctx->fractional_scale_manager, win->surface);
@@ -1788,6 +1813,7 @@ void wl_window_destroy(struct wl_window *win) {
     if (win->xdg_surface) xdg_surface_destroy(win->xdg_surface);
     if (win->layer_surface) zwlr_layer_surface_v1_destroy(win->layer_surface);
 
+    win->gpu.reset();
     destroy_shm_buffer(win);
 
     if (win->surface) wl_surface_destroy(win->surface);
@@ -2201,7 +2227,7 @@ RawWindow *windowing::open_window(RawApp *app, WindowType type, RawWindowSetting
 
     if (type == WindowType::NORMAL) {
         auto window = wl_window_create(ctx, settings.pos.w, settings.pos.h, settings.pos.min_w, settings.pos.min_h, settings.name.c_str(), rw, settings.app_id);
-        rw->cr = window->cr;
+        rw->drawing_context = window->cr;
         window->id = rw->id;
         window->on_render = on_window_render;  // set now that rw is set (resize_buffer skipped it)
         if (window->on_render)
@@ -2210,7 +2236,7 @@ RawWindow *windowing::open_window(RawApp *app, WindowType type, RawWindowSetting
     }
     if (type == WindowType::DOCK) {
         auto window = wl_layer_window_create(ctx, settings.pos.w, settings.pos.h, ZWLR_LAYER_SHELL_V1_LAYER_TOP, settings.name.c_str(), settings.alignment, settings.monitor_name, true, rw);
-        rw->cr = window->cr;
+        rw->drawing_context = window->cr;
         window->id = rw->id;
         window->on_render = on_window_render;
         if (window->on_render)
@@ -2240,7 +2266,7 @@ RawWindow *windowing::open_popup(RawWindow *parent, RawWindowSettings settings) 
         return nullptr;
     }
 
-    rw->cr = window->cr;
+    rw->drawing_context = window->cr;
     window->id = rw->id;
     window->on_render = on_window_render;
     window->popup_positioner = settings.popup;
@@ -2273,8 +2299,7 @@ RawWindow *windowing::open_popup(RawWindow *parent, RawWindowSettings settings) 
         xdg_popup_grab(window_wl->xdg_popup, ctx->seat, ctx->last_pointer_button_serial);
     }
 
-    wl_surface_attach(window_wl->surface, get_attach_buffer(window_wl), 0, 0);
-    wl_surface_commit(window_wl->surface);
+    commit_buffer(window_wl);
 
     xdg_positioner_destroy(positioner);
 
@@ -2409,8 +2434,7 @@ static void set_popup_size_impl(
         win->pending_width = popup_w;
         win->pending_height = popup_h;
         wl_window_resize_buffer(win, popup_w, popup_h);
-        wl_surface_attach(win->surface, get_attach_buffer(win), 0, 0);
-        wl_surface_commit(win->surface);
+        commit_buffer(win);
     });
     ctx->have_functions_to_execute = true;
     write(ctx->wake_pipe[1], "x", 1);

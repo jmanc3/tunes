@@ -1,19 +1,14 @@
 #pragma once
 
-#include <cairo.h>
+#include "drawing/context.h"
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
-// Immutable Cairo image surfaces are built entirely on workers and shared with
-// the renderer only after publication.
-struct AlbumTexture {
-    cairo_surface_t *surface = nullptr;
-    int width = 0;
-    int height = 0;
+// Immutable pixel images are built on workers and shared after publication.
+struct AlbumTexture : drawing::Image {
     int pixels = 0;
-    ~AlbumTexture();
 };
 
 class AlbumArtCache {
@@ -44,4 +39,19 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+// UI-thread prefetch cursor. Only one background album's loading chain is
+// submitted at a time, after foreground work has drained. Visibility/fades stay
+// with the UI; this prepares immutable sharp images without starting animations.
+class AlbumArtPrefetch {
+public:
+    void add(AlbumArtCache::Handle album);
+    void reset();
+    bool advance(AlbumArtCache &cache, int pixels, bool foreground_ready);
+
+private:
+    std::vector<AlbumArtCache::Handle> albums_;
+    std::size_t next_ = 0;
+    int pixels_ = 0;
 };

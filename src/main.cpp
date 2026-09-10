@@ -2,10 +2,14 @@
 #include "client/raw_windowing.h"
 #include "container.h"
 #include "player.h"
+#include "playback_queue.h"
+#include "popup_input.h"
+#include "library_scrollbar.h"
 #include "client/windowing.h"
 #include "utility.h"
 #include "audio_data.h"
 #include "album_art.h"
+#include "drawing/cached_shadow.h"
 #include "session_state.h"
 #include "ThreadPool.h"
 #include "pipewire_settings.h"
@@ -21,20 +25,28 @@
 #include <thread>
 #include <filesystem>
 #include <magic.h>
-#include <pango/pango-layout.h>
-#include <pango/pango-types.h>
-#include <pango/pangocairo.h>
 #include <cmath>
 #include <gdk/gdk.h>
 #include <unordered_map>
 #include <optional>
+#include <random>
+#include <map>
 #include <utility>
 
 
 static float artwork_fade_duration_ms = 100.0f;
 
+using drawing::ShadowStyle;
+
+// Independently tunable library artwork, library text, and popup shadows.
+static ShadowStyle library_art_shadow{.6, 2, 0};
+static ShadowStyle library_text_shadow{0, 1.5, 1};
+static ShadowStyle popup_shadow{.6, 18, 4};
+static double popup_corner_radius = 12; // Logical pixels.
+
 static std::string mylar_font = "SF Pro";
 static Player *player = nullptr;
+static PlaybackQueue playback_queue;
 
 static long get_current_time_in_ms() {
     using namespace std::chrono;
@@ -194,16 +206,78 @@ struct LibraryScanResult {
     bool launch = false;
 };
 
+struct ClosingAlbum {
+    Container *card = nullptr;
+    double initial_height = 0; // Logical pixels; contents retain their final layout.
+    double initial_gap = 0;
+    std::chrono::steady_clock::time_point start;
+    Bounds bounds;
+    double visible_height = 0;
+    double occupied_height = 0;
+    std::size_t row = 0;
+};
+
+struct QueueRemoval {
+    PlaybackQueue::Entry entry;
+    std::size_t position;
+    std::chrono::steady_clock::time_point start;
+};
+
 struct RootData : UserData {
+    Container *queue_overlay = nullptr;
+    Container *context_overlay = nullptr;
+    Bounds context_bounds;
+    Bounds queue_bounds;
+    double context_x = 0, context_y = 0;
+    std::vector<std::string> context_paths;
+    std::vector<std::pair<std::uint64_t, Bounds>> queue_rows;
+    std::vector<QueueRemoval> queue_removals;
+    std::uint64_t queue_drag = 0;
+    double queue_dx = 0, queue_dy = 0;
+    double queue_scroll = 0, queue_scroll_max = 0;
     RawApp *app = nullptr;
     MylarWindow *window = nullptr;
     std::shared_ptr<AlbumArtCache> artwork;
+    AlbumArtPrefetch artwork_prefetch;
+    int artwork_prefetch_pixels = 0;
+    drawing::CachedShadow library_shadow;
+    std::optional<std::chrono::steady_clock::time_point> initial_shadow_fade;
+    double library_shadow_alpha = 0;
+    drawing::CachedShadow playback_bar_shadow;
+    drawing::CachedShadow album_panel_shadow;
+    drawing::CachedShadow menu_shadow;
+    drawing::CachedShadow context_shadow;
+    drawing::CachedShadow settings_shadow;
+    Container *library_scrollbar = nullptr;
+    double library_scroll_max = 0;
+    double scrollbar_grab = 0;
+    bool scrollbar_dragging = false;
+    std::chrono::steady_clock::time_point scrollbar_activity{};
     std::shared_ptr<ArtRefresh> artwork_refresh;
     std::size_t album_first = 0;
     std::size_t album_end = 0;
     std::unordered_map<std::string, TrackDisplay> tracks;
     Container *playback_bar = nullptr;
     Container *library = nullptr;
+    Container *album_panel = nullptr;
+    Container *expanded_album = nullptr;
+    std::optional<std::chrono::steady_clock::time_point> album_scroll_start;
+    double album_scroll_from = 0;
+    std::optional<std::chrono::steady_clock::time_point> album_reveal_start;
+    double album_reveal = 1;
+    Container *outgoing_album = nullptr;
+    double album_transition_from_height = 0;
+    double album_transition_from_gap = 0;
+    double album_visible_gap = 0;
+    double album_visible_height = 0;
+    std::size_t album_columns = 1;
+    std::vector<ClosingAlbum> closing_albums;
+    Container *last_album_clicked = nullptr;
+    std::chrono::steady_clock::time_point last_album_click_time;
+    double last_album_click_x = 0;
+    double last_album_click_y = 0;
+    Container *album_double_click_target = nullptr;
+    bool album_double_click_handled = false;
     Container *artwork_preview = nullptr;
     Container *settings_menu = nullptr;
     Bounds settings_bounds;
@@ -238,131 +312,40 @@ static RootData *root_data_for(Container *c) {
     return static_cast<RootData *>(c->user_data);
 }
 
-struct CachedFont {
-    std::string name;
-    int size;
-    int used_count;
-    bool italic = false;
-    PangoWeight weight;
-    PangoLayout *layout;
-    cairo_t *cr; // Creator
-    
-    ~CachedFont() { g_object_unref(layout); }
-};
-
-static std::vector<CachedFont *> cached_fonts;
-
-static PangoLayout *
-get_cached_pango_font(cairo_t *cr, std::string name, int pixel_height, PangoWeight weight, bool italic) {
-#ifdef TRACY_ENABLE
-    ZoneScoped;
-#endif
-    // Look for a matching font in the cache (including italic style)
-    for (int i = cached_fonts.size() - 1; i >= 0; i--) {
-        auto font = cached_fonts[i];
-        if (font->name == name &&
-            font->size == pixel_height &&
-            font->weight == weight &&
-            font->cr == cr &&
-            font->italic == italic) { // New italic check
-            pango_layout_set_attributes(font->layout, nullptr);
-            return font->layout;
-        }
-    }
-
-    // Create a new CachedFont entry
-    auto *font = new CachedFont;
-    assert(font);
-    font->name = name;
-    font->size = pixel_height;
-    font->weight = weight;
-    font->cr = cr;
-    font->italic = italic; // Save the italic setting
-    font->used_count = 0;
-
-    PangoLayout *layout = pango_cairo_create_layout(cr);
-    PangoFontDescription *desc = pango_font_description_new();
-
-    pango_font_description_set_size(desc, pixel_height * PANGO_SCALE);
-    pango_font_description_set_family_static(desc, name.c_str());
-    pango_font_description_set_weight(desc, weight);
-    // Set the style to italic or normal based on the parameter
-    pango_font_description_set_style(desc, italic ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
-
-    pango_layout_set_font_description(layout, desc);
-    pango_font_description_free(desc);
-    pango_layout_set_attributes(layout, nullptr);
-
-    assert(layout);
-
-    font->layout = layout;
-    //printf("new: %p\n", font->layout);
-
-    cached_fonts.push_back(font);
-
-    assert(font->layout);
-
-    return font->layout;
+static Bounds draw_text(drawing::Context *cr, int x, int y, std::string text, int size, bool draw, std::string font, int wrap, double h, RGBA color, bool bold, int align = 0,
+                        const ShadowStyle *shadow = nullptr, double dpi = 1) {
+    drawing::TextStyle style;
+    style.font = font;
+    style.size = size;
+    style.bold = bold;
+    style.align = static_cast<drawing::TextAlign>(align);
+    style.width = wrap;
+    style.height = h;
+    style.color = color;
+    if (shadow) style.shadow = *shadow;
+    style.dpi = dpi;
+    const auto metrics = cr->text(x, y, text, style, draw);
+    return Bounds(metrics.ink_width, metrics.ink_height, metrics.width, metrics.height);
 }
 
-static void cleanup_cached_fonts() {
-    for (auto font: cached_fonts)
-        delete font;
-    cached_fonts.clear();
-    cached_fonts.shrink_to_fit();
+static void rounded_rectangle(drawing::Context *cr, const Bounds &b, double radius) {
+    cr->rounded_rectangle({b.x, b.y, b.w, b.h}, radius);
 }
 
-static void remove_cached_fonts(cairo_t *cr) {
-    for (int i = cached_fonts.size() - 1; i >= 0; --i) {
-        if (cached_fonts[i]->cr == cr) {
-            delete cached_fonts[i];
-            cached_fonts.erase(cached_fonts.begin() + i);
-        }
-    }
-}
-
-static Bounds draw_text(cairo_t *cr, int x, int y, std::string text, int size, bool draw, std::string font, int wrap, int h, RGBA color, bool bold, int align = 0) {
-    auto layout = get_cached_pango_font(cr, mylar_font, size, bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL, false);
-    
-    //pango_layout_set_text(layout, "\uE7E7", strlen("\uE83F"));
-    pango_layout_set_text(layout, text.data(), text.size());
-    pango_layout_set_alignment(layout, (PangoAlignment) align);
-    if (wrap == -1) {
-        pango_layout_set_wrap(layout, PangoWrapMode::PANGO_WRAP_NONE);
-        pango_layout_set_width(layout, -1);
-        pango_layout_set_height(layout, -1);
-        pango_layout_set_ellipsize(layout, PangoEllipsizeMode::PANGO_ELLIPSIZE_NONE);
-    } else {
-        pango_layout_set_wrap(layout, PangoWrapMode::PANGO_WRAP_WORD_CHAR);
-        pango_layout_set_width(layout, wrap * PANGO_SCALE);
-        pango_layout_set_height(layout, h);
-        if (h != -1)
-            pango_layout_set_ellipsize(layout, PangoEllipsizeMode::PANGO_ELLIPSIZE_MIDDLE);
-    }
-    set_argb(cr, color);
-    PangoRectangle ink;
-    PangoRectangle logical;
-    pango_layout_get_pixel_extents(layout, &ink, &logical);
-    if (draw) {
-        cairo_move_to(cr, std::round(x), std::round(y));
-        pango_cairo_show_layout(cr, layout);
-    }
-    return Bounds(ink.width, ink.height, logical.width, logical.height);
-}
 
 static void paint_button_bg(Container *root, Container *c) {
     auto root_data = (RootData *) root->user_data;
     auto dpi = root_data->window->raw_window->dpi;
-    auto cr = root_data->window->raw_window->cr;
+    auto cr = root_data->window->raw_window->drawing_context;
     
     if (c->state.mouse_pressing) {
-        cairo_rectangle(cr, c->real_bounds.x, c->real_bounds.y, c->real_bounds.w, c->real_bounds.h);
-        cairo_set_source_rgba(cr, 0, 0, 0, .4);
-        cairo_fill(cr);
+        cr->rectangle(c->real_bounds.x, c->real_bounds.y, c->real_bounds.w, c->real_bounds.h);
+        cr->set_color(RGBA(0, 0, 0, .4));
+        cr->fill();
     } else if (c->state.mouse_hovering) {
-        cairo_rectangle(cr, c->real_bounds.x, c->real_bounds.y, c->real_bounds.w, c->real_bounds.h);
-        cairo_set_source_rgba(cr, 0, 0, 0, .2);
-        cairo_fill(cr);
+        cr->rectangle(c->real_bounds.x, c->real_bounds.y, c->real_bounds.w, c->real_bounds.h);
+        cr->set_color(RGBA(0, 0, 0, .2));
+        cr->fill();
     }
 }
 
@@ -370,6 +353,11 @@ constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
 
 struct AlbumData : UserData {
     AlbumOption album;
+    std::optional<std::chrono::steady_clock::time_point> play_pulse_start;
+    std::weak_ptr<const AlbumTexture> palette_source;
+    RGBA background_color{.95, .96, .97, 1};
+    RGBA secondary_color{.4, .4, .4, 1};
+    RGBA accent_color{.4, .4, .4, 1};
     std::string name;
     std::string artist;
     AlbumArtCache::Handle art;
@@ -377,7 +365,7 @@ struct AlbumData : UserData {
 };
 
 // Grid cards and the playback cover use the same preview and crossfade path.
-static void paint_artwork(RootData *rd, cairo_t *cr, const AlbumArtCache::Handle &handle,
+static void paint_artwork(RootData *rd, drawing::Context *cr, const AlbumArtCache::Handle &handle,
                           const std::shared_ptr<const AlbumTexture> &art,
                           const std::optional<std::chrono::steady_clock::time_point> &fade,
                           double x, double y, double size, bool fade_preview = true) {
@@ -394,33 +382,729 @@ static void paint_artwork(RootData *rd, cairo_t *cr, const AlbumArtCache::Handle
         }
     }
     auto paint_art = [&](const auto &image, double alpha) {
-        cairo_save(cr);
+        cr->save();
         const double scale = std::min(size / image->width, size / image->height);
-        cairo_translate(cr, x + (size - image->width * scale) / 2,
+        cr->translate(x + (size - image->width * scale) / 2,
                         y + (size - image->height * scale) / 2);
         // Stretch the tiny preview to the same display size as the detail.
-        cairo_scale(cr, scale, scale);
-        cairo_set_source_surface(cr, image->surface, 0, 0);
-        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
-        cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_PAD);
-        cairo_rectangle(cr, 0, 0, image->width, image->height);
-        cairo_clip(cr);
-        cairo_paint_with_alpha(cr, alpha);
-        cairo_restore(cr);
+        cr->scale(scale, scale);
+        cr->draw_image(*image, alpha);
+        cr->restore();
     };
     if (detailed && blend < 1) {
-        // Add weighted layers in a group for a true crossfade, including alpha.
-        cairo_push_group(cr);
+        // Bound the transient target to this cover, rather than the whole grid.
+        cr->push_group({x, y, size, size});
         paint_art(preview, 1 - blend);
-        cairo_set_operator(cr, CAIRO_OPERATOR_ADD);
+        cr->set_operator(drawing::Composite::Add);
         paint_art(art, blend);
-        cairo_pop_group_to_source(cr);
-        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-        cairo_paint(cr);
+        cr->pop_group_to_source();
+        cr->set_operator(drawing::Composite::Over);
+        cr->paint_source();
     } else {
         paint_art(art, 1);
     }
 
+}
+
+static void playback_changed(Container *root);
+
+static void observe_queue() {
+    playback_queue.observe(player->queue(), player->current_index());
+}
+
+static void commit_queue(Container *root) {
+    player->queue() = playback_queue.paths();
+    player->queue_changed();
+    playback_changed(root);
+}
+
+static std::vector<std::string> album_paths(const AlbumOption &album) {
+    std::vector<std::string> paths;
+    for (const auto &song : album.songs) paths.push_back(song.full);
+    return paths;
+}
+
+static void open_queue_context(Container *root, std::vector<std::string> paths) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    rd->context_paths = std::move(paths);
+    rd->context_x = root->mouse_current_x;
+    rd->context_y = root->mouse_current_y;
+    rd->last_album_clicked = nullptr;
+    rd->album_double_click_target = nullptr;
+    rd->context_overlay->exists = true;
+    layout(root, root, root->real_bounds);
+    windowing::redraw(rd->window->raw_window);
+}
+
+static void fill_queue_overlay(Container *root, Container *overlay, bool context = false) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    (context ? rd->context_overlay : rd->queue_overlay) = overlay;
+    overlay->name = context ? "queue-context" : "queue-flyout";
+    overlay->type = ::fullycustom;
+    overlay->z_index = context ? 91 : 90;
+    overlay->exists = false;
+    overlay->when_drag_end_is_click = false;
+    overlay->minimum_x_distance_to_move_before_drag_begins = 6;
+    overlay->minimum_y_distance_to_move_before_drag_begins = 6;
+    overlay->pre_layout = [context](Container *root, Container *, const Bounds &b) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        const auto d = rd->dpi;
+        const double w = std::min((context ? 224 : 420) * d, b.w);
+        const double h = std::min((context ? 124 : 520) * d,
+                                  std::max(0.0, b.h - (context ? 0 : 104 * d)));
+        (context ? rd->context_bounds : rd->queue_bounds) = Bounds(std::clamp(context ? rd->context_x : b.right() - w - 12 * d,
+                                           b.x, b.right() - w),
+            std::clamp(context ? rd->context_y : b.bottom() - 104 * d - h, b.y, b.bottom() - h), w, h);
+    };
+    overlay->when_paint = [context](Container *root, Container *) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        observe_queue();
+        auto cr = rd->window->raw_window->drawing_context;
+        const auto b = context ? rd->context_bounds : rd->queue_bounds;
+        const auto d = rd->dpi;
+        auto text = [&](double x, double y, const std::string &s, int size, bool bold, double width) {
+            draw_text(cr, x, y, s, (size) * d, true, mylar_font, std::max(0.0, width), 24 * d,
+                      RGBA(.16, .22, .26, 1), bold);
+        };
+        cr->save();
+        (context ? rd->context_shadow : rd->menu_shadow).draw(*cr, {b.x, b.y, b.w, b.h}, popup_corner_radius * d, popup_shadow, d);
+        cr->set_color(RGBA(.98, .985, .99, 1));
+        rounded_rectangle(cr, b, popup_corner_radius * d);
+        cr->fill_preserve();
+        cr->clip();
+        if (context) {
+            const char *labels[] = {"Play Next", "Play After All Next", "Add to Queue"};
+            for (int i = 0; i < 3; ++i) {
+                Bounds row(b.x, b.y + (2 + i * 40) * d, b.w, 40 * d);
+                if (bounds_contains(row, root->mouse_current_x, root->mouse_current_y)) {
+                    cr->set_color(RGBA(.87, .94, .97, 1));
+                    cr->rectangle(row.x, row.y, row.w, row.h); cr->fill();
+                }
+                text(row.x + 16 * d, row.y + 10 * d, labels[i], 12, false, row.w - 32 * d);
+            }
+            cr->restore();
+            return;
+        }
+        text(b.x + 16 * d, b.y + 12 * d, "Queue", 16, true, b.w - 150 * d);
+        text(b.right() - 114 * d, b.y + 15 * d, "Clear all", 11, true, 74 * d);
+        text(b.right() - 30 * d, b.y + 10 * d, "×", 20, false, 26 * d);
+        text(b.x + 16 * d, b.y + 42 * d, "Drag ↕ to reorder · Swipe ↔ to remove", 10, false, b.w - 32 * d);
+        const double top = b.y + 70 * d;
+        cr->rectangle(b.x, top, b.w, std::max(0.0, b.bottom() - top)); cr->clip();
+        auto visible = std::vector<PlaybackQueue::Entry>();
+        if (auto current = playback_queue.current()) visible.push_back(*current);
+        const auto &items = playback_queue.entries();
+        visible.insert(visible.end(), items.begin() + playback_queue.upcoming_begin(), items.end());
+        const auto now = std::chrono::steady_clock::now();
+        std::erase_if(rd->queue_removals, [&](const auto &r) { return now - r.start >= std::chrono::milliseconds(220); });
+        for (const auto &r : rd->queue_removals)
+            visible.insert(visible.begin() + std::min(r.position, visible.size()), r.entry);
+        rd->queue_rows.clear();
+        double y = top - rd->queue_scroll;
+        int previous_group = -1;
+        for (std::size_t i = 0; i < visible.size(); ++i) {
+            const auto &e = visible[i];
+            const bool current = playback_queue.current() && playback_queue.current()->id == e.id;
+            const int group = current ? 0 : e.category == PlaybackQueue::Category::Next ? 1 : 2;
+            if (group != previous_group) {
+                text(b.x + 16 * d, y + 4 * d, group == 0 ? "Now Playing" : group == 1 ? "Play Next" : "Up Next · Queue", 11, true, b.w - 32 * d);
+                y += 28 * d;
+                previous_group = group;
+            }
+            auto removed = std::find_if(rd->queue_removals.begin(), rd->queue_removals.end(),
+                                       [&](const auto &r) { return r.entry.id == e.id; });
+            const double progress = removed == rd->queue_removals.end() ? 0 : std::clamp(
+                std::chrono::duration<double, std::milli>(now - removed->start).count() / 220.0, 0.0, 1.0);
+            const double ease = progress * progress * (3 - 2 * progress);
+            const double height = 64 * d * (1 - ease);
+            Bounds row(b.x + 8 * d, y, b.w - 16 * d, height);
+            if (!current && removed == rd->queue_removals.end()) rd->queue_rows.push_back({e.id, row});
+            const double swipe = rd->queue_drag == e.id && std::abs(rd->queue_dx) > std::abs(rd->queue_dy) ? rd->queue_dx : 0;
+            if (row.bottom() > top && row.y < b.bottom()) {
+                cr->save();
+                cr->rectangle(row.x, row.y, row.w, row.h); cr->clip();
+                cr->push_group();
+                cr->translate(swipe + ease * b.w, 0);
+                cr->set_color(RGBA(.91, .95, .97, 1));
+                cr->rectangle(row.x, row.y + 2 * d, row.w, 60 * d); cr->fill();
+                const auto it = rd->tracks.find(e.path);
+                if (it != rd->tracks.end()) {
+                    const auto &track = it->second;
+                    rd->artwork->request(track.art, 48 * d);
+                    const auto detail = rd->artwork->image(track.art);
+                    const auto art = detail ? detail : rd->artwork->preview(track.art);
+                    if (art || rd->artwork->preview(track.art))
+                        paint_artwork(rd, cr, track.art, art, {}, row.x + 6 * d, row.y + 8 * d, 48 * d, false);
+                    text(row.x + 64 * d, row.y + 10 * d, track.title, 12, true, row.w - 102 * d);
+                    text(row.x + 64 * d, row.y + 30 * d, track.album.empty() ? "Unknown album" : track.album, 10, false, row.w - 102 * d);
+                } else {
+                    text(row.x + 12 * d, row.y + 10 * d, std::filesystem::path(e.path).stem().string(), 12, true, row.w - 50 * d);
+                    text(row.x + 12 * d, row.y + 33 * d, "Unknown album", 10, false, row.w - 50 * d);
+                }
+                if (!current) text(row.right() - 30 * d, row.y + 18 * d, "×", 18, false, 24 * d);
+                cr->pop_group_to_source(); cr->paint_source(1 - ease);
+                cr->restore();
+                if (rd->queue_drag && std::abs(rd->queue_dy) > std::abs(rd->queue_dx) &&
+                    bounds_contains(row, root->mouse_current_x, root->mouse_current_y)) {
+                    cr->set_color(RGBA(.02, .56, .73, 1));
+                    cr->rectangle(row.x, row.y, row.w, 3 * d); cr->fill();
+                }
+            }
+            y += height;
+        }
+        rd->queue_scroll_max = std::max(0.0, y + rd->queue_scroll - b.bottom());
+        const auto old_scroll = rd->queue_scroll;
+        rd->queue_scroll = std::clamp(rd->queue_scroll, 0.0, rd->queue_scroll_max);
+        if (rd->queue_scroll_max > 0) {
+            const double viewport = b.bottom() - top;
+            const double thumb = viewport * viewport / (viewport + rd->queue_scroll_max);
+            cr->set_color(RGBA(.2, .35, .42, .4));
+            cr->rectangle(b.right() - 5 * d,
+                top + (viewport - thumb) * rd->queue_scroll / rd->queue_scroll_max, 3 * d, thumb);
+            cr->fill();
+        }
+        if (old_scroll != rd->queue_scroll) rd->artwork_refresh->animating = true;
+        poll_artwork(rd->artwork_refresh);
+        if (visible.empty()) text(b.x + 16 * d, top + 20 * d, "Your queue is empty", 12, false, b.w - 32 * d);
+        if (!rd->queue_removals.empty()) {
+            rd->artwork_refresh->animating = true;
+            poll_artwork(rd->artwork_refresh);
+        }
+        cr->restore();
+    };
+    auto remove = [context](Container *root, std::uint64_t id) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        observe_queue();
+        const auto &entries = playback_queue.entries();
+        auto it = std::find_if(entries.begin() + playback_queue.upcoming_begin(), entries.end(),
+                               [id](const auto &e) { return e.id == id; });
+        if (it == entries.end()) return;
+        auto position = static_cast<std::size_t>(it - entries.begin()) - playback_queue.upcoming_begin() + (playback_queue.current() ? 1 : 0);
+        rd->queue_removals.push_back({*it, position, std::chrono::steady_clock::now()});
+        playback_queue.remove(id);
+        commit_queue(root);
+    };
+    overlay->when_mouse_down = [context](Container *root, Container *c) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        rd->queue_drag = 0;
+        rd->queue_dx = rd->queue_dy = 0;
+        if (context || c->state.mouse_button_pressed != BTN_LEFT ||
+            root->mouse_current_y < rd->queue_bounds.y + 70 * rd->dpi) return;
+        for (const auto &[id, b] : rd->queue_rows)
+            if (bounds_contains(b, root->mouse_current_x, root->mouse_current_y)) rd->queue_drag = id;
+    };
+    overlay->when_drag = [context](Container *root, Container *) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        rd->queue_dx = root->mouse_current_x - root->mouse_initial_x;
+        rd->queue_dy = root->mouse_current_y - root->mouse_initial_y;
+        if (rd->queue_drag && std::abs(rd->queue_dy) > std::abs(rd->queue_dx)) {
+            if (root->mouse_current_y < rd->queue_bounds.y + 100 * rd->dpi) rd->queue_scroll -= 12 * rd->dpi;
+            if (root->mouse_current_y > rd->queue_bounds.bottom() - 30 * rd->dpi) rd->queue_scroll += 12 * rd->dpi;
+            rd->queue_scroll = std::clamp(rd->queue_scroll, 0.0, rd->queue_scroll_max);
+        }
+        windowing::redraw(rd->window->raw_window);
+    };
+    overlay->when_drag_start = overlay->when_drag;
+    overlay->when_drag_end = [remove, context](Container *root, Container *) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        if (rd->queue_drag) {
+            if (std::abs(rd->queue_dx) > 70 * rd->dpi && std::abs(rd->queue_dx) > std::abs(rd->queue_dy))
+                remove(root, rd->queue_drag);
+            else if (std::abs(rd->queue_dy) > std::abs(rd->queue_dx)) {
+                observe_queue();
+                for (const auto &[id, b] : rd->queue_rows)
+                    if (bounds_contains(b, root->mouse_current_x, root->mouse_current_y)) {
+                        playback_queue.move(rd->queue_drag, id);
+                        commit_queue(root);
+                        break;
+                    }
+            }
+        }
+        rd->queue_drag = 0;
+        rd->queue_dx = rd->queue_dy = 0;
+        windowing::redraw(rd->window->raw_window);
+    };
+    overlay->when_clicked = [remove, context](Container *root, Container *c) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        if (c->state.mouse_button_pressed == BTN_RIGHT) {
+            const double x = root->mouse_current_x, y = root->mouse_current_y;
+            // A right click replaces the context popup while preserving the queue.
+            if (context && bounds_contains(rd->context_bounds, x, y)) return;
+            rd->context_overlay->exists = false;
+            if (rd->queue_overlay->exists && bounds_contains(rd->queue_bounds, x, y)) {
+                if (context) {
+                    forward_popup_right_click(root, {rd->context_overlay});
+                } else if (y >= rd->queue_bounds.y + 70 * rd->dpi) {
+                    observe_queue();
+                    for (const auto &[id, row] : rd->queue_rows) {
+                        if (!bounds_contains(row, x, y)) continue;
+                        for (const auto &entry : playback_queue.entries())
+                            if (entry.id == id) { open_queue_context(root, {entry.path}); break; }
+                        break;
+                    }
+                }
+            } else {
+                forward_popup_right_click(root, {rd->context_overlay, rd->queue_overlay});
+            }
+            windowing::redraw(rd->window->raw_window);
+            return;
+        }
+        if (c->state.mouse_button_pressed != BTN_LEFT) return;
+        const auto b = context ? rd->context_bounds : rd->queue_bounds;
+        const auto d = rd->dpi;
+        const double x = root->mouse_current_x, y = root->mouse_current_y;
+        rd->queue_drag = 0;
+        if (!bounds_contains(b, x, y)) {
+            rd->context_overlay->exists = false;
+            rd->queue_overlay->exists = false;
+        }
+        else if (context) {
+            const int action = static_cast<int>((y - b.y - 2 * d) / (40 * d));
+            if (action >= 0 && action < 3) {
+                observe_queue();
+                playback_queue.add(rd->context_paths, static_cast<PlaybackQueue::Action>(action));
+                commit_queue(root);
+            }
+            c->exists = false;
+        } else if (y < b.y + 40 * d && x > b.right() - 40 * d) {
+            c->exists = false;
+            rd->context_overlay->exists = false;
+        }
+        else if (y < b.y + 40 * d && x > b.right() - 120 * d) {
+            observe_queue();
+            const auto begin = playback_queue.upcoming_begin();
+            for (auto i = begin; i < playback_queue.entries().size(); ++i)
+                rd->queue_removals.push_back({playback_queue.entries()[i],
+                    i - begin + (playback_queue.current() ? 1 : 0), std::chrono::steady_clock::now()});
+            playback_queue.clear();
+            commit_queue(root);
+        } else if (y >= b.y + 70 * d) {
+            for (const auto &[id, row] : rd->queue_rows)
+                if (x > row.right() - 38 * d && bounds_contains(row, x, y)) { remove(root, id); break; }
+        }
+        windowing::redraw(rd->window->raw_window);
+    };
+    overlay->when_fine_scrolled = [context](Container *root, Container *, double, double y, bool) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        if (!context) rd->queue_scroll = std::clamp(rd->queue_scroll - y, 0.0, rd->queue_scroll_max);
+        windowing::redraw(rd->window->raw_window);
+    };
+}
+
+static void play_album(const AlbumOption &album, std::size_t index) {
+    auto &queue = player->queue();
+    queue.clear();
+    for (const auto &song : album.songs)
+        queue.push_back(song.full);
+    playback_queue.reset(queue, index);
+    if (!player->play_queued_item(index))
+        std::cerr << "Album playback failed: " << player->last_error() << '\n';
+}
+
+struct AlbumTrackLayout {
+    double art_size;
+    double text_width;
+    double column_width;
+    double column_gap;
+    std::size_t rows;
+
+    Bounds track_bounds(const Bounds &panel, double dpi, std::size_t index) const {
+        return Bounds(panel.x + 56 * dpi + (index / rows) * (column_width + column_gap),
+                      panel.y + (94 + (index % rows) * 32) * dpi, column_width, 32 * dpi);
+    }
+};
+
+static AlbumTrackLayout album_track_layout(double width, double dpi, std::size_t count) {
+    const double art_size = std::min(360 * dpi, width * .4);
+    const double text_width = std::max(0.0, width - art_size - 88 * dpi);
+    const double gap = 24 * dpi;
+    // Keep short albums together; longer albums flow down columns at least 260 logical pixels wide.
+    const auto allowed = static_cast<std::size_t>(std::max(1.0,
+        std::floor((text_width + gap) / (260 * dpi + gap))));
+    const auto columns = count > 7 ? std::min(allowed, (count + 6) / 7) : 1;
+    const auto rows = std::max<std::size_t>(1, (count + columns - 1) / columns);
+    return {art_size, text_width, std::max(0.0, (text_width - (columns - 1) * gap) / columns),
+            gap, rows};
+}
+
+struct AlbumColorLess {
+    bool operator()(const RGBA &a, const RGBA &b) const {
+        return std::tie(a.r, a.g, a.b, a.a) < std::tie(b.r, b.g, b.b, b.a);
+    }
+};
+
+static std::map<RGBA, float, AlbumColorLess> mainColorsInImage(const drawing::Image &image) {
+    std::map<RGBA, float, AlbumColorLess> palette;
+    const int width = image.width, height = image.height;
+    if (width <= 0 || height <= 0 || image.argb.empty())
+        return palette;
+    constexpr int dimension = 10, flexibility = 2;
+    constexpr double range = 60.0 / 255.0;
+    std::map<RGBA, int, AlbumColorLess> counter;
+    for (int y = 0; y < dimension; ++y) {
+        const auto row = image.argb.data() + (y * height / dimension) * width;
+        for (int x = 0; x < dimension; ++x) {
+            const auto pixel = row[x * width / dimension];
+            const int red = (pixel >> 16) & 255, green = (pixel >> 8) & 255, blue = pixel & 255;
+            // Count the same 5 × 5 × 5 flexible colors without storing the expanded vector.
+            for (int r = -flexibility; r <= flexibility; ++r)
+                for (int g = -flexibility; g <= flexibility; ++g)
+                    for (int b = -flexibility; b <= flexibility; ++b)
+                        ++counter[RGBA(std::clamp(red + r, 0, 255) / 255.0,
+                                       std::clamp(green + g, 0, 255) / 255.0,
+                                       std::clamp(blue + b, 0, 255) / 255.0, 1)];
+        }
+    }
+    std::vector<std::pair<RGBA, int>> ordered(counter.begin(), counter.end());
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b) {
+        return a.second > b.second;
+    });
+    std::vector<std::pair<RGBA, int>> ranges;
+    float total = 0;
+    for (const auto &[color, count] : ordered) {
+        const bool exclude = std::any_of(ranges.begin(), ranges.end(), [&](const auto &existing) {
+            return std::abs(color.r - existing.first.r) <= range &&
+                   std::abs(color.g - existing.first.g) <= range &&
+                   std::abs(color.b - existing.first.b) <= range;
+        });
+        if (!exclude) {
+            ranges.emplace_back(color, count);
+            total += count;
+        }
+    }
+    for (const auto &[color, count] : ranges)
+        palette[color] = count / total;
+    return palette;
+}
+
+static void update_album_colors(AlbumData *album, const std::shared_ptr<const AlbumTexture> &art) {
+    if (!art || album->palette_source.lock() == art)
+        return;
+    album->palette_source = art;
+    const auto palette = mainColorsInImage(*art);
+    if (palette.empty())
+        return;
+    std::vector<std::pair<RGBA, float>> colors(palette.begin(), palette.end());
+    std::stable_sort(colors.begin(), colors.end(), [](const auto &a, const auto &b) {
+        return a.second > b.second;
+    });
+    album->background_color = album->secondary_color = album->accent_color = colors.front().first;
+    colors.erase(colors.begin());
+    const auto distance = [&](const RGBA &color) {
+        const auto &background = album->background_color;
+        return std::pow(color.r - background.r, 2) + std::pow(color.g - background.g, 2) +
+               std::pow(color.b - background.b, 2);
+    };
+    std::stable_sort(colors.begin(), colors.end(), [&](const auto &a, const auto &b) {
+        return distance(a.first) > distance(b.first);
+    });
+    if (!colors.empty()) {
+        album->accent_color = colors[0].first;
+        album->secondary_color = colors.size() > 1 ? colors[1].first : colors[0].first;
+    }
+}
+
+static void open_artwork_preview(Container *root, const AlbumArtCache::Handle &art);
+
+static bool consume_album_double_click(Container *root);
+
+static void retain_closing_album(RootData *rd) {
+    if (!rd->expanded_album)
+        return;
+    rd->closing_albums.push_back({rd->expanded_album, rd->album_visible_height / rd->dpi,
+        rd->album_visible_gap / rd->dpi, std::chrono::steady_clock::now()});
+}
+
+static void close_album(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    // Keep the event target alive until the current event dispatch completes.
+    retain_closing_album(rd);
+    rd->expanded_album = nullptr;
+    rd->outgoing_album = nullptr;
+    rd->album_scroll_start.reset();
+    rd->album_reveal_start.reset();
+    rd->album_panel->exists = false;
+    layout(root, root, root->real_bounds);
+    windowing::redraw(rd->window->raw_window);
+}
+
+static Bounds album_action_bounds(const Bounds &b, double dpi, int action) {
+    return Bounds(b.x + (56 + action * 76) * dpi, b.y + 61 * dpi, 70 * dpi, 26 * dpi);
+}
+
+static void open_album(Container *root, Container *card) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (rd->expanded_album == card)
+        return;
+    if (!rd->album_panel) {
+        rd->album_panel = rd->library->child(FILL_SPACE, FILL_SPACE);
+        rd->album_panel->handles_pierced = [](Container *c, int x, int y) {
+            const auto rd = root_data_for(c);
+            const auto b = c->real_bounds;
+            return rd->expanded_album && bounds_contains(Bounds(b.x, b.y, b.w, std::min(b.h, rd->album_visible_height)), x, y);
+        };
+        rd->album_panel->when_paint = [](Container *root, Container *c) {
+            auto rd = static_cast<RootData *>(root->user_data);
+            auto cr = rd->window->raw_window->drawing_context;
+            auto draw_panel = [&](Container *card, Bounds b, double visible_height, double visible_gap) {
+                auto album = static_cast<AlbumData *>(card->user_data);
+                const double dpi = rd->dpi;
+                // These rows are painted directly rather than child widgets.
+                // Respect the panel's event hover state and modal overlays before
+                // using pointer coordinates to highlight individual controls.
+                const bool hover_enabled = c->state.mouse_hovering && rd->library->interactable &&
+                    card == rd->expanded_album && !((rd->queue_overlay && rd->queue_overlay->exists) || (rd->context_overlay && rd->context_overlay->exists));
+
+                const auto tracks = album_track_layout(b.w, dpi, album->album.songs.size());
+                const double art_size = tracks.art_size;
+                const double text_width = tracks.text_width;
+                update_album_colors(album, rd->artwork->image(album->art));
+                const auto background = album->background_color;
+                const bool light = .2126 * background.r + .7152 * background.g + .0722 * background.b > .45;
+                const auto foreground = light ? RGBA(.08, .08, .08, 1) : RGBA(.98, .98, .98, 1);
+                const auto secondary = album->secondary_color;
+                cr->save();
+                set_rect(cr, c->parent->real_bounds);
+                cr->clip();
+                // Fixed-size casters keep the shadow cached as the panel animates.
+                // Clip each one to the outside of its visible edge.
+                const double shadow_alpha = std::clamp(visible_height / (16 * dpi), 0.0, 1.0);
+                const double panel_bottom = b.y + std::min(b.h, visible_height);
+                const auto viewport = c->parent->real_bounds;
+                auto draw_edge_shadow = [&](double edge, bool above) {
+                    // Inset the caster so only the softer blur reaches the panel edge.
+                    const double inset = 8 * dpi;
+                    cr->save();
+                    set_rect(cr, above
+                        ? Bounds(viewport.x, viewport.y, viewport.w, std::max(0.0, edge - viewport.y))
+                        : Bounds(viewport.x, edge, viewport.w, std::max(0.0, viewport.bottom() - edge)));
+                    cr->clip();
+                    rd->album_panel_shadow.draw(*cr,
+                        {b.x, above ? edge + inset : edge - inset - 96 * dpi, b.w, 96 * dpi},
+                        0, {.14, 32, 0}, dpi, shadow_alpha);
+                    cr->restore();
+                };
+                draw_edge_shadow(b.y, true);
+                draw_edge_shadow(panel_bottom, false);
+                // Reveal the final layout without moving or scaling its contents.
+                set_rect(cr, Bounds(b.x, b.y - 12 * dpi, b.w, 12 * dpi + visible_height));
+                cr->clip();
+                set_rect(cr, b);
+                set_argb(cr, background);
+                cr->fill();
+                const double pointer_x = card->real_bounds.x + card->real_bounds.w / 2;
+                const double pointer_size = 12 * dpi * std::clamp(visible_gap / (16 * dpi), 0.0, 1.0);
+                cr->move_to(pointer_x - pointer_size, b.y);
+                cr->line_to(pointer_x, b.y - pointer_size);
+                cr->line_to(pointer_x + pointer_size, b.y);
+                cr->close_path();
+                set_argb(cr, background);
+                cr->fill();
+                draw_text(cr, b.x + 16 * dpi, b.y + 16 * dpi, "×", 22 * dpi, true,
+                          mylar_font, 28 * dpi, -1, foreground, false);
+                draw_text(cr, b.x + 56 * dpi, b.y + 16 * dpi, album->name,
+                          16 * dpi, true, mylar_font, text_width, 24 * dpi,
+                          foreground, true);
+                std::string artist_year = album->artist;
+                const auto &year = album->album.songs.front().year;
+                if (!year.empty() && year != "0")
+                    artist_year += " (" + year + ")";
+                draw_text(cr, b.x + 56 * dpi, b.y + 41 * dpi, artist_year,
+                          12 * dpi, true, mylar_font, text_width, 20 * dpi,
+                          secondary, false);
+                const char *actions[] = {"▶ Play", "Shuffle", "+ Queue"};
+                for (int i = 0; i < 3; ++i) {
+                    const auto button = album_action_bounds(b, dpi, i);
+                    if (button.x + button.w > b.x + 56 * dpi + text_width)
+                        continue;
+                    if (hover_enabled && bounds_contains(button, root->mouse_current_x, root->mouse_current_y)) {
+                        set_rect(cr, button);
+                        cr->set_color(RGBA(0, 0, 0, .08));
+                        cr->fill();
+                    }
+                    draw_text(cr, button.x, button.y + 4 * dpi, actions[i], 11 * dpi, true,
+                              mylar_font, button.w, 20 * dpi, foreground, true);
+                }
+                const auto playing_path = player->current_path();
+                for (std::size_t i = 0; i < album->album.songs.size(); ++i) {
+                    const auto &song = album->album.songs[i];
+                    const auto row = tracks.track_bounds(b, dpi, i);
+                    if (row.intersection(c->parent->real_bounds).empty())
+                        continue;
+                    const bool hovered = hover_enabled && bounds_contains(row, root->mouse_current_x, root->mouse_current_y);
+                    if (hovered) {
+                        set_rect(cr, row);
+                        cr->set_color(RGBA(0, 0, 0, .07));
+                        cr->fill();
+                    }
+                    const bool playing = song.full == playing_path;
+                    const bool bold = playing || hovered;
+                    const auto title = song.name.empty() ? std::filesystem::path(song.full).stem().string() : song.name;
+                    const auto number = playing ? "♫" : (!song.track.empty() && song.track != "0"
+                        ? song.track : std::to_string(i + 1));
+                    int duration = 0;
+                    const auto [end, error] = std::from_chars(song.length.data(), song.length.data() + song.length.size(), duration);
+                    const auto time = error == std::errc{} && end == song.length.data() + song.length.size() && duration >= 0
+                        ? seconds_to_mmss(duration) : std::string{};
+                    cr->save();
+                    set_rect(cr, row);
+                    cr->clip();
+                    draw_text(cr, row.x, row.y + 7 * dpi, number, 11 * dpi, true, mylar_font,
+                              28 * dpi, 22 * dpi, secondary, bold, 2);
+                    draw_text(cr, row.x + 40 * dpi, row.y + 7 * dpi, title, 12 * dpi, true,
+                              mylar_font, std::max(1.0, row.w - 96 * dpi), 22 * dpi,
+                              foreground, bold);
+                    draw_text(cr, row.x + row.w - 50 * dpi, row.y + 7 * dpi, time, 11 * dpi, true,
+                              mylar_font, 46 * dpi, 22 * dpi, secondary, bold, 2);
+                    cr->restore();
+                }
+                const auto art = rd->artwork->image(album->art);
+                if (art && art_size > 0)
+                    paint_artwork(rd, cr, album->art, art, {}, b.x + b.w - art_size - 16 * dpi,
+                                  b.y + 16 * dpi, art_size, false);
+                cr->restore();
+            };
+            for (const auto &closing : rd->closing_albums)
+                draw_panel(closing.card, closing.bounds, closing.visible_height,
+                           closing.occupied_height - closing.visible_height);
+            if (!rd->expanded_album)
+                return;
+            if (rd->outgoing_album) {
+                // Add weighted complete layers so overlapping opaque backgrounds crossfade evenly.
+                cr->push_group();
+                auto layer = [&](Container *card, double height, double opacity) {
+                    cr->push_group();
+                    auto bounds = c->real_bounds;
+                    bounds.h = height;
+                    draw_panel(card, bounds, rd->album_visible_height, rd->album_visible_gap);
+                    cr->pop_group_to_source();
+                    cr->set_operator(drawing::Composite::Add);
+                    cr->paint_source(opacity);
+                    cr->set_operator(drawing::Composite::Over);
+                };
+                layer(rd->outgoing_album, rd->album_transition_from_height * rd->dpi, 1 - rd->album_reveal);
+                layer(rd->expanded_album, c->real_bounds.h, rd->album_reveal);
+                cr->pop_group_to_source();
+                cr->paint_source();
+            } else {
+                draw_panel(rd->expanded_album, c->real_bounds, rd->album_visible_height, rd->album_visible_gap);
+            }
+        };
+        rd->album_panel->when_clicked = [](Container *root, Container *c) {
+            if (consume_album_double_click(root))
+                return;
+            if (c->state.mouse_button_pressed == BTN_RIGHT) {
+                auto rd = static_cast<RootData *>(root->user_data);
+                if (!rd->expanded_album) return;
+                auto album = static_cast<AlbumData *>(rd->expanded_album->user_data);
+                const auto tracks = album_track_layout(c->real_bounds.w, rd->dpi, album->album.songs.size());
+                for (std::size_t i = 0; i < album->album.songs.size(); ++i)
+                    if (bounds_contains(tracks.track_bounds(c->real_bounds, rd->dpi, i), root->mouse_current_x, root->mouse_current_y)) {
+                        open_queue_context(root, {album->album.songs[i].full});
+                        return;
+                    }
+                open_queue_context(root, album_paths(album->album));
+                return;
+            }
+            if (c->state.mouse_button_pressed != BTN_LEFT)
+                return;
+            auto rd = static_cast<RootData *>(root->user_data);
+            auto album = static_cast<AlbumData *>(rd->expanded_album->user_data);
+            const auto b = c->real_bounds;
+            if (root->mouse_current_y >= b.y + std::min(b.h, rd->album_visible_height))
+                return;
+            const auto tracks = album_track_layout(b.w, rd->dpi, album->album.songs.size());
+            if (bounds_contains(Bounds(b.x + 8 * rd->dpi, b.y + 8 * rd->dpi, 36 * rd->dpi, 36 * rd->dpi),
+                                root->mouse_current_x, root->mouse_current_y)) {
+                close_album(root);
+                return;
+            }
+            const Bounds artwork(b.x + b.w - tracks.art_size - 16 * rd->dpi,
+                                 b.y + 16 * rd->dpi, tracks.art_size, tracks.art_size);
+            if (bounds_contains(artwork, root->mouse_current_x, root->mouse_current_y)) {
+                open_artwork_preview(root, album->art);
+                return;
+            }
+            for (int action = 0; action < 3; ++action) {
+                const auto button = album_action_bounds(b, rd->dpi, action);
+                if (button.x + button.w > b.x + 56 * rd->dpi + tracks.text_width ||
+                    !bounds_contains(button, root->mouse_current_x, root->mouse_current_y))
+                    continue;
+                if (action == 0) {
+                    play_album(album->album, 0);
+                } else if (action == 1) {
+                    auto queue = album_paths(album->album);
+                    static std::mt19937 random(std::random_device{}());
+                    std::shuffle(queue.begin(), queue.end(), random);
+                    observe_queue();
+                    const auto index = playback_queue.upcoming_begin();
+                    playback_queue.add(queue, PlaybackQueue::Action::PlayNext);
+                    commit_queue(root);
+                    if (!player->play_queued_item(index))
+                        std::cerr << "Album playback failed: " << player->last_error() << '\n';
+                } else {
+                    observe_queue();
+                    playback_queue.add(album_paths(album->album), PlaybackQueue::Action::Append);
+                    commit_queue(root);
+                }
+                return;
+            }
+
+            for (std::size_t i = 0; i < album->album.songs.size(); ++i) {
+                if (bounds_contains(tracks.track_bounds(b, rd->dpi, i),
+                                    root->mouse_current_x, root->mouse_current_y)) {
+                    play_album(album->album, i);
+                    break;
+                }
+            }
+        };
+    }
+    if (rd->expanded_album != card) {
+        const auto &cards = rd->library->children;
+        const auto index = std::distance(cards.begin(), std::find(cards.begin(), cards.end(), card));
+        const auto previous = std::distance(cards.begin(), std::find(cards.begin(), cards.end(), rd->expanded_album));
+        const bool same_row = rd->expanded_album && index / rd->album_columns == previous / rd->album_columns;
+        if (!same_row)
+            retain_closing_album(rd);
+        rd->outgoing_album = same_row ? rd->expanded_album : nullptr;
+        rd->album_transition_from_height = same_row ? rd->album_visible_height / rd->dpi : 0;
+        rd->album_transition_from_gap = same_row ? rd->album_visible_gap / rd->dpi : 0;
+        // If we return to a row mid-close, transition from its current visible height.
+        const auto closing = std::find_if(rd->closing_albums.begin(), rd->closing_albums.end(), [&](const auto &entry) {
+            const auto closing_index = std::distance(cards.begin(), std::find(cards.begin(), cards.end(), entry.card));
+            return closing_index / rd->album_columns == index / rd->album_columns;
+        });
+        if (!same_row && closing != rd->closing_albums.end()) {
+            rd->outgoing_album = closing->card;
+            rd->album_transition_from_height = closing->visible_height / rd->dpi;
+            rd->album_transition_from_gap = (closing->occupied_height - closing->visible_height) / rd->dpi;
+            rd->closing_albums.erase(closing);
+        }
+        rd->album_reveal_start = std::chrono::steady_clock::now();
+        rd->album_reveal = 0;
+    }
+    rd->expanded_album = card;
+    // Interpolate the selected card's screen position, compensating for changing panels above it.
+    rd->album_scroll_from = (card->real_bounds.y - rd->library->real_bounds.y) / rd->dpi;
+    rd->album_scroll_start = std::chrono::steady_clock::now();
+    layout(root, root, root->real_bounds);
+    windowing::redraw(rd->window->raw_window);
+}
+
+static bool consume_album_double_click(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->album_double_click_target)
+        return false;
+    if (!rd->album_double_click_handled) {
+        rd->album_double_click_handled = true;
+        auto card = rd->album_double_click_target;
+        auto album = static_cast<AlbumData *>(card->user_data);
+        album->play_pulse_start = std::chrono::steady_clock::now();
+        play_album(album->album, 0);
+        open_album(root, card);
+        windowing::redraw(rd->window->raw_window);
+    }
+    return true;
 }
 
 static void add_album(Container *parent, const AlbumOption &option, AlbumArtCache::Handle existing_art = {},
@@ -436,6 +1120,7 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
         tracks.push_back(song.full);
     auto root_data = root_data_for(parent);
     data->art = existing_art ? std::move(existing_art) : root_data->artwork->create(std::move(tracks));
+    root_data->artwork_prefetch.add(data->art);
     for (const auto &song : option.songs)
         root_data->tracks[song.full] = {
             song.name.empty() ? std::filesystem::path(song.full).stem().string() : song.name,
@@ -457,49 +1142,99 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
     c->when_paint = [](Container *root, Container *c) {
         auto data = static_cast<AlbumData *>(c->user_data);
         auto window = static_cast<RootData *>(root->user_data)->window->raw_window;
-        auto cr = window->cr;
+        auto cr = window->drawing_context;
         const double dpi = window->dpi;
         if (c->real_bounds.intersection(c->parent->real_bounds).empty())
             return;
         const auto art = static_cast<RootData *>(root->user_data)->artwork->image(data->art);
         // AlbumTexture *art = nullptr;
 
-        cairo_save(cr);
+        cr->save();
         set_rect(cr, c->parent->real_bounds);
-        cairo_clip(cr);
-        set_rect(cr, c->real_bounds);
-        cairo_clip(cr);
-        paint_button_bg(root, c);
+        cr->clip();
+        if (data->play_pulse_start) {
+            auto rd = static_cast<RootData *>(root->user_data);
+            const double t = std::clamp(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - *data->play_pulse_start).count() / 240.0, 0.0, 1.0);
+            const double scale = 1 - .07 * std::pow(std::sin(M_PI * t), 2);
+            const double cx = c->real_bounds.x + c->real_bounds.w / 2;
+            const double cy = c->real_bounds.y + c->real_bounds.h / 2;
+            cr->translate(cx, cy);
+            cr->scale(scale, scale);
+            cr->translate(-cx, -cy);
+            if (t >= 1)
+                data->play_pulse_start.reset();
+            else {
+                rd->artwork_refresh->animating = true;
+                poll_artwork(rd->artwork_refresh);
+            }
+        }
         const double pad = 8 * dpi;
         const double x = c->real_bounds.x + pad;
         const double y = c->real_bounds.y + pad;
         const double size = std::max(0.0, c->real_bounds.w - 2 * pad);
-        cairo_rectangle(cr, x, y, size, size);
-        cairo_set_source_rgb(cr, .9, .91, .93);
-        cairo_fill(cr);
+        auto rd = root_data_for(root);
+        rd->library_shadow.draw(*cr, {x, y, size, size}, 0, library_art_shadow, dpi, rd->library_shadow_alpha);
+        cr->rectangle(x, y, size, size);
+        cr->set_color(RGBA(.9, .91, .93, 1));
+        cr->fill();
         if (art && size > 0) {
             paint_artwork(static_cast<RootData *>(root->user_data), cr, data->art, art,
                           data->detail_fade, x, y, size);
         } else {
             draw_text(cr, x, y + size / 2 - 12 * dpi, "♫", 24 * dpi, true,
-                      mylar_font, size, -1, RGBA(.45, .47, .5, 1), false, PANGO_ALIGN_CENTER);
+                      mylar_font, size, -1, RGBA(.45, .47, .5, 1), false, 1);
+        }
+        if (c->state.mouse_hovering && size > 0) {
+            const double cx = x + size / 2, cy = y + size / 2;
+            cr->arc(cx, cy, std::min(26 * dpi, size / 3), 0, 2 * M_PI);
+            cr->set_color(RGBA(0, 0, 0, .65));
+            cr->fill();
+            cr->move_to(cx - 6 * dpi, cy - 10 * dpi);
+            cr->line_to(cx + 10 * dpi, cy);
+            cr->line_to(cx - 6 * dpi, cy + 10 * dpi);
+            cr->close_path();
+            cr->set_color(RGBA(1, 1, 1, 1));
+            cr->fill();
         }
         draw_text(cr, x, y + size + 8 * dpi, data->name, 12 * dpi, true,
-                  mylar_font, size, 20 * dpi * PANGO_SCALE, RGBA(0, 0, 0, 1), true);
+                  mylar_font, size, 20 * dpi, RGBA(0, 0, 0, 1), true,
+                  0, nullptr, dpi);
         draw_text(cr, x, y + size + 30 * dpi, data->artist, 10 * dpi, true,
-                  mylar_font, size, 18 * dpi * PANGO_SCALE, RGBA(.4, .4, .4, 1), false);
-        cairo_restore(cr);
+                  mylar_font, size, 18 * dpi, RGBA(.4, .4, .4, 1), false,
+                  0, nullptr, dpi);
+        cr->restore();
     };
-    c->when_clicked = [](Container *, Container *c) {
+    c->when_clicked = [](Container *root, Container *c) {
+        if (consume_album_double_click(root))
+            return;
+        if (c->state.mouse_button_pressed == BTN_RIGHT) {
+            open_queue_context(root, album_paths(static_cast<AlbumData *>(c->user_data)->album));
+            return;
+        }
         if (c->state.mouse_button_pressed != BTN_LEFT)
             return;
-        auto data = static_cast<AlbumData *>(c->user_data);
-        auto &queue = player->queue();
-        queue.clear();
-        for (const auto &song : data->album.songs)
-            queue.push_back(song.full);
-        if (!player->play_queued_item(0))
-            std::cerr << "Album playback failed: " << player->last_error() << '\n';
+        auto rd = root_data_for(c);
+        auto album = static_cast<AlbumData *>(c->user_data);
+        const double dpi = rd->dpi;
+        const auto now = std::chrono::steady_clock::now();
+        rd->last_album_clicked = c;
+        rd->last_album_click_time = now;
+        rd->last_album_click_x = root->mouse_current_x;
+        rd->last_album_click_y = root->mouse_current_y;
+        const double size = std::max(0.0, c->real_bounds.w - 16 * dpi);
+        const double dx = root->mouse_current_x - (c->real_bounds.x + c->real_bounds.w / 2);
+        const double dy = root->mouse_current_y - (c->real_bounds.y + 8 * dpi + size / 2);
+        if (std::hypot(dx, dy) <= std::min(26 * dpi, size / 3)) {
+            album->play_pulse_start = now;
+            play_album(album->album, 0);
+            open_album(root, c);
+        } else if (rd->expanded_album == c) {
+            close_album(root);
+        } else {
+            open_album(root, c);
+        }
+        windowing::redraw(rd->window->raw_window);
     };
 
 }
@@ -546,9 +1281,8 @@ static void add_song(Container *parent, const Option &option) {
         auto root_data = (RootData *) root->user_data;
         auto option_data = (OptionData *) c->user_data;
         auto dpi = root_data->window->raw_window->dpi;
-        auto cr = root_data->window->raw_window->cr;
+        auto cr = root_data->window->raw_window->drawing_context;
         paint_button_bg(root, c);
-//static Bounds draw_text(cairo_t *cr, int x, int y, std::string text, int size, bool draw, std::string font, int wrap, int h, RGBA color, bool bold, int align = 0) {
         auto b = draw_text(cr, 0, 0, option_data->name, 12 * dpi, false, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
         draw_text(cr, 10, center_y(c, b.h), option_data->name, 12 * dpi, true, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
     };
@@ -557,13 +1291,14 @@ static void add_song(Container *parent, const Option &option) {
         auto btn = c->state.mouse_button_pressed;
         // printf("here\n");
         if (btn == BTN_LEFT) {
-            player->play_track(option_data->full_path);
-            player->start();
+            observe_queue();
+            const auto index = playback_queue.upcoming_begin();
+            playback_queue.add({option_data->full_path}, PlaybackQueue::Action::PlayNext);
+            commit_queue(root);
+            player->play_queued_item(index);
             // printf(fz("{}\n", option_data->full_path).c_str());
         } else if (btn == BTN_RIGHT) {
-            printf("%s queued\n", option_data->full_path.c_str());
-            player->queue().push_back(option_data->full_path);
-            player->queue_changed();
+            open_queue_context(root, {option_data->full_path});
         }
     };
 }
@@ -572,11 +1307,11 @@ static void fill_out_for_songs(Container *root, const std::vector<Option> &playa
     root->type = ::fullycustom;
     root->when_paint = [](Container *root, Container *c) {
         auto root_data = (RootData *) root->user_data;
-        auto cr = root_data->window->raw_window->cr;
+        auto cr = root_data->window->raw_window->drawing_context;
         auto b = c->real_bounds;
         set_rect(cr, b); 
         set_argb(cr, RGBA(1, 1, 1, 1));
-        cairo_fill(cr);
+        cr->fill();
         // windowing::redraw(mylar_window->raw_window);
     };    
     root->receive_events_even_if_obstructed = true;
@@ -605,6 +1340,12 @@ static void fill_out_for_songs(Container *root, const std::vector<Option> &playa
         add_song(root, option);
 }
 
+static void show_library_scrollbar(RootData *data) {
+    data->scrollbar_activity = std::chrono::steady_clock::now();
+    data->artwork_refresh->animating = true;
+    poll_artwork(data->artwork_refresh);
+}
+
 static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> &albums) {
     auto data = root_data_for(root);
     data->artwork = std::make_shared<AlbumArtCache>();
@@ -617,37 +1358,48 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
     root->clip = true;
     root->receive_events_even_if_obstructed = true;
     root->when_paint = [](Container *root, Container *c) {
-        auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->cr;
+        auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->drawing_context;
         set_rect(cr, c->real_bounds);
-        cairo_set_source_rgb(cr, 1, 1, 1);
-        cairo_fill(cr);
+        cr->set_color(RGBA(1, 1, 1, 1));
+        cr->fill();
         const auto data = static_cast<RootData *>(root->user_data);
         data->artwork_frame_time = std::chrono::steady_clock::now();
-        // Inspect the whole viewport before painting any card. Every waiting
-        // card gets the same start time once the last visible detail is ready.
-        bool ready = data->first_frame_shown;
-        if (data->current_art_startup_fade && data->current_art &&
-            !data->artwork->detail_ready(data->current_art, 128))
-            ready = false;
+        // Ready covers reveal independently; a slow cover must not hold back
+        // the rest of the viewport or the playback artwork.
+        bool foreground_ready = data->first_frame_shown;
+        if (data->current_art_startup_fade && data->current_art) {
+            const bool ready = data->first_frame_shown && data->artwork->detail_ready(data->current_art, 128);
+            foreground_ready &= ready;
+            if (ready && !data->current_art_fade)
+                data->current_art_fade = data->artwork_frame_time;
+        }
         for (auto i = data->album_first; i < data->album_end; ++i) {
             auto child = c->children[i];
             if (!child->exists)
                 continue;
-            const auto album = static_cast<AlbumData *>(child->user_data);
+            auto album = static_cast<AlbumData *>(child->user_data);
             const int pixels = std::max(1, static_cast<int>(std::ceil(child->real_bounds.w - 16 * data->dpi)));
-            if (!data->artwork->detail_ready(album->art, pixels))
-                ready = false;
-        }
-        if (ready) {
-            if (data->current_art_startup_fade && data->current_art && !data->current_art_fade)
-                data->current_art_fade = data->artwork_frame_time;
-            for (auto i = data->album_first; i < data->album_end; ++i) {
-                auto child = c->children[i];
-                if (!child->exists)
-                    continue;
-                auto album = static_cast<AlbumData *>(child->user_data);
+            const bool ready = data->first_frame_shown && data->artwork->detail_ready(album->art, pixels);
+            foreground_ready &= ready;
+            if (ready) {
                 if (!album->detail_fade)
                     album->detail_fade = data->artwork_frame_time;
+                if (!data->initial_shadow_fade)
+                    data->initial_shadow_fade = album->detail_fade;
+            }
+        }
+        // Only background prefetch waits for all foreground requests to finish.
+        if (data->artwork_prefetch.advance(*data->artwork, data->artwork_prefetch_pixels, foreground_ready))
+            poll_artwork(data->artwork_refresh);
+        // Only the first sharp-art reveal controls shadows. Later scrolls,
+        // artwork loads, and library rescans keep the full configured shadow.
+        if (data->initial_shadow_fade && data->library_shadow_alpha < 1) {
+            data->library_shadow_alpha = artwork_fade_duration_ms <= 0 ? 1.0 : std::clamp(
+                std::chrono::duration<double, std::milli>(data->artwork_frame_time - *data->initial_shadow_fade).count() /
+                artwork_fade_duration_ms, 0.0, 1.0);
+            if (data->library_shadow_alpha < 1) {
+                data->artwork_refresh->animating = true;
+                poll_artwork(data->artwork_refresh);
             }
         }
         for (auto i = data->album_first; i < data->album_end; ++i) {
@@ -655,9 +1407,61 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
             if (child->exists)
                 child->when_paint(root, child);
         }
+        if (data->album_panel && (data->album_panel->exists || !data->closing_albums.empty()))
+            data->album_panel->when_paint(root, data->album_panel);
+        if (data->library_scroll_max + c->scroll_v_real > .5 * data->dpi) {
+            const auto &b = c->real_bounds;
+            cr->save();
+            cr->rectangle(b.x, b.y, b.w, b.h); cr->clip();
+            data->playback_bar_shadow.draw(*cr, {b.x, b.bottom(), b.w, 96 * data->dpi},
+                                           0, {.28, 16, -3}, data->dpi);
+            cr->restore();
+        }
     };
-    root->when_fine_scrolled = [](Container *, Container *c, double, double scroll_y, bool) {
+    root->when_mouse_enters_container = root->when_mouse_motion = [](Container *root, Container *) {
+        auto data = static_cast<RootData *>(root->user_data);
+        if (data->library->interactable && !((data->queue_overlay && data->queue_overlay->exists) || (data->context_overlay && data->context_overlay->exists)))
+            show_library_scrollbar(data);
+    };
+    root->when_mouse_leaves_container = [](Container *root, Container *) {
+        auto data = static_cast<RootData *>(root->user_data);
+        if (!data->scrollbar_dragging) {
+            // Start the fade immediately when leaving the library.
+            data->scrollbar_activity = std::chrono::steady_clock::now() - std::chrono::milliseconds(900);
+            data->artwork_refresh->animating = true;
+            poll_artwork(data->artwork_refresh);
+        }
+    };
+    root->when_mouse_down = [](Container *root, Container *c) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        if ((rd->queue_overlay && rd->queue_overlay->exists) || (rd->context_overlay && rd->context_overlay->exists)) return;
+        if (rd->library_scrollbar && rd->library_scrollbar->interactable &&
+            bounds_contains(rd->library_scrollbar->real_bounds, root->mouse_current_x, root->mouse_current_y)) return;
+        const auto now = std::chrono::steady_clock::now();
+        const bool double_click = c->state.mouse_button_pressed == BTN_LEFT && rd->last_album_clicked &&
+            now - rd->last_album_click_time <= std::chrono::milliseconds(400) &&
+            std::hypot(root->mouse_current_x - rd->last_album_click_x,
+                       root->mouse_current_y - rd->last_album_click_y) <= 8 * rd->dpi;
+        rd->album_double_click_target = double_click ? rd->last_album_clicked : nullptr;
+        rd->album_double_click_handled = false;
+        rd->last_album_clicked = nullptr;
+    };
+    root->when_clicked = [](Container *root, Container *) {
+        // Also catch a second click over empty space after the card has scrolled away.
+        auto rd = static_cast<RootData *>(root->user_data);
+        if ((rd->queue_overlay && rd->queue_overlay->exists) || (rd->context_overlay && rd->context_overlay->exists)) return;
+        if (rd->library_scrollbar && rd->library_scrollbar->interactable &&
+            bounds_contains(rd->library_scrollbar->real_bounds, root->mouse_current_x, root->mouse_current_y)) return;
+        consume_album_double_click(root);
+    };
+    root->when_fine_scrolled = [](Container *root, Container *c, double, double scroll_y, bool) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        if ((rd->queue_overlay && rd->queue_overlay->exists) || (rd->context_overlay && rd->context_overlay->exists)) return;
+        rd->album_scroll_start.reset();
+        rd->last_album_clicked = nullptr;
+        rd->album_double_click_target = nullptr;
         c->scroll_v_real += 2 * scroll_y;
+        show_library_scrollbar(rd);
     };
     root->pre_layout = [](Container *root, Container *c, const Bounds &b) {
         auto data = static_cast<RootData *>(root->user_data);
@@ -681,21 +1485,119 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         const double width = std::max(0.0, b.w - 2 * pad);
         const double card_w = std::min(192 * dpi, width);
         const double card_h = card_w + 56 * dpi;
+        data->artwork_prefetch_pixels = std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi)));
         const auto columns = std::max<std::size_t>(1, std::floor((width + gap) / (card_w + gap)));
+        data->album_columns = columns;
         // Share remaining width across the outer margins and every column gap.
         const double column_gap = std::max(0.0, b.w - columns * card_w) / (columns + 1);
-        const auto rows = (c->children.size() + columns - 1) / columns;
-        const double content_h = rows ? 2 * pad + rows * card_h + (rows - 1) * gap : 0;
-        c->scroll_v_real = std::clamp(c->scroll_v_real, std::min(0.0, b.h - content_h), 0.0);
-        // Lay out and preload the viewport plus one row on either side.
-        // Paint and image requests now scale with visible cards, not library size.
+        const auto count = c->children.size() - (data->album_panel ? 1 : 0);
+        const auto rows = (count + columns - 1) / columns;
+        const auto now = std::chrono::steady_clock::now();
+        std::erase_if(data->closing_albums, [&](const auto &closing) {
+            return now - closing.start >= std::chrono::milliseconds(320);
+        });
+        for (auto &closing : data->closing_albums) {
+            const auto index = std::distance(c->children.begin(),
+                std::find(c->children.begin(), c->children.end(), closing.card));
+            closing.row = index / columns;
+            const double t = std::clamp(std::chrono::duration<double, std::milli>(now - closing.start).count() / 320.0, 0.0, 1.0);
+            const double remaining = 1 - t * t * (3 - 2 * t);
+            closing.visible_height = closing.initial_height * dpi * remaining;
+            closing.occupied_height = (closing.initial_height + closing.initial_gap) * dpi * remaining;
+            data->artwork_refresh->animating = true;
+            poll_artwork(data->artwork_refresh);
+        }
+        auto closing_height_before = [&](std::size_t row) {
+            double height = 0;
+            for (const auto &closing : data->closing_albums)
+                if (closing.row < row)
+                    height += closing.occupied_height;
+            return height;
+        };
+        std::size_t expanded_row = no_index;
+        double panel_h = 0;
+        double panel_full_h = 0;
+        if (data->expanded_album) {
+            const auto selected = std::find(c->children.begin(), c->children.end(), data->expanded_album);
+            expanded_row = std::distance(c->children.begin(), selected) / columns;
+            const auto album = static_cast<AlbumData *>(data->expanded_album->user_data);
+            const auto tracks = album_track_layout(b.w, dpi, album->album.songs.size());
+            panel_full_h = std::max((150 + 32 * tracks.rows) * dpi, tracks.art_size + 32 * dpi);
+            if (data->album_reveal_start) {
+                const double t = std::clamp(std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - *data->album_reveal_start).count() / 320.0, 0.0, 1.0);
+                data->album_reveal = t * t * (3 - 2 * t);
+                if (t >= 1) {
+                    data->album_reveal_start.reset();
+                    data->outgoing_album = nullptr;
+                } else {
+                    data->artwork_refresh->animating = true;
+                    poll_artwork(data->artwork_refresh);
+                }
+            }
+            const double previous_h = data->outgoing_album ? data->album_transition_from_height * dpi : 0;
+            data->album_visible_height = previous_h + (panel_full_h - previous_h) * data->album_reveal;
+            const double previous_gap = data->outgoing_album ? data->album_transition_from_gap * dpi : 0;
+            data->album_visible_gap = previous_gap + (gap - previous_gap) * data->album_reveal;
+            panel_h = data->album_visible_height + data->album_visible_gap;
+        }
+        double content_h = rows ? 2 * pad + rows * card_h + (rows - 1) * gap + panel_h + closing_height_before(rows) : 0;
+        if (data->expanded_album) {
+            const double target = -(pad + expanded_row * (card_h + gap) + closing_height_before(expanded_row));
+            // Allow the final album to reach the viewport top as well.
+            content_h = std::max(content_h, b.h - target);
+            if (data->album_scroll_start) {
+                const double t = std::clamp(std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - *data->album_scroll_start).count() / 320.0, 0.0, 1.0);
+                c->scroll_v_real = target + data->album_scroll_from * dpi * (1 - t);
+                // Do not clamp away compensation while an old panel above the selection closes.
+                content_h = std::max(content_h, b.h - c->scroll_v_real);
+                if (t >= 1)
+                    data->album_scroll_start.reset();
+                else {
+                    data->artwork_refresh->animating = true;
+                    poll_artwork(data->artwork_refresh);
+                }
+            }
+        }
+        const double scroll_max = data->album_scroll_start ? std::max(0.0, c->scroll_v_real) : 0;
+        data->library_scroll_max = std::max(0.0, content_h - b.h);
+        c->scroll_v_real = std::clamp(c->scroll_v_real, std::min(0.0, b.h - content_h), scroll_max);
+        // Lay out the viewport plus one row on either side. Only visible cards
+        // issue foreground requests; the prefetch cursor handles the rest.
         const double row_h = card_h + gap;
-        const auto first_row = static_cast<std::size_t>(std::max(0.0,
-            std::floor((-c->scroll_v_real - pad) / row_h) - 1));
-        const auto end_row = static_cast<std::size_t>(std::max(0.0,
-            std::ceil((b.h - c->scroll_v_real - pad) / row_h) + 1));
-        const auto first = std::min(c->children.size(), first_row * columns);
-        const auto end = std::min(c->children.size(), end_row * columns);
+        const double panel_top = expanded_row == no_index ? 0 :
+            (expanded_row + 1) * row_h + closing_height_before(expanded_row + 1);
+        auto row_top = [&](std::size_t row) {
+            return row * row_h + closing_height_before(row) + (row > expanded_row ? panel_h : 0);
+        };
+        // Binary searches keep viewport work bounded even with multiple closing rows.
+        auto first_row_after = [&](double y) {
+            std::size_t low = 0, high = rows;
+            while (low < high) {
+                const auto mid = low + (high - low) / 2;
+                if (row_top(mid) <= y)
+                    low = mid + 1;
+                else
+                    high = mid;
+            }
+            return low;
+        };
+        const auto visible_first = first_row_after(-c->scroll_v_real - pad);
+        const auto first_row = visible_first > 1 ? visible_first - 2 : 0;
+        const auto end_row = std::min(rows, first_row_after(b.h - c->scroll_v_real - pad) + 1);
+        const auto first = std::min(count, first_row * columns);
+        const auto end = std::min(count, end_row * columns);
+        if (data->expanded_album) {
+            layout(root, data->album_panel, Bounds(b.x, b.y + pad + panel_top + c->scroll_v_real,
+                                                 b.w, panel_full_h));
+            data->album_panel->exists = !data->album_panel->real_bounds.intersection(b).empty();
+        }
+        for (auto &closing : data->closing_albums) {
+            closing.bounds = Bounds(b.x, b.y + pad + (closing.row + 1) * row_h +
+                closing_height_before(closing.row) + (closing.row > expanded_row ? panel_h : 0) + c->scroll_v_real,
+                b.w, closing.initial_height * dpi);
+        }
         for (auto i = data->album_first; i < data->album_end; ++i) {
             if (i >= first && i < end)
                 continue;
@@ -709,18 +1611,19 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
             auto child = c->children[i];
             layout(root, child, Bounds(
                 b.x + column_gap + (i % columns) * (card_w + column_gap),
-                b.y + pad + (i / columns) * row_h + c->scroll_v_real, card_w, card_h));
+                b.y + pad + row_top(i / columns) + c->scroll_v_real, card_w, card_h));
             child->exists = !child->real_bounds.intersection(b).empty();
             auto art = static_cast<AlbumData *>(child->user_data)->art;
             if (!child->exists)
                 data->artwork->release(art);
-            if (child->exists || data->first_frame_shown) {
-                // Once the preview frame is shown, request display-sized detail
-                // for every visible card; offscreen preloads do not hold the fade.
-                const bool detail = data->first_frame_shown && child->exists;
-                data->artwork->request(art, detail ? std::max(1, static_cast<int>(std::ceil(card_w - 16 * dpi))) : 0);
+            if (child->exists) {
+                // Keep the first preview frame, then prioritize visible detail.
+                data->artwork->request(art, data->first_frame_shown ? data->artwork_prefetch_pixels : 0);
             }
         }
+        if (data->album_panel && data->album_panel->exists)
+            data->artwork->request(static_cast<AlbumData *>(data->expanded_album->user_data)->art,
+                                  std::max(1, static_cast<int>(std::ceil(std::min(360 * dpi, b.w * .4)))));
         if (data->first_frame_shown && data->current_art)
             data->artwork->request(data->current_art, 128);
         if (data->artwork->pending() || data->artwork->take_changed())
@@ -740,6 +1643,7 @@ struct PlaybackData : UserData {
     Container *seek = nullptr;
     Container *mute = nullptr;
     Container *volume = nullptr;
+    Container *queue_button = nullptr;
     Bounds info_bounds;
     Bounds elapsed_bounds;
     Bounds duration_bounds;
@@ -828,6 +1732,7 @@ static bool sync_playback(Container *root) {
     // The saved-session display is authoritative until player initialization.
     if (!static_cast<RootData *>(root->user_data)->first_frame_shown)
         return false;
+    observe_queue();
     auto data = playback_data(root);
     const auto path = player->current_path();
     const auto index = player->current_index();
@@ -945,6 +1850,18 @@ static void finish_library_rescan(Container *root) {
             std::optional<std::chrono::steady_clock::time_point> detail_fade;
         };
         std::map<std::vector<std::string>, RetainedArt> retained_art;
+        if (data->album_panel) {
+            std::erase(library->children, data->album_panel);
+            delete data->album_panel;
+            data->album_panel = nullptr;
+            data->expanded_album = nullptr;
+            data->outgoing_album = nullptr;
+            data->closing_albums.clear();
+            data->last_album_clicked = nullptr;
+            data->album_double_click_target = nullptr;
+            data->album_scroll_start.reset();
+            data->album_reveal_start.reset();
+        }
         for (auto child : library->children) {
             auto album = static_cast<AlbumData *>(child->user_data);
             std::vector<std::string> paths;
@@ -954,6 +1871,7 @@ static void finish_library_rescan(Container *root) {
             delete child;
         }
         library->children.clear();
+        data->artwork_prefetch.reset();
         data->album_first = data->album_end = 0;
         // Keep metadata for queued tracks even if they are outside the library.
         std::erase_if(data->tracks, [](const auto &entry) {
@@ -1031,75 +1949,75 @@ enum class PlaybackButton { Previous, Play, Next, Mute };
 static void paint_playback_button(Container *root, Container *c, PlaybackButton button) {
     auto window = static_cast<RootData *>(root->user_data)->window->raw_window;
     auto data = playback_data(root);
-    auto cr = window->cr;
+    auto cr = window->drawing_context;
     const double scale = std::min(c->real_bounds.w, c->real_bounds.h) / 32;
     const bool active = c->interactable;
-    cairo_save(cr);
-    cairo_translate(cr, c->real_bounds.x + c->real_bounds.w / 2, c->real_bounds.y + c->real_bounds.h / 2);
-    cairo_scale(cr, scale, scale);
+    cr->save();
+    cr->translate(c->real_bounds.x + c->real_bounds.w / 2, c->real_bounds.y + c->real_bounds.h / 2);
+    cr->scale(scale, scale);
     if (!active)
-        cairo_set_source_rgb(cr, .66, .73, .77);
+        cr->set_color(RGBA(.66, .73, .77, 1));
     else if (c->state.mouse_hovering)
-        cairo_set_source_rgb(cr, .02, .52, .68);
+        cr->set_color(RGBA(.02, .52, .68, 1));
     else
-        cairo_set_source_rgb(cr, .24, .34, .40);
+        cr->set_color(RGBA(.24, .34, .40, 1));
     if (button == PlaybackButton::Play) {
         if (!active)
-            cairo_set_source_rgb(cr, .76, .84, .88);
+            cr->set_color(RGBA(.76, .84, .88, 1));
         else if (c->state.mouse_pressing)
-            cairo_set_source_rgb(cr, .02, .43, .58);
+            cr->set_color(RGBA(.02, .43, .58, 1));
         else if (c->state.mouse_hovering)
-            cairo_set_source_rgb(cr, .02, .56, .73);
+            cr->set_color(RGBA(.02, .56, .73, 1));
         else
-            cairo_set_source_rgb(cr, .04, .62, .79);
-        cairo_arc(cr, 0, 0, 16, 0, 2 * M_PI);
-        cairo_fill(cr);
-        cairo_set_source_rgb(cr, 1, 1, 1);
+            cr->set_color(RGBA(.04, .62, .79, 1));
+        cr->arc(0, 0, 16, 0, 2 * M_PI);
+        cr->fill();
+        cr->set_color(RGBA(1, 1, 1, 1));
         if (data->playing) {
-            cairo_rectangle(cr, -5, -6, 3, 12);
-            cairo_rectangle(cr, 2, -6, 3, 12);
+            cr->rectangle(-5, -6, 3, 12);
+            cr->rectangle(2, -6, 3, 12);
         } else {
-            cairo_move_to(cr, -4, -7);
-            cairo_line_to(cr, 7, 0);
-            cairo_line_to(cr, -4, 7);
-            cairo_close_path(cr);
+            cr->move_to(-4, -7);
+            cr->line_to(7, 0);
+            cr->line_to(-4, 7);
+            cr->close_path();
         }
-        cairo_fill(cr);
+        cr->fill();
     } else if (button == PlaybackButton::Previous || button == PlaybackButton::Next) {
         if (button == PlaybackButton::Next)
-            cairo_scale(cr, -1, 1);
-        cairo_rectangle(cr, -8, -6, 2.5, 12);
-        cairo_move_to(cr, -5, 0);
-        cairo_line_to(cr, 6, -7);
-        cairo_line_to(cr, 6, 7);
-        cairo_close_path(cr);
-        cairo_fill(cr);
+            cr->scale(-1, 1);
+        cr->rectangle(-8, -6, 2.5, 12);
+        cr->move_to(-5, 0);
+        cr->line_to(6, -7);
+        cr->line_to(6, 7);
+        cr->close_path();
+        cr->fill();
     } else {
-        cairo_move_to(cr, -10, -3);
-        cairo_line_to(cr, -6, -3);
-        cairo_line_to(cr, -1, -7);
-        cairo_line_to(cr, -1, 7);
-        cairo_line_to(cr, -6, 3);
-        cairo_line_to(cr, -10, 3);
-        cairo_close_path(cr);
-        cairo_fill(cr);
-        cairo_set_line_width(cr, 1.6);
-        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+        cr->move_to(-10, -3);
+        cr->line_to(-6, -3);
+        cr->line_to(-1, -7);
+        cr->line_to(-1, 7);
+        cr->line_to(-6, 3);
+        cr->line_to(-10, 3);
+        cr->close_path();
+        cr->fill();
+        cr->set_line_width(1.6);
+        cr->set_line_cap(drawing::LineCap::Round);
         if (data->gain == 0) {
-            cairo_move_to(cr, 4, -3);
-            cairo_line_to(cr, 10, 3);
-            cairo_move_to(cr, 10, -3);
-            cairo_line_to(cr, 4, 3);
+            cr->move_to(4, -3);
+            cr->line_to(10, 3);
+            cr->move_to(10, -3);
+            cr->line_to(4, 3);
         } else {
-            cairo_arc(cr, -1, 0, 7, -M_PI / 4, M_PI / 4);
+            cr->arc(-1, 0, 7, -M_PI / 4, M_PI / 4);
             if (data->gain > .5f) {
-                cairo_new_sub_path(cr);
-                cairo_arc(cr, -1, 0, 11, -M_PI / 4, M_PI / 4);
+                cr->new_sub_path();
+                cr->arc(-1, 0, 11, -M_PI / 4, M_PI / 4);
             }
         }
-        cairo_stroke(cr);
+        cr->stroke();
     }
-    cairo_restore(cr);
+    cr->restore();
 }
 
 static void activate_playback_button(Container *root, PlaybackButton button) {
@@ -1151,6 +2069,13 @@ static void playback_key_event(Container *root, Container *, int, bool pressed,
                                xkb_keysym_t sym, int mods, bool, std::string) {
     if (!pressed || (mods & (MOD_CTRL | MOD_ALT | MOD_SUPER)))
         return;
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (sym == XKB_KEY_Escape && (rd->queue_overlay->exists || rd->context_overlay->exists)) {
+        rd->queue_overlay->exists = false;
+        rd->context_overlay->exists = false;
+        windowing::redraw(rd->window->raw_window);
+        return;
+    }
     switch (sym) {
         case XKB_KEY_space:
             activate_playback_button(root, PlaybackButton::Play);
@@ -1197,7 +2122,7 @@ static Container *add_playback_slider(Container *bar, const char *name, bool vol
     c->when_drag_end_is_click = false;
     c->when_paint = [volume](Container *root, Container *c) {
         auto window = static_cast<RootData *>(root->user_data)->window->raw_window;
-        auto cr = window->cr;
+        auto cr = window->drawing_context;
         auto data = playback_data(root);
         const double dpi = window->dpi;
         const double inset = std::min(6 * dpi, c->real_bounds.w / 2);
@@ -1206,28 +2131,28 @@ static Container *add_playback_slider(Container *bar, const char *name, bool vol
         const double y = c->real_bounds.y + c->real_bounds.h / 2;
         const double value = volume ? data->gain : data->seeking ? data->seek_preview : data->position;
         const bool highlight = c->interactable && (c->state.mouse_hovering || c->state.mouse_pressing);
-        cairo_save(cr);
-        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-        cairo_set_line_width(cr, 4 * dpi);
-        cairo_set_source_rgb(cr, .80, .86, .89);
-        cairo_move_to(cr, x, y);
-        cairo_line_to(cr, x + width, y);
-        cairo_stroke(cr);
+        cr->save();
+        cr->set_line_cap(drawing::LineCap::Round);
+        cr->set_line_width(4 * dpi);
+        cr->set_color(RGBA(.80, .86, .89, 1));
+        cr->move_to(x, y);
+        cr->line_to(x + width, y);
+        cr->stroke();
         if (highlight)
-            cairo_set_source_rgb(cr, .02, .52, .68);
+            cr->set_color(RGBA(.02, .52, .68, 1));
         else
-            cairo_set_source_rgb(cr, .04, .62, .79);
+            cr->set_color(RGBA(.04, .62, .79, 1));
         if (value > 0 && c->interactable) {
-            cairo_move_to(cr, x, y);
-            cairo_line_to(cr, x + width * value, y);
-            cairo_stroke(cr);
+            cr->move_to(x, y);
+            cr->line_to(x + width * value, y);
+            cr->stroke();
         }
         if (highlight) {
-            cairo_set_source_rgb(cr, .02, .52, .68);
-            cairo_arc(cr, x + width * value, y, 5 * dpi, 0, 2 * M_PI);
-            cairo_fill(cr);
+            cr->set_color(RGBA(.02, .52, .68, 1));
+            cr->arc(x + width * value, y, 5 * dpi, 0, 2 * M_PI);
+            cr->fill();
         }
-        cairo_restore(cr);
+        cr->restore();
     };
     auto update = [volume](Container *root, Container *c) {
         if (c->state.mouse_button_pressed != BTN_LEFT || !c->interactable)
@@ -1278,11 +2203,11 @@ static void close_artwork_preview(Container *root) {
     playback_changed(root);
 }
 
-static void open_artwork_preview(Container *root) {
+static void open_artwork_preview(Container *root, const AlbumArtCache::Handle &art) {
     auto data = static_cast<RootData *>(root->user_data);
-    if (!data->current_art || !data->artwork_preview)
+    if (!art || !data->artwork_preview)
         return;
-    data->preview_art = data->artwork->create_preview(data->current_art);
+    data->preview_art = data->artwork->create_preview(art);
     data->preview_bounds = {};
     data->artwork_preview->exists = true;
     data->library->interactable = false;
@@ -1307,18 +2232,18 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
     };
     close->when_paint = [](Container *root, Container *c) {
         auto window = static_cast<RootData *>(root->user_data)->window->raw_window;
-        auto cr = window->cr;
+        auto cr = window->drawing_context;
         const auto &b = c->real_bounds;
         const double inset = b.w * .32;
-        cairo_save(cr);
-        cairo_set_source_rgba(cr, 1, 1, 1, c->state.mouse_hovering ? 1 : .7);
-        cairo_set_line_width(cr, 2 * window->dpi);
-        cairo_move_to(cr, b.x + inset, b.y + inset);
-        cairo_line_to(cr, b.right() - inset, b.bottom() - inset);
-        cairo_move_to(cr, b.right() - inset, b.y + inset);
-        cairo_line_to(cr, b.x + inset, b.bottom() - inset);
-        cairo_stroke(cr);
-        cairo_restore(cr);
+        cr->save();
+        cr->set_color(RGBA(1, 1, 1, c->state.mouse_hovering ? 1 : .7));
+        cr->set_line_width(2 * window->dpi);
+        cr->move_to(b.x + inset, b.y + inset);
+        cr->line_to(b.right() - inset, b.bottom() - inset);
+        cr->move_to(b.right() - inset, b.y + inset);
+        cr->line_to(b.x + inset, b.bottom() - inset);
+        cr->stroke();
+        cr->restore();
     };
     overlay->pre_layout = [close](Container *root, Container *c, const Bounds &b) {
         auto data = static_cast<RootData *>(root->user_data);
@@ -1334,12 +2259,12 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
     overlay->when_paint = [](Container *root, Container *c) {
         auto data = static_cast<RootData *>(root->user_data);
         auto window = data->window->raw_window;
-        auto cr = window->cr;
+        auto cr = window->drawing_context;
         const auto &b = c->real_bounds;
-        cairo_save(cr);
+        cr->save();
         set_rect(cr, b);
-        cairo_set_source_rgba(cr, 0, 0, 0, .82);
-        cairo_fill(cr);
+        cr->set_color(RGBA(0, 0, 0, .82));
+        cr->fill();
         const auto image = data->preview_art ? data->artwork->image(data->preview_art) : nullptr;
         data->preview_bounds = {};
         if (image) {
@@ -1347,15 +2272,14 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
             const double scale = std::min((b.w - 2 * padding) / image->width, (b.h - 2 * padding) / image->height);
             const double width = image->width * scale, height = image->height * scale;
             data->preview_bounds = Bounds(b.x + (b.w - width) / 2, b.y + (b.h - height) / 2, width, height);
-            cairo_translate(cr, data->preview_bounds.x, data->preview_bounds.y);
-            cairo_scale(cr, scale, scale);
-            cairo_set_source_surface(cr, image->surface, 0, 0);
-            cairo_paint(cr);
+            cr->translate(data->preview_bounds.x, data->preview_bounds.y);
+            cr->scale(scale, scale);
+            cr->draw_image(*image, 1, drawing::ImageFilter::Good);
         } else {
             draw_text(cr, b.x, b.y + b.h / 2, data->artwork->pending() ? "Loading artwork…" : "No artwork available",
-                      14 * window->dpi, true, mylar_font, b.w, -1, RGBA(1, 1, 1, 1), false, PANGO_ALIGN_CENTER);
+                      14 * window->dpi, true, mylar_font, b.w, -1, RGBA(1, 1, 1, 1), false, 1);
         }
-        cairo_restore(cr);
+        cr->restore();
     };
     overlay->when_clicked = [](Container *root, Container *c) {
         auto data = static_cast<RootData *>(root->user_data);
@@ -1381,6 +2305,35 @@ static void fill_playback_bar(Container *root, Container *bar) {
     data->seek = add_playback_slider(bar, "song-progress", false);
     data->mute = add_playback_button(root, bar, "mute", PlaybackButton::Mute);
     data->volume = add_playback_slider(bar, "volume", true);
+    data->queue_button = bar->child(FILL_SPACE, FILL_SPACE);
+    data->queue_button->name = "show-queue";
+    data->queue_button->when_clicked = [](Container *root, Container *c) {
+        if (c->state.mouse_button_pressed != BTN_LEFT) return;
+        auto rd = static_cast<RootData *>(root->user_data);
+        rd->context_overlay->exists = false;
+        rd->queue_overlay->exists = !rd->queue_overlay->exists;
+        rd->queue_scroll = 0;
+        layout(root, root, root->real_bounds);
+        playback_changed(root);
+    };
+    data->queue_button->when_paint = [](Container *root, Container *c) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        auto cr = rd->window->raw_window->drawing_context;
+        const auto b = c->real_bounds;
+        cr->save();
+        cr->translate(b.x + b.w / 2, b.y + b.h / 2);
+        cr->scale(b.w / 32, b.h / 32);
+        cr->set_color(RGBA(.12, c->state.mouse_hovering ? .56 : .34, .43, 1));
+        cr->set_line_width(2);
+        cr->set_line_cap(drawing::LineCap::Round);
+        for (int y : {-7, 0, 7}) {
+            cr->move_to(-10, y); cr->line_to(3, y);
+        }
+        cr->stroke();
+        cr->move_to(7, -4); cr->line_to(13, 0); cr->line_to(7, 4);
+        cr->close_path(); cr->fill();
+        cr->restore();
+    };
     data->settings = bar->child(FILL_SPACE, FILL_SPACE);
     data->settings->name = "settings";
     data->settings->when_clicked = [](Container *root, Container *c) {
@@ -1397,35 +2350,35 @@ static void fill_playback_bar(Container *root, Container *bar) {
     };
     data->settings->when_paint = [](Container *root, Container *c) {
         auto window = static_cast<RootData *>(root->user_data)->window->raw_window;
-        auto cr = window->cr;
+        auto cr = window->drawing_context;
         const auto &b = c->real_bounds;
-        cairo_save(cr);
-        cairo_translate(cr, b.x + b.w / 2, b.y + b.h / 2);
+        cr->save();
+        cr->translate(b.x + b.w / 2, b.y + b.h / 2);
         const double scale = std::min(b.w, b.h) / 32;
-        cairo_scale(cr, scale, scale);
+        cr->scale(scale, scale);
         if (c->state.mouse_hovering || c->state.mouse_pressing)
-            cairo_set_source_rgb(cr, .02, .52, .68);
+            cr->set_color(RGBA(.02, .52, .68, 1));
         else
-            cairo_set_source_rgb(cr, .24, .34, .40);
+            cr->set_color(RGBA(.24, .34, .40, 1));
         for (int i = 0; i < 48; ++i) {
             const double angle = i * 2 * M_PI / 48;
             const double radius = (i % 6 == 1 || i % 6 == 2) ? 10 : 8;
             const double x = std::cos(angle) * radius, y = std::sin(angle) * radius;
-            if (i == 0) cairo_move_to(cr, x, y);
-            else cairo_line_to(cr, x, y);
+            if (i == 0) cr->move_to(x, y);
+            else cr->line_to(x, y);
         }
-        cairo_close_path(cr);
-        cairo_new_sub_path(cr);
-        cairo_arc(cr, 0, 0, 3.5, 0, 2 * M_PI);
-        cairo_set_fill_rule(cr, CAIRO_FILL_RULE_EVEN_ODD);
-        cairo_fill(cr);
-        cairo_restore(cr);
+        cr->close_path();
+        cr->new_sub_path();
+        cr->arc(0, 0, 3.5, 0, 2 * M_PI);
+        cr->set_fill_rule(drawing::FillRule::EvenOdd);
+        cr->fill();
+        cr->restore();
     };
     data->art_button = bar->child(FILL_SPACE, FILL_SPACE);
     data->art_button->name = "preview-current-artwork";
     data->art_button->when_clicked = [](Container *root, Container *c) {
         if (c->state.mouse_button_pressed == BTN_LEFT)
-            open_artwork_preview(root);
+            open_artwork_preview(root, static_cast<RootData *>(root->user_data)->current_art);
     };
     if (auto startup = static_cast<RootData *>(root->user_data)->startup)
         data->unmuted_gain = startup->session.unmuted_volume;
@@ -1434,7 +2387,7 @@ static void fill_playback_bar(Container *root, Container *bar) {
         const double dpi = static_cast<RootData *>(root->user_data)->window->raw_window->dpi;
         const double pad = std::min(16 * dpi, b.w / 8);
         const bool compact = b.w < 1000 * dpi;
-        const double right_width = std::min(240 * dpi, b.w * .42);
+        const double right_width = std::min(272 * dpi, b.w * .42);
         const double center = compact ? b.x + (b.w - right_width) / 2 : b.x + b.w / 2;
         const double step = std::min(44 * dpi, (b.w - right_width - 2 * pad) / 3);
         const double button = std::max(0.0, std::min(32 * dpi, step));
@@ -1444,9 +2397,10 @@ static void fill_playback_bar(Container *root, Container *bar) {
         layout(root, data->next, Bounds(center + step - button / 2, button_y, button, button));
         const double mute_size = std::min(32 * dpi, right_width / 3);
         const double volume_y = b.y + (b.h - mute_size) / 2;
-        layout(root, data->mute, Bounds(b.right() - right_width, volume_y, mute_size, mute_size));
-        layout(root, data->volume, Bounds(b.right() - right_width + mute_size, volume_y,
-            std::max(0.0, right_width - 2 * mute_size - pad), mute_size));
+        layout(root, data->queue_button, Bounds(b.right() - right_width, volume_y, mute_size, mute_size));
+        layout(root, data->mute, Bounds(b.right() - right_width + mute_size, volume_y, mute_size, mute_size));
+        layout(root, data->volume, Bounds(b.right() - right_width + 2 * mute_size, volume_y,
+            std::max(0.0, right_width - 3 * mute_size - pad), mute_size));
         layout(root, data->settings, Bounds(b.right() - pad - mute_size, volume_y,
             mute_size, mute_size));
         const double seek_left = compact ? b.x + pad : b.x + b.w * .28;
@@ -1466,47 +2420,47 @@ static void fill_playback_bar(Container *root, Container *bar) {
         auto data = static_cast<PlaybackData *>(bar->user_data);
         auto window = root_data->window->raw_window;
         const double dpi = window->dpi;
-        auto cr = window->cr;
+        auto cr = window->drawing_context;
         sync_playback(root);
-        cairo_save(cr);
+        cr->save();
         set_rect(cr, bar->real_bounds);
-        cairo_set_source_rgb(cr, .96, .98, .99);
-        cairo_fill(cr);
-        cairo_rectangle(cr, bar->real_bounds.x, bar->real_bounds.y, bar->real_bounds.w, dpi);
-        cairo_set_source_rgb(cr, .82, .88, .91);
-        cairo_fill(cr);
+        cr->set_color(RGBA(.96, .98, .99, 1));
+        cr->fill();
+        cr->rectangle(bar->real_bounds.x, bar->real_bounds.y, bar->real_bounds.w, dpi);
+        cr->set_color(RGBA(.82, .88, .91, 1));
+        cr->fill();
         auto text = [&](const Bounds &b, const std::string &value, int size, RGBA color, bool bold, int align) {
             if (b.w > 0)
                 draw_text(cr, b.x, b.y, value, size * dpi, true, mylar_font, b.w,
-                          b.h * PANGO_SCALE, color, bold, align);
+                          b.h, color, bold, align);
         };
         const double elapsed = data->seeking ? data->seek_preview * data->duration : data->elapsed;
         text(data->elapsed_bounds, seconds_to_mmss(std::max(0, static_cast<int>(elapsed))), 9,
-             RGBA(.38, .47, .53, 1), false, PANGO_ALIGN_CENTER);
+             RGBA(.38, .47, .53, 1), false, 1);
         text(data->duration_bounds, seconds_to_mmss(std::max(0, static_cast<int>(data->duration))), 9,
-             RGBA(.38, .47, .53, 1), false, PANGO_ALIGN_CENTER);
+             RGBA(.38, .47, .53, 1), false, 1);
         if (!data->info_bounds.empty()) {
             const auto &b = data->info_bounds;
             auto track = root_data->tracks.find(data->path);
             auto art = root_data->current_art ? root_data->artwork->image(root_data->current_art) : nullptr;
             const double size = b.h;
-            cairo_rectangle(cr, b.x, b.y, size, size);
-            cairo_set_source_rgb(cr, .87, .93, .96);
-            cairo_fill(cr);
+            cr->rectangle(b.x, b.y, size, size);
+            cr->set_color(RGBA(.87, .93, .96, 1));
+            cr->fill();
             if (art) {
                 paint_artwork(root_data, cr, root_data->current_art, art,
                               root_data->current_art_fade, b.x, b.y, size,
                               root_data->current_art_startup_fade);
             } else {
                 text(Bounds(b.x, b.y + 14 * dpi, size, 30 * dpi), "♫", 18,
-                     RGBA(.20, .52, .64, 1), false, PANGO_ALIGN_CENTER);
+                     RGBA(.20, .52, .64, 1), false, 1);
             }
             const double text_x = b.x + size + 12 * dpi;
             const double text_w = std::max(0.0, b.right() - text_x);
             const std::string title = data->path.empty() ? "Choose an album" : track != root_data->tracks.end()
                 ? track->second.title : std::filesystem::path(data->path).stem().string();
             text(Bounds(text_x, b.y + 7 * dpi, text_w, 22 * dpi), title, 10,
-                 RGBA(.12, .22, .29, 1), true, PANGO_ALIGN_LEFT);
+                 RGBA(.12, .22, .29, 1), true, 0);
             std::string subtitle;
             if (track != root_data->tracks.end()) {
                 subtitle = track->second.artist;
@@ -1516,10 +2470,10 @@ static void fill_playback_bar(Container *root, Container *bar) {
                     subtitle += track->second.album;
                 }
             }
-            text(Bounds(text_x, b.y + 31 * dpi, text_w, 18 * dpi), subtitle, 9,
-                 RGBA(.38, .47, .53, 1), false, PANGO_ALIGN_LEFT);
+            text(Bounds(text_x, b.y + 28 * dpi, text_w, 18 * dpi), subtitle, 11,
+                 RGBA(.38, .47, .53, 1), false, 0);
         }
-        cairo_restore(cr);
+        cr->restore();
     };
     sync_playback(root);
 }
@@ -1581,19 +2535,20 @@ static void fill_settings_menu(Container *root, Container *overlay) {
     };
     overlay->when_paint = [](Container *root, Container *c) {
         auto data = static_cast<RootData *>(root->user_data);
-        auto cr = data->window->raw_window->cr;
+        auto cr = data->window->raw_window->drawing_context;
         const double dpi = settings_scale(root);
         const auto &b = data->settings_bounds;
-        cairo_save(cr);
+        cr->save();
         set_rect(cr, c->real_bounds);
-        cairo_set_source_rgba(cr, .05, .12, .17, .48);
-        cairo_fill(cr);
-        set_rect(cr, b);
-        cairo_set_source_rgb(cr, .97, .99, 1);
-        cairo_fill(cr);
+        cr->set_color(RGBA(.05, .12, .17, .48));
+        cr->fill();
+        data->settings_shadow.draw(*cr, {b.x, b.y, b.w, b.h}, popup_corner_radius * dpi, popup_shadow, dpi);
+        rounded_rectangle(cr, b, popup_corner_radius * dpi);
+        cr->set_color(RGBA(.97, .99, 1, 1));
+        cr->fill();
         auto text = [&](double y, const std::string &label, int size, RGBA color, bool bold = false) {
             draw_text(cr, b.x + 28 * dpi, b.y + y * dpi, label, size * dpi, true,
-                      mylar_font, b.w - 56 * dpi, -1, color, bold, PANGO_ALIGN_LEFT);
+                      mylar_font, b.w - 56 * dpi, -1, color, bold, 0);
         };
         if (data->settings_information) {
             const RGBA body(.38, .47, .53, 1);
@@ -1601,7 +2556,7 @@ static void fill_settings_menu(Container *root, Container *overlay) {
             // Explicit lines keep the instructions and command fully visible without wrapping.
             auto line = [&](double y, const std::string &label) {
                 draw_text(cr, b.x + 28 * dpi, b.y + y * dpi, label, 10 * dpi, true,
-                          mylar_font, -1, -1, body, false, PANGO_ALIGN_LEFT);
+                          mylar_font, -1, -1, body, false, 0);
             };
             text(24, "Playback rates", 22, heading, true);
             line(80, "Choose your track's rate in Settings. Your device must support it.");
@@ -1634,28 +2589,28 @@ static void fill_settings_menu(Container *root, Container *overlay) {
                  10, data->settings_error.empty() ? RGBA(.02, .39, .53, 1) : RGBA(.65, .16, .12, 1));
             text(302 + settings_extra_height(root), "Library", 12, RGBA(.12, .22, .29, 1), true);
         }
-        cairo_restore(cr);
+        cr->restore();
     };
     auto make_button = [&](const char *name, std::function<std::string()> label, unsigned rate = 0) {
         auto item = overlay->child(FILL_SPACE, FILL_SPACE);
         item->name = name;
         item->z_index = 1;
         item->when_paint = [label, rate](Container *root, Container *c) {
-            auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->cr;
+            auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->drawing_context;
             const auto &b = c->real_bounds;
             const double dpi = settings_scale(root);
             const bool selected = rate != 0 && player->sample_rate() == rate;
-            cairo_save(cr);
+            cr->save();
             set_rect(cr, b);
-            if (selected) cairo_set_source_rgb(cr, .04, .62, .79);
-            else if (c->interactable && c->state.mouse_hovering) cairo_set_source_rgb(cr, .78, .91, .96);
-            else cairo_set_source_rgb(cr, .87, .94, .97);
-            cairo_fill(cr);
+            if (selected) cr->set_color(RGBA(.04, .62, .79, 1));
+            else if (c->interactable && c->state.mouse_hovering) cr->set_color(RGBA(.78, .91, .96, 1));
+            else cr->set_color(RGBA(.87, .94, .97, 1));
+            cr->fill();
             draw_text(cr, b.x, b.y + 10 * dpi, label(), 10 * dpi, true,
                       mylar_font, b.w, -1, selected ? RGBA(1, 1, 1, 1) :
                       c->interactable ? RGBA(.02, .39, .53, 1) : RGBA(.45, .52, .56, 1),
-                      selected, PANGO_ALIGN_CENTER);
-            cairo_restore(cr);
+                      selected, 1);
+            cr->restore();
         };
         return item;
     };
@@ -1700,27 +2655,27 @@ static void fill_settings_menu(Container *root, Container *overlay) {
     auto_rescan->z_index = 1;
     auto_rescan->when_paint = [](Container *root, Container *c) {
         auto data = static_cast<RootData *>(root->user_data);
-        auto cr = data->window->raw_window->cr;
+        auto cr = data->window->raw_window->drawing_context;
         const double dpi = settings_scale(root);
         const auto &b = c->real_bounds;
         const bool enabled = data->startup->session.rescan_on_launch;
-        cairo_save(cr);
+        cr->save();
         draw_text(cr, b.x, b.y + 10 * dpi, "Rescan on launch", 10 * dpi, true,
-                  mylar_font, b.w - 100 * dpi, -1, RGBA(.12, .22, .29, 1), false, PANGO_ALIGN_LEFT);
+                  mylar_font, b.w - 100 * dpi, -1, RGBA(.12, .22, .29, 1), false, 0);
         draw_text(cr, b.right() - 96 * dpi, b.y + 10 * dpi, enabled ? "On" : "Off", 10 * dpi, true,
-                  mylar_font, 36 * dpi, -1, RGBA(.38, .47, .53, 1), false, PANGO_ALIGN_CENTER);
+                  mylar_font, 36 * dpi, -1, RGBA(.38, .47, .53, 1), false, 1);
         const double x = b.right() - 48 * dpi, y = b.y + b.h / 2;
-        cairo_set_line_width(cr, 24 * dpi);
-        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-        if (enabled) cairo_set_source_rgb(cr, .04, .62, .79);
-        else cairo_set_source_rgb(cr, .66, .73, .77);
-        cairo_move_to(cr, x + 12 * dpi, y);
-        cairo_line_to(cr, x + 36 * dpi, y);
-        cairo_stroke(cr);
-        cairo_set_source_rgb(cr, 1, 1, 1);
-        cairo_arc(cr, x + (enabled ? 36 : 12) * dpi, y, 9 * dpi, 0, 2 * M_PI);
-        cairo_fill(cr);
-        cairo_restore(cr);
+        cr->set_line_width(24 * dpi);
+        cr->set_line_cap(drawing::LineCap::Round);
+        if (enabled) cr->set_color(RGBA(.04, .62, .79, 1));
+        else cr->set_color(RGBA(.66, .73, .77, 1));
+        cr->move_to(x + 12 * dpi, y);
+        cr->line_to(x + 36 * dpi, y);
+        cr->stroke();
+        cr->set_color(RGBA(1, 1, 1, 1));
+        cr->arc(x + (enabled ? 36 : 12) * dpi, y, 9 * dpi, 0, 2 * M_PI);
+        cr->fill();
+        cr->restore();
     };
     auto_rescan->when_clicked = [](Container *root, Container *c) {
         if (c->state.mouse_button_pressed != BTN_LEFT)
@@ -1791,6 +2746,81 @@ static void fill_settings_menu(Container *root, Container *overlay) {
     };
 }
 
+static LibraryScrollMetrics library_scroll_metrics(RootData *data) {
+    return {data->library->real_bounds.h, data->library_scroll_max,
+            data->library_scrollbar->real_bounds.h, data->library->scroll_v_real, 32 * data->dpi};
+}
+
+static void fill_library_scrollbar(Container *root, Container *scrollbar) {
+    auto data = static_cast<RootData *>(root->user_data);
+    data->library_scrollbar = scrollbar;
+    scrollbar->name = "library-scrollbar";
+    scrollbar->z_index = 1;
+    scrollbar->when_drag_end_is_click = false;
+    scrollbar->when_mouse_enters_container = scrollbar->when_mouse_motion = [](Container *root, Container *) {
+        show_library_scrollbar(static_cast<RootData *>(root->user_data));
+    };
+    scrollbar->when_mouse_leaves_container = [](Container *root, Container *) {
+        auto data = static_cast<RootData *>(root->user_data);
+        data->artwork_refresh->animating = true;
+        poll_artwork(data->artwork_refresh);
+    };
+    auto update = [](Container *root, Container *c) {
+        auto data = static_cast<RootData *>(root->user_data);
+        if (!data->scrollbar_dragging || !c->interactable) return;
+        data->album_scroll_start.reset();
+        data->last_album_clicked = data->album_double_click_target = nullptr;
+        data->library->scroll_v_real = library_scroll_metrics(data).offset_at(
+            root->mouse_current_y - c->real_bounds.y, data->scrollbar_grab);
+        show_library_scrollbar(data);
+        windowing::redraw(data->window->raw_window);
+    };
+    scrollbar->when_mouse_down = [update](Container *root, Container *c) {
+        if (c->state.mouse_button_pressed != BTN_LEFT || !c->interactable) return;
+        auto data = static_cast<RootData *>(root->user_data);
+        const auto metrics = library_scroll_metrics(data);
+        const double y = root->mouse_current_y - c->real_bounds.y;
+        // Preserve the grab point on the thumb; track clicks center it at once.
+        data->scrollbar_grab = y >= metrics.thumb_top && y <= metrics.thumb_top + metrics.thumb_height
+            ? y - metrics.thumb_top : metrics.thumb_height / 2;
+        data->scrollbar_dragging = true;
+        update(root, c);
+    };
+    scrollbar->when_drag_start = scrollbar->when_drag = update;
+    auto finish = [update](Container *root, Container *c) {
+        auto data = static_cast<RootData *>(root->user_data);
+        if (!data->scrollbar_dragging) return;
+        update(root, c);
+        data->scrollbar_dragging = false;
+        show_library_scrollbar(data);
+    };
+    scrollbar->when_clicked = scrollbar->when_drag_end = finish;
+    scrollbar->when_paint = [](Container *root, Container *c) {
+        auto data = static_cast<RootData *>(root->user_data);
+        if (!c->interactable) return;
+        const double age = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - data->scrollbar_activity).count();
+        const bool held = data->scrollbar_dragging || c->state.mouse_hovering;
+        const double alpha = held ? 1 : std::clamp(1 - (age - 900) / 250, 0.0, 1.0);
+        if (alpha <= 0) return;
+        auto cr = data->window->raw_window->drawing_context;
+        const auto &b = c->real_bounds;
+        const auto metrics = library_scroll_metrics(data);
+        const double thickness = std::min((held ? 5 : 3) * data->dpi, b.w);
+        cr->save();
+        cr->rectangle(b.x, b.y, b.w, b.h); cr->clip();
+        cr->set_color(RGBA(.2, .3, .36, (held ? .65 : .4) * alpha));
+        cr->rounded_rectangle({b.x + (b.w - thickness) / 2, b.y + metrics.thumb_top,
+                               thickness, metrics.thumb_height}, thickness / 2);
+        cr->fill();
+        cr->restore();
+        if (!held) {
+            data->artwork_refresh->animating = true;
+            poll_artwork(data->artwork_refresh);
+        }
+    };
+}
+
 static void fill_root(Container *root) {
     auto root_data = static_cast<RootData *>(root->user_data);
     auto startup = root_data->startup;
@@ -1806,16 +2836,35 @@ static void fill_root(Container *root) {
     fill_out_for_albums(library, albums);
     auto bar = root->child(FILL_SPACE, FILL_SPACE);
     fill_playback_bar(root, bar);
+    auto scrollbar = root->child(FILL_SPACE, FILL_SPACE);
+    fill_library_scrollbar(root, scrollbar);
     root->when_key_event = playback_key_event;
+    auto queue_overlay = root->child(FILL_SPACE, FILL_SPACE);
+    fill_queue_overlay(root, queue_overlay);
+    auto context_overlay = root->child(FILL_SPACE, FILL_SPACE);
+    fill_queue_overlay(root, context_overlay, true);
     auto overlay = root->child(FILL_SPACE, FILL_SPACE);
     fill_artwork_preview(root, overlay);
     auto settings_menu = root->child(FILL_SPACE, FILL_SPACE);
     fill_settings_menu(root, settings_menu);
-    root->pre_layout = [library, bar, overlay, settings_menu](Container *root, Container *, const Bounds &b) {
+    root->pre_layout = [library, bar, scrollbar, overlay, settings_menu, queue_overlay, context_overlay](Container *root, Container *, const Bounds &b) {
         const double dpi = static_cast<RootData *>(root->user_data)->window->raw_window->dpi;
         const double bar_height = std::min(96 * dpi, b.h);
         layout(root, library, Bounds(b.x, b.y, b.w, std::max(0.0, b.h - bar_height)));
         layout(root, bar, Bounds(b.x, b.bottom() - bar_height, b.w, bar_height));
+        auto data = static_cast<RootData *>(root->user_data);
+        const auto &viewport = library->real_bounds;
+        const double gutter = std::min(14 * dpi, viewport.w);
+        const double inset = std::min(6 * dpi, viewport.h / 2);
+        layout(root, scrollbar, Bounds(viewport.right() - gutter, viewport.y + inset,
+                                      gutter, std::max(0.0, viewport.h - 2 * inset)));
+        scrollbar->interactable = library->interactable && !queue_overlay->exists && !context_overlay->exists &&
+            data->library_scroll_max > 0 && scrollbar->real_bounds.h > 0;
+        if (!scrollbar->interactable) data->scrollbar_dragging = false;
+        if (queue_overlay->exists)
+            layout(root, queue_overlay, b);
+        if (context_overlay->exists)
+            layout(root, context_overlay, b);
         if (overlay->exists)
             layout(root, overlay, b);
         if (settings_menu->exists)
@@ -1913,7 +2962,6 @@ int main(int argc, char **argv) {
         player = owned_player.get();
         open_window(startup);
         player->stop();
-        cleanup_cached_fonts();
         player = nullptr;
         return 0;
     } catch (const std::exception &error) {

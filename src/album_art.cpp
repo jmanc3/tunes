@@ -41,19 +41,24 @@ Pixbuf resized(GdkPixbuf *image, int pixels) {
         std::max(1, static_cast<int>(height * scale)), GDK_INTERP_BILINEAR), g_object_unref);
 }
 
-std::shared_ptr<const AlbumTexture> texture(GdkPixbuf *image, int pixels) {
+std::shared_ptr<AlbumTexture> texture(GdkPixbuf *image, int pixels) {
     auto result = std::make_shared<AlbumTexture>();
     result->width = gdk_pixbuf_get_width(image);
     result->height = gdk_pixbuf_get_height(image);
     result->pixels = pixels;
-    result->surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, result->width, result->height);
-    auto cr = cairo_create(result->surface);
-    gdk_cairo_set_source_pixbuf(cr, image, 0, 0);
-    cairo_paint(cr);
-    const bool ok = cairo_status(cr) == CAIRO_STATUS_SUCCESS;
-    cairo_destroy(cr);
-    cairo_surface_flush(result->surface);
-    return ok ? result : nullptr;
+    result->argb.resize(result->width * result->height);
+    const auto data = gdk_pixbuf_get_pixels(image);
+    const int stride = gdk_pixbuf_get_rowstride(image);
+    const int channels = gdk_pixbuf_get_n_channels(image);
+    for (int y = 0; y < result->height; ++y)
+        for (int x = 0; x < result->width; ++x) {
+            const auto p = data + y * stride + x * channels;
+            const uint32_t a = channels == 4 ? p[3] : 255;
+            auto premultiply = [a](uint32_t c) { return (c * a + 127) / 255; };
+            result->argb[y * result->width + x] = (a << 24) |
+                (premultiply(p[0]) << 16) | (premultiply(p[1]) << 8) | premultiply(p[2]);
+        }
+    return result;
 }
 
 // Separable Gaussian convolution on premultiplied pixels avoids alpha fringes.
@@ -62,8 +67,8 @@ std::shared_ptr<const AlbumTexture> blurred_preview(GdkPixbuf *image) {
     auto result = texture(image, preview_pixels);
     if (!result)
         return {};
-    auto data = cairo_image_surface_get_data(result->surface);
-    const int stride = cairo_image_surface_get_stride(result->surface);
+    auto data = reinterpret_cast<unsigned char *>(result->argb.data());
+    const int stride = result->width * 4;
     const int width = result->width, height = result->height;
     constexpr int radius = 4;
     double weights[2 * radius + 1], total = 0;
@@ -86,7 +91,6 @@ std::shared_ptr<const AlbumTexture> blurred_preview(GdkPixbuf *image) {
                     value += weights[i + radius] * horizontal[(std::clamp(y + i, 0, height - 1) * width + x) * 4 + channel];
                 data[y * stride + x * 4 + channel] = static_cast<unsigned char>(std::lround(value));
             }
-    cairo_surface_mark_dirty(result->surface);
     return result;
 }
 
@@ -155,11 +159,6 @@ std::string fingerprint(const std::vector<std::string> &tracks, const std::vecto
     g_checksum_free(checksum);
     return key;
 }
-}
-
-AlbumTexture::~AlbumTexture() {
-    if (surface)
-        cairo_surface_destroy(surface);
 }
 
 struct AlbumArtCache::Entry {
@@ -389,3 +388,33 @@ bool AlbumArtCache::detail_ready(const Handle &entry, int pixels) const {
 
 bool AlbumArtCache::take_changed() { return impl_->changed.exchange(false); }
 bool AlbumArtCache::pending() const { return impl_->jobs.load() != 0; }
+
+void AlbumArtPrefetch::add(AlbumArtCache::Handle album) {
+    albums_.push_back(std::move(album));
+}
+
+void AlbumArtPrefetch::reset() {
+    albums_.clear();
+    next_ = 0;
+    pixels_ = 0;
+}
+
+bool AlbumArtPrefetch::advance(AlbumArtCache &cache, int pixels, bool foreground_ready) {
+    if (pixels != pixels_) {
+        pixels_ = pixels;
+        next_ = 0; // A larger card/DPI may need sharper resident images.
+    }
+    if (!foreground_ready || pixels <= 0 || cache.pending())
+        return false;
+    while (next_ < albums_.size()) {
+        const auto &album = albums_[next_++];
+        if (!cache.detail_ready(album, pixels)) {
+            cache.request(album, pixels);
+            if (cache.pending())
+                return true;
+            // A failed entry may have no remaining work. Do not wait for a
+            // completion notification that will never arrive before advancing.
+        }
+    }
+    return false;
+}

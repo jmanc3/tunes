@@ -11,6 +11,11 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
     src/*.cpp
 )
 
+file(GLOB DRAWING_SOURCES CONFIGURE_DEPENDS src/drawing/*.cpp)
+list(REMOVE_ITEM SOURCES ${DRAWING_SOURCES})
+add_library(tunes_drawing STATIC ${DRAWING_SOURCES})
+target_include_directories(tunes_drawing PUBLIC include)
+
 add_executable(tunes ${SOURCES})
 
 target_include_directories(tunes PRIVATE include)
@@ -19,6 +24,9 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
     cairo
+    egl
+    glesv2
+    wayland-egl
     pango
     pangocairo
     librsvg-2.0
@@ -41,10 +49,39 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
     taglib
 )
 
-target_link_libraries(tunes PRIVATE PkgConfig::DEPS)
+target_link_libraries(tunes_drawing PRIVATE PkgConfig::DEPS)
+target_link_libraries(tunes PRIVATE tunes_drawing PkgConfig::DEPS)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tunes_library_scrollbar_test tests/library_scrollbar_test.cpp)
+    target_include_directories(tunes_library_scrollbar_test PRIVATE include)
+    add_test(NAME library_scrollbar COMMAND tunes_library_scrollbar_test)
+    add_executable(tunes_egl_window_test tests/egl_window_test.cpp src/client/egl_window.cpp)
+    target_include_directories(tunes_egl_window_test PRIVATE include)
+    target_link_libraries(tunes_egl_window_test PRIVATE tunes_drawing PkgConfig::DEPS)
+    add_test(NAME egl_window COMMAND tunes_egl_window_test)
+    set_tests_properties(egl_window PROPERTIES TIMEOUT 30 ENVIRONMENT "LIBGL_ALWAYS_SOFTWARE=1")
+    add_executable(tunes_opengl_drawing_test tests/opengl_drawing_test.cpp)
+    target_include_directories(tunes_opengl_drawing_test PRIVATE include)
+    target_link_libraries(tunes_opengl_drawing_test PRIVATE tunes_drawing PkgConfig::DEPS)
+    add_test(NAME opengl_drawing COMMAND tunes_opengl_drawing_test)
+    set_tests_properties(opengl_drawing PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_executable(tunes_drawing_test tests/drawing_test.cpp)
+    target_include_directories(tunes_drawing_test PRIVATE include)
+    target_link_libraries(tunes_drawing_test PRIVATE tunes_drawing PkgConfig::DEPS)
+    add_test(NAME drawing COMMAND tunes_drawing_test)
+    add_executable(tunes_popup_overlay_test tests/popup_overlay_test.cpp src/events.cpp src/container.cpp)
+    target_include_directories(tunes_popup_overlay_test PRIVATE include)
+    target_link_libraries(tunes_popup_overlay_test PRIVATE PkgConfig::DEPS)
+    add_test(NAME popup_overlay COMMAND tunes_popup_overlay_test)
+    add_executable(tunes_scroll_hover_test tests/scroll_hover_test.cpp src/events.cpp src/container.cpp)
+    target_include_directories(tunes_scroll_hover_test PRIVATE include)
+    target_link_libraries(tunes_scroll_hover_test PRIVATE PkgConfig::DEPS)
+    add_test(NAME scroll_hover COMMAND tunes_scroll_hover_test)
+    add_executable(tunes_playback_queue_test tests/playback_queue_test.cpp)
+    target_include_directories(tunes_playback_queue_test PRIVATE include)
+    add_test(NAME playback_queue COMMAND tunes_playback_queue_test)
     add_executable(tunes_pipewire_settings_test tests/pipewire_settings_test.cpp src/pipewire_settings.cpp)
     target_include_directories(tunes_pipewire_settings_test PRIVATE include)
     target_link_libraries(tunes_pipewire_settings_test PRIVATE PkgConfig::DEPS)

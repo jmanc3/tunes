@@ -12,6 +12,9 @@ OBJ := $(C_SRC:.c=.o) $(CPP_SRC:.cpp=.o)
 
 PKGS := \
 	cairo \
+	egl \
+	glesv2 \
+	wayland-egl \
 	pango \
 	pangocairo \
 	librsvg-2.0 \

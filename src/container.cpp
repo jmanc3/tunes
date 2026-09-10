@@ -705,7 +705,7 @@ void layout(Container* root, Container* container, const Bounds& bounds) {
         s->content->exists = true;
         s->right->exists   = true;
         s->bottom->exists  = true;
-    } else if (container->children.empty()) {
+    } else if (container->children.empty() && !(container->type & layout_type::fullycustom)) {
         return;
     }
     if (!container->should_layout_children)
@@ -1119,5 +1119,4 @@ ScrollPaneSettings::ScrollPaneSettings(float scale) {
     this->right_arrow_height = this->right_arrow_height * scale;
     this->bottom_arrow_width = this->bottom_arrow_width * scale;
 }
-
 

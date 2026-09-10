@@ -1,4 +1,5 @@
 #include "player.h"
+#include "playback_queue.h"
 #include "miniaudio.h"
 
 #include <chrono>
@@ -50,6 +51,21 @@ int main() {
         check(player.queue() == queue, "restoration changed queue order or duplicates");
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         check(player.playback_position().seconds == position.seconds, "paused playback advanced");
+        PlaybackQueue model;
+        model.observe(player.queue(), player.current_index());
+        model.add({path.string(), path.string()}, PlaybackQueue::Action::PlayNext);
+        player.queue() = model.paths();
+        player.queue_changed();
+        check(player.playback_position().seconds == position.seconds && player.current_index() == 1,
+              "priority insertion restarted current track");
+        model.move(model.entries().back().id, model.entries()[2].id);
+        model.remove(model.entries().back().id);
+        model.clear();
+        player.queue() = model.paths();
+        player.queue_changed();
+        check(player.queue().size() == 2 && player.current_index() == 1 &&
+              player.playback_position().seconds == position.seconds && device_starts == 0,
+              "queue editing interrupted current track");
         check(player.restore_session(queue, 2, 100), "restore past track end failed");
         check(player.current_time_seconds() < player.total_time_seconds(), "position not clamped");
         check(player.restore_session({(base / "missing.wav").string(), path.string()}, 0, 1), "fallback failed");

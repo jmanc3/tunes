@@ -5,7 +5,7 @@
 #include <string>
 #include <mutex>
 #include <vector>
-#include <cairo.h>
+#include "drawing/context.h"
 #include <xkbcommon/xkbcommon.h>
 
 enum Modifier : uint32_t {
@@ -132,7 +132,7 @@ struct RawWindow {
     RawWindow *parent = nullptr;
     std::vector<RawWindow *> children;
 
-    cairo_t *cr = nullptr;
+    drawing::Context *drawing_context = nullptr;
 
     std::function<bool(RawWindow *, float x, float y)> on_mouse_move = nullptr;
 

@@ -70,7 +70,13 @@ void fill_list_with_pierced(std::vector<Container*>& containers, Container* pare
         if (s->bottom && s->bottom->exists)
             fill_list_with_pierced(containers, s->bottom, x, y);
     } else {
-        for (auto child : parent->children) {
+        // Hit test front to back, keeping each sibling's subtree together.
+        auto children = parent->children;
+        std::stable_sort(children.begin(), children.end(), [](Container *a, Container *b) {
+            return a->z_index < b->z_index;
+        });
+        for (auto it = children.rbegin(); it != children.rend(); ++it) {
+            auto child = *it;
             if (child->interactable) {
                 // check if parent is scrollpane and if so, check if the child is in
                 // bounds before calling
@@ -342,8 +348,6 @@ void handle_mouse_button_press(Container* root, const Event& e) {
             }
         }
 
-        p->state.concerned = true; // Make sure this container is concerned
-
         // Check if its a scroll event and call when_scrolled if so
         if (e.scroll) {
             if (p->when_fine_scrolled) {
@@ -356,6 +360,10 @@ void handle_mouse_button_press(Container* root, const Event& e) {
         if (e.button != BTN_LEFT && e.button != BTN_RIGHT && e.button != BTN_MIDDLE) {
             continue;
         }
+
+        // Scrolling must not mark newly exposed cards as concerned before
+        // mouse motion has delivered their hover-entry transition.
+        p->state.concerned = true;
 
         // Update state and call when_mouse_down
         p->state.mouse_hovering = true; // If this container is pressed then clearly
@@ -561,7 +569,7 @@ void paint_outline(Container* root, Container* c) {
         for (int i = 0; i < s->content->children.size(); i++) {
             render_order.push_back(i);
         }
-        std::sort(render_order.begin(), render_order.end(), [s](int a, int b) -> bool {
+        std::stable_sort(render_order.begin(), render_order.end(), [s](int a, int b) -> bool {
             return s->content->children[a]->z_index < s->content->children[b]->z_index;
         });
         
@@ -580,7 +588,7 @@ void paint_outline(Container* root, Container* c) {
         for (int i = 0; i < c->children.size(); i++) {
             render_order.push_back(i);
         }
-        std::sort(render_order.begin(), render_order.end(), [c](int a, int b) -> bool {
+        std::stable_sort(render_order.begin(), render_order.end(), [c](int a, int b) -> bool {
             return c->children[a]->z_index < c->children[b]->z_index;
         });
         for (auto index: render_order) {
@@ -621,4 +629,3 @@ send_key_actual(Container *root, Container* container, int key, bool pressed, xk
 void key_press(Container* container, int key, bool pressed, xkb_keysym_t sym, int mods, bool is_text, std::string text) {
     send_key_actual(container, container, key, pressed, sym, mods, is_text, text);
 }
-

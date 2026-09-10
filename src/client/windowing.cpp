@@ -111,28 +111,28 @@ bool on_keyboard_focus(RawWindow *rw, bool gained) {
 void on_render(RawWindow *rw, int w, int h) {
     std::lock_guard<std::mutex> lock(rw->creator->mutex);
     log("on_render");
-    if (!rw->cr)
+    if (!rw->drawing_context)
         return;
     auto m = mylar(rw);
     if (!m) return;
     // A deferred first frame can render at the default scale before the
     // compositor supplies its preferred scale for the mapped surface.
     if (!rw->fractional_scale_set_once && !rw->first_frame_ready) {
-        cairo_save(rw->cr);
-        cairo_set_operator(rw->cr, CAIRO_OPERATOR_SOURCE);
-        set_argb(rw->cr, m->bg_color);
-        cairo_paint(rw->cr);
-        cairo_restore(rw->cr);
+        rw->drawing_context->save();
+        rw->drawing_context->set_operator(drawing::Composite::Source);
+        set_argb(rw->drawing_context, m->bg_color);
+        rw->drawing_context->paint_source();
+        rw->drawing_context->restore();
         return;
     }
     m->root->real_bounds = Bounds(0, 0, w, h);
     m->root->wanted_bounds = m->root->real_bounds;
     ::layout(m->root, m->root, m->root->real_bounds);
-    auto cr = rw->cr;
-    cairo_save(cr);
-    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR); 
-    cairo_paint(cr);
-    cairo_restore(cr);
+    auto cr = rw->drawing_context;
+    cr->save();
+    cr->set_operator(drawing::Composite::Clear);
+    cr->paint_source();
+    cr->restore();
     paint_root(m->root);
 }
 

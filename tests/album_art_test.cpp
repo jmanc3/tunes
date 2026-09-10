@@ -222,11 +222,70 @@ int main() {
             wait_for([&] { return !cache.pending(); });
             auto preview = cache.preview(entry);
             check(preview != nullptr, "blur preview missing");
-            const auto data = cairo_image_surface_get_data(preview->surface);
-            const int row = 12 * cairo_image_surface_get_stride(preview->surface);
+            const auto data = reinterpret_cast<const unsigned char *>(preview->argb.data());
+            const int row = 12 * (preview->width * 4);
             check(data[row + 10 * 4] > 0 && data[row + 10 * 4] < data[row + 11 * 4] &&
                   data[row + 11 * 4] < data[row + 12 * 4] && data[row + 13 * 4] < 255,
                   "preview did not Gaussian blur the edge");
+        }
+        // Foreground detail must drain before any background chain is submitted.
+        // Hold extraction at the real I/O boundary to make ordering deterministic.
+        {
+            AlbumArtCache cache(base / "prefetch");
+            AlbumArtPrefetch prefetch;
+            auto visible = cache.create({(base / "visible.flac").string()});
+            auto first = cache.create({(base / "offscreen-first.flac").string()});
+            auto second = cache.create({(base / "offscreen-second.flac").string()});
+            auto scrolled_to = cache.create({(base / "new-visible.flac").string()});
+            prefetch.add(visible);
+            prefetch.add(first);
+            prefetch.add(second);
+            auto reads_before = reads.load();
+            {
+                std::lock_guard lock(gate_mutex);
+                blocked = true;
+            }
+            cache.request(visible, 256);
+            wait_for([&] { return reads.load() > reads_before; });
+            check(!prefetch.advance(cache, 256, true), "prefetch started while foreground was loading");
+            check(!cache.image(first) && !cache.image(second), "offscreen artwork jumped ahead of visible detail");
+            {
+                std::lock_guard lock(gate_mutex);
+                blocked = false;
+            }
+            gate.notify_all();
+            wait_for([&] { return !cache.pending(); });
+            check(cache.detail_ready(visible, 256), "visible detail was not ready");
+            check(!prefetch.advance(cache, 256, false), "prefetch ignored the visible-quality gate");
+            {
+                std::lock_guard lock(gate_mutex);
+                blocked = true;
+            }
+            reads_before = reads.load();
+            check(prefetch.advance(cache, 256, true), "idle prefetch did not start");
+            wait_for([&] { return reads.load() > reads_before; });
+            check(!prefetch.advance(cache, 256, true), "prefetch queued multiple background albums");
+            // Scrolling can submit foreground work immediately; it never sits
+            // behind a queue containing the rest of the offscreen library.
+            cache.request(scrolled_to, 256);
+            check(!prefetch.advance(cache, 256, false), "prefetch continued through a foreground change");
+            check(!cache.image(second), "the second background album started too soon");
+            {
+                std::lock_guard lock(gate_mutex);
+                blocked = false;
+            }
+            gate.notify_all();
+            wait_for([&] { return !cache.pending(); });
+            check(cache.detail_ready(scrolled_to, 256), "newly visible artwork did not finish");
+            check(cache.detail_ready(first, 256), "offscreen artwork was not sharpened");
+            while (prefetch.advance(cache, 256, true)) wait_for([&] { return !cache.pending(); });
+            check(cache.image(second) && cache.image(second)->pixels >= 256, "prefetch never reached the full library");
+            check(!prefetch.advance(cache, 256, true), "finished prefetch restarted itself");
+            while (prefetch.advance(cache, 512, true)) wait_for([&] { return !cache.pending(); });
+            check(cache.image(first)->pixels >= 512 && cache.image(second)->pixels >= 512,
+                  "card-size change did not upgrade prefetched artwork");
+            prefetch.reset();
+            check(!prefetch.advance(cache, 768, true), "library replacement retained old prefetch entries");
         }
         fs::remove_all(base);
         std::cout << "Album artwork cache checks passed\n";
