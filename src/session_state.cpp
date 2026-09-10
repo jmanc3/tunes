@@ -79,6 +79,9 @@ SessionState load_session(const std::filesystem::path &path) {
     int rescan = 1;
     if (in >> rescan && (rescan == 0 || rescan == 1))
         state.rescan_on_launch = rescan != 0;
+    std::string expanded_album_track;
+    if (in >> std::quoted(expanded_album_track))
+        state.expanded_album_track = std::move(expanded_album_track);
     return state;
 }
 
@@ -102,7 +105,7 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
     for (const auto &[root, offset] : state.scroll_offsets)
         out << std::quoted(root) << ' ' << offset << '\n';
     out << state.window_width << ' ' << state.window_height << '\n' << state.sample_rate << '\n'
-        << state.rescan_on_launch << '\n';
+        << state.rescan_on_launch << '\n' << std::quoted(state.expanded_album_track) << '\n';
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)

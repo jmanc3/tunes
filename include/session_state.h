@@ -16,6 +16,8 @@ struct SessionState {
     float unmuted_volume = .75f;
     // Logical pixels, keyed by canonical library directory.
     std::map<std::string, double> scroll_offsets;
+    // A track path identifying the expanded album in this library; empty means closed.
+    std::string expanded_album_track;
     // Logical pixels; zero uses the default window size.
     int window_width = 0;
     int window_height = 0;

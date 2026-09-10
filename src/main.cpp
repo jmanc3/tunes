@@ -198,6 +198,7 @@ struct TrackDisplay {
     std::string artist;
     AlbumArtCache::Handle art;
     std::string album;
+    std::string length;
 };
 
 struct LibraryScanResult {
@@ -299,6 +300,7 @@ struct RootData : UserData {
     bool scroll_restored = false;
     bool scroll_restored_at_preferred_scale = false;
     bool first_frame_shown = false;
+    bool playback_initialized = false;
     std::chrono::steady_clock::time_point artwork_frame_time;
     std::chrono::steady_clock::time_point last_session_save;
     std::future<LibraryScanResult> scan;
@@ -832,7 +834,7 @@ static Bounds album_action_bounds(const Bounds &b, double dpi, int action) {
     return Bounds(b.x + (56 + action * 76) * dpi, b.y + 61 * dpi, 70 * dpi, 26 * dpi);
 }
 
-static void open_album(Container *root, Container *card) {
+static void open_album(Container *root, Container *card, bool animate = true) {
     auto rd = static_cast<RootData *>(root->user_data);
     if (rd->expanded_album == card)
         return;
@@ -1059,6 +1061,14 @@ static void open_album(Container *root, Container *card) {
             }
         };
     }
+    if (!animate) {
+        rd->expanded_album = card;
+        rd->album_reveal = 1;
+        rd->album_reveal_start.reset();
+        rd->album_scroll_start.reset();
+        rd->outgoing_album = nullptr;
+        return;
+    }
     if (rd->expanded_album != card) {
         const auto &cards = rd->library->children;
         const auto index = std::distance(cards.begin(), std::find(cards.begin(), cards.end(), card));
@@ -1089,6 +1099,26 @@ static void open_album(Container *root, Container *card) {
     rd->album_scroll_start = std::chrono::steady_clock::now();
     layout(root, root, root->real_bounds);
     windowing::redraw(rd->window->raw_window);
+}
+
+// Restore before layout so scroll clamping includes the panel's full height.
+static void restore_expanded_album(Container *root, const std::string &track) {
+    if (track.empty()) return;
+    auto data = static_cast<RootData *>(root->user_data);
+    for (auto card : data->library->children) {
+        if (card == data->album_panel) continue;
+        const auto &songs = static_cast<AlbumData *>(card->user_data)->album.songs;
+        if (std::any_of(songs.begin(), songs.end(), [&](const auto &song) { return song.full == track; })) {
+            open_album(root, card, false);
+            return;
+        }
+    }
+}
+
+static std::string expanded_album_track(RootData *data) {
+    if (!data->expanded_album) return {};
+    const auto &songs = static_cast<AlbumData *>(data->expanded_album->user_data)->album.songs;
+    return songs.empty() ? std::string() : songs.front().full;
 }
 
 static bool consume_album_double_click(Container *root) {
@@ -1124,7 +1154,7 @@ static void add_album(Container *parent, const AlbumOption &option, AlbumArtCach
     for (const auto &song : option.songs)
         root_data->tracks[song.full] = {
             song.name.empty() ? std::filesystem::path(song.full).stem().string() : song.name,
-            song.artist, data->art, song.album};
+            song.artist, data->art, song.album, song.length};
     data->name = option.songs.front().album.empty() ? "Unknown" : option.songs.front().album;
     data->artist = option.songs.front().artist;
     for (const auto &song : option.songs) {
@@ -1470,8 +1500,9 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         const bool restore = !data->scroll_restored ||
             (window->fractional_scale_set_once && !data->scroll_restored_at_preferred_scale);
         if (restore && data->startup && !c->children.empty() && b.w > 0 && b.h > 0) {
-            // The provisional first layout may clamp the saved offset at DPI 1.
-            // Reapply the untouched session value once the preferred scale arrives.
+            if (!data->scroll_restored)
+                restore_expanded_album(root, data->startup->session.expanded_album_track);
+            // The provisional layout may clamp at DPI 1; reapply once the preferred scale arrives.
             c->scroll_v_real = data->initial_scroll_offset * dpi;
             data->scroll_restored = true;
             data->scroll_restored_at_preferred_scale = window->fractional_scale_set_once;
@@ -1684,8 +1715,10 @@ static void checkpoint_session(Container *root, bool force = false) {
     state.volume = player->volume();
     state.sample_rate = player->sample_rate();
     state.unmuted_volume = playback_data(root)->unmuted_gain;
-    if (data->scroll_restored && data->library)
+    if (data->scroll_restored && data->library) {
         state.scroll_offsets[state.music_root] = data->library->scroll_v_real / data->dpi;
+        state.expanded_album_track = expanded_album_track(data);
+    }
     startup.session = state;
     if (!force && startup.last_saved && *startup.last_saved == state)
         return;
@@ -1721,16 +1754,23 @@ static void prepare_session_display(Container *root, StartupState &startup) {
         const auto track = read_track(path);
         rd->tracks[path] = {
             track.name.empty() ? std::filesystem::path(path).stem().string() : track.name,
-            track.artist, rd->artwork->create({path}), track.album};
+            track.artist, rd->artwork->create({path}), track.album, track.length};
     }
-    rd->current_art = rd->artwork->clone(rd->tracks.at(path).art);
+    const auto &track = rd->tracks.at(path);
+    int duration = 0;
+    const auto [end, error] = std::from_chars(track.length.data(), track.length.data() + track.length.size(), duration);
+    if (error == std::errc{} && end == track.length.data() + track.length.size() && duration > 0) {
+        display->duration = duration;
+        display->position = std::clamp(static_cast<float>(display->elapsed / duration), 0.0f, 1.0f);
+    }
+    rd->current_art = rd->artwork->clone(track.art);
     rd->artwork->request(rd->current_art, 0);
     poll_artwork(rd->artwork_refresh);
 }
 
 static bool sync_playback(Container *root) {
     // The saved-session display is authoritative until player initialization.
-    if (!static_cast<RootData *>(root->user_data)->first_frame_shown)
+    if (!static_cast<RootData *>(root->user_data)->playback_initialized)
         return false;
     observe_queue();
     auto data = playback_data(root);
@@ -1849,6 +1889,7 @@ static void finish_library_rescan(Container *root) {
             AlbumArtCache::Handle art;
             std::optional<std::chrono::steady_clock::time_point> detail_fade;
         };
+        const auto expanded_track = expanded_album_track(data);
         std::map<std::vector<std::string>, RetainedArt> retained_art;
         if (data->album_panel) {
             std::erase(library->children, data->album_panel);
@@ -1892,6 +1933,7 @@ static void finish_library_rescan(Container *root) {
             if (previous != retained_art.end())
                 retained_art.erase(previous);
         }
+        restore_expanded_album(root, expanded_track);
         for (const auto &[paths, retained] : retained_art)
             data->artwork->release(retained.art);
         if (result.launch) {
@@ -1906,6 +1948,8 @@ static void finish_library_rescan(Container *root) {
         sync_playback(root);
         layout(root, root, root->real_bounds);
         for (std::size_t i = 0; i < library->children.size(); ++i) {
+            if (library->children[i] == data->album_panel || library->children[i] == data->expanded_album)
+                continue;
             if (i < data->album_first || i >= data->album_end)
                 data->artwork->release(static_cast<AlbumData *>(library->children[i]->user_data)->art);
         }
@@ -2925,6 +2969,7 @@ void open_window(StartupState &startup) {
         // Upgrade the blurred previews after their first frame is committed.
         layout(root, root, root->real_bounds);
         initialize_playback(startup);
+        root_data->playback_initialized = true;
         // Populate other queued tracks after the first frame. The selected
         // track already has display metadata, even outside the cached library.
         for (const auto &path : player->queue()) {
@@ -2933,7 +2978,7 @@ void open_window(StartupState &startup) {
             const auto track = read_track(path);
             root_data->tracks[path] = {
                 track.name.empty() ? std::filesystem::path(path).stem().string() : track.name,
-                track.artist, root_data->artwork->create({path}), track.album};
+                track.artist, root_data->artwork->create({path}), track.album, track.length};
         }
         sync_playback(root);
         // Explicit mixed file/folder inputs require discovery to build their queue.

@@ -117,7 +117,8 @@ void on_render(RawWindow *rw, int w, int h) {
     if (!m) return;
     // A deferred first frame can render at the default scale before the
     // compositor supplies its preferred scale for the mapped surface.
-    if (!rw->fractional_scale_set_once && !rw->first_frame_ready) {
+    //if (!rw->fractional_scale_set_once && !rw->first_frame_ready) {
+    if (!rw->fractional_scale_set_once) {
         rw->drawing_context->save();
         rw->drawing_context->set_operator(drawing::Composite::Source);
         set_argb(rw->drawing_context, m->bg_color);

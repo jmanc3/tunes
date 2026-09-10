@@ -118,6 +118,7 @@ int main() {
     state.queue = {a[0].full, b[0].full, a[0].full, "a path with \"quotes\" and\na newline.wav"};
     state.current_index = 2;
     state.current_path = a[0].full;
+    state.expanded_album_track = "a path with \"quotes\" and\na newline.wav";
     state.seconds = .625;
     state.volume = 0;
     state.unmuted_volume = .6f;
@@ -129,6 +130,7 @@ int main() {
     check(library_session_path(root_a) == library_session_path((base / "alias").string()),
           "alias split a library session");
     auto fresh = load_library_session(root_a, state);
+    check(fresh.expanded_album_track.empty(), "new library inherited expanded album");
     check(fresh.queue.empty() && fresh.seconds == 0, "new library inherited previous playback");
     check(fresh.window_width == state.window_width && fresh.volume == state.volume,
           "new library lost window/volume preferences");
@@ -162,6 +164,7 @@ int main() {
         std::ofstream(file, std::ios::trunc) << contents.substr(0, dimensions);
         auto legacy = load_session(file);
         auto expected = state;
+        expected.expanded_album_track.clear();
         expected.window_width = expected.window_height = 0;
         expected.sample_rate = 48000;
         check(legacy == expected, "legacy session compatibility failed");
