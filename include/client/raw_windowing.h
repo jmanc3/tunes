@@ -152,7 +152,7 @@ struct RawWindow {
 
     // Full-window startup blur: hold until fractional_scale_set_once is true,
     // then fade out over 130 ms.
-    bool startup_blur = true;
+    bool startup_blur = false;
 
     bool defer_initial_frame = false;
     // Returning false leaves the surface uncommitted; callers schedule a redraw.

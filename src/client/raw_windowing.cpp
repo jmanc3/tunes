@@ -577,9 +577,9 @@ void on_window_render(wl_window *win) {
         const double elapsed = win->startup_blur_fading
             ? std::chrono::duration<double, std::milli>(now - win->startup_blur_fade_start).count()
             : 0;
-        win->startup_blur_active = win->rw->startup_blur && elapsed < 130;
+        win->startup_blur_active = win->rw->startup_blur && elapsed < 800.0;
         if (win->startup_blur_active) {
-            const double amount = 1 - std::clamp(elapsed / 130, 0.0, 1.0);
+            const double amount = 1 - std::clamp(elapsed / 800.0, 0.0, 1.0);
             win->rw->drawing_context->gaussian_blur(6 * win->rw->dpi, amount);
             win->redraw_pending = true;
         }
