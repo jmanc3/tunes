@@ -2,7 +2,8 @@
 
 A gapless audio player for Linux
 
-#![Screenshot]()
+<img width="2094" height="1459" alt="tunes" src="https://github.com/user-attachments/assets/2316af9f-ac90-4631-9f04-15dc7931941c" />
+
 
 ## Installation
 
