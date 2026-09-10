@@ -60,6 +60,47 @@ public:
     void pop_group_to_source() override { cairo_pop_group_to_source(cr_); }
     void paint_source(double alpha) override { cairo_paint_with_alpha(cr_, alpha); }
     void flush() override { cairo_surface_flush(cairo_get_target(cr_)); }
+    void gaussian_blur(double sigma, double amount) override {
+        if (sigma <= 0 || amount <= 0) return;
+        sigma = std::min(sigma, 20.0);
+        amount = std::min(amount, 1.0);
+        auto surface = cairo_get_target(cr_);
+        cairo_surface_flush(surface);
+        const int w = cairo_image_surface_get_width(surface), h = cairo_image_surface_get_height(surface);
+        const int stride = cairo_image_surface_get_stride(surface);
+        auto data = cairo_image_surface_get_data(surface);
+        const int radius = std::ceil(3 * sigma);
+        std::vector<double> weights(2 * radius + 1);
+        double total = 0;
+        for (int i = -radius; i <= radius; ++i)
+            total += weights[i + radius] = std::exp(-i * i / (2 * sigma * sigma));
+        for (auto &weight : weights) weight /= total;
+        std::vector<float> horizontal(size_t(w) * h * 4);
+        for (int y = 0; y < h; ++y) {
+            auto row = reinterpret_cast<uint32_t *>(data + y * stride);
+            for (int x = 0; x < w; ++x)
+                for (int i = -radius; i <= radius; ++i) {
+                    auto pixel = row[std::clamp(x + i, 0, w - 1)];
+                    for (int c = 0; c < 4; ++c)
+                        horizontal[(size_t(y) * w + x) * 4 + c] += ((pixel >> (c * 8)) & 255) * weights[i + radius];
+                }
+        }
+        for (int y = 0; y < h; ++y) {
+            auto row = reinterpret_cast<uint32_t *>(data + y * stride);
+            for (int x = 0; x < w; ++x) {
+                uint32_t result = 0;
+                for (int c = 0; c < 4; ++c) {
+                    double value = 0;
+                    for (int i = -radius; i <= radius; ++i)
+                        value += horizontal[(size_t(std::clamp(y + i, 0, h - 1)) * w + x) * 4 + c] * weights[i + radius];
+                    value = value * amount + ((row[x] >> (c * 8)) & 255) * (1 - amount);
+                    result |= uint32_t(std::clamp(std::lround(value), 0L, 255L)) << (c * 8);
+                }
+                row[x] = result;
+            }
+        }
+        cairo_surface_mark_dirty(surface);
+    }
     void draw_image(const Image &image, double alpha, ImageFilter filter) override {
         if (image.width <= 0 || image.height <= 0 ||
             image.argb.size() < static_cast<size_t>(image.width) * image.height) return;

@@ -75,6 +75,8 @@ public:
     // image bounds and preserves drawing state; consumes the current path.
     virtual void draw_image(const Image &image, double alpha = 1, ImageFilter filter = ImageFilter::Bilinear) = 0;
     virtual TextMetrics text(double x, double y, const std::string &text, const TextStyle &style, bool draw) = 0;
+    // Blur the complete frame, mixing with the original by amount (0..1).
+    virtual void gaussian_blur(double sigma, double amount) = 0;
     virtual void flush() = 0;
 };
 

@@ -276,6 +276,9 @@ struct wl_window {
     bool gpu_failed = false;
     bool redraw_pending = false;
     bool dropped_frame = false;
+    std::chrono::steady_clock::time_point startup_blur_fade_start;
+    bool startup_blur_fading = false;
+    bool startup_blur_active = false;
     wl_callback *frame_callback = nullptr;
     bool resize_next = false;
 
@@ -529,7 +532,7 @@ void on_window_render(wl_window *win) {
     ZoneScoped;
 #endif
     if (!win->configured) return;
-    if (win->gpu && win->frame_callback) {
+    if ((win->gpu || win->startup_blur_active) && win->frame_callback) {
         win->redraw_pending = true;
         return;
     }
@@ -564,9 +567,26 @@ void on_window_render(wl_window *win) {
             win->rw->on_render(win->rw, win->scaled_w, win->scaled_h);
         }
     }
+    win->startup_blur_active = false;
+    if (win->rw && win->rw->on_render) {
+        const auto now = std::chrono::steady_clock::now();
+        if (win->rw->fractional_scale_set_once && !win->startup_blur_fading) {
+            win->startup_blur_fading = true;
+            win->startup_blur_fade_start = now;
+        }
+        const double elapsed = win->startup_blur_fading
+            ? std::chrono::duration<double, std::milli>(now - win->startup_blur_fade_start).count()
+            : 0;
+        win->startup_blur_active = win->rw->startup_blur && elapsed < 130;
+        if (win->startup_blur_active) {
+            const double amount = 1 - std::clamp(elapsed / 130, 0.0, 1.0);
+            win->rw->drawing_context->gaussian_blur(6 * win->rw->dpi, amount);
+            win->redraw_pending = true;
+        }
+    }
     if (slot) slot->cr->flush();
     if (win->rw && win->rw->on_render && !win->frame_callback &&
-        (win->gpu || ((win->rw->fractional_scale_set_once || win->rw->first_frame_ready) && win->rw->on_next_frame))) {
+        (win->gpu || win->startup_blur_active || ((win->rw->fractional_scale_set_once || win->rw->first_frame_ready) && win->rw->on_next_frame))) {
         static const wl_callback_listener listener = {
             .done = [](void *data, wl_callback *callback, uint32_t) {
                 auto win = static_cast<wl_window *>(data);
@@ -576,7 +596,7 @@ void on_window_render(wl_window *win) {
                 win->rw->on_next_frame = nullptr;
                 if (notify)
                     notify(win->rw);
-                if (win->gpu && win->redraw_pending && !win->marked_for_closing)
+                if ((win->gpu || win->startup_blur_active) && win->redraw_pending && !win->marked_for_closing)
                     on_window_render(win);
             },
         };
@@ -712,6 +732,10 @@ static void handle_fractional_scale_preferred_scale(
         return;
     if (!win->rw)
         return;
+    if (!win->rw->fractional_scale_set_once) {
+        win->startup_blur_fading = true;
+        win->startup_blur_fade_start = std::chrono::steady_clock::now();
+    }
     win->rw->fractional_scale_set_once = true;
     win->current_fractional_scale = ((float) scale) / 120.0f;
 

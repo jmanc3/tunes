@@ -250,12 +250,12 @@ class GLContext final : public OpenGLContext {
         const auto b = target_->bounds;
         glUniform4f(pipeline_.target, b.x, b.y, b.width, b.height);
     }
-    std::shared_ptr<Target> target(Rect bounds, bool sampled = true) {
+    std::shared_ptr<Target> target(Rect bounds, bool sampled = true, bool exact_size = false) {
         bounds = integral(bounds);
         // Empty clips still need a legal framebuffer; scissoring suppresses draws.
         bounds.width = std::max(1.0, bounds.width);
         bounds.height = std::max(1.0, bounds.height);
-        if (sampled) {
+        if (sampled && !exact_size) {
             // Stable size buckets allow small animation/clip changes to reuse FBOs.
             bounds.width = std::min(double(max_texture_), std::ceil(bounds.width / 32) * 32);
             bounds.height = std::min(double(max_texture_), std::ceil(bounds.height / 32) * 32);
@@ -897,6 +897,45 @@ class GLContext final : public OpenGLContext {
             move_to(std::round(x), std::round(y));
         }
         return entry.raster.metrics;
+    }
+    void gaussian_blur(double sigma, double amount) override {
+        if (sigma <= 0 || amount <= 0) return;
+        if (!groups_.empty()) throw std::logic_error("Cannot blur inside a drawing group");
+        draw_batch();
+        auto saved = state_;
+        auto original = target(root_->bounds, true, true);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, root_->draw);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, original->resolve);
+        glBlitFramebuffer(0, 0, root_->bounds.width, root_->bounds.height,
+                         0, 0, root_->bounds.width, root_->bounds.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        state_ = State{};
+        state_.clip = root_->bounds;
+        auto source = original;
+        glUseProgram(pipeline_.program);
+        glUniform1f(glGetUniformLocation(pipeline_.program, "blurSigma"), std::min(sigma, 20.0));
+        for (int kind : {4, 5}) {
+            target_ = target(root_->bounds, true, true);
+            clear_target();
+            start_batch(source->color.id, kind);
+            batch_source_ = source;
+            for (auto p : quad(root_->bounds))
+                vertices_.push_back(vertex(p, p.x / root_->bounds.width, 1 - p.y / root_->bounds.height,
+                                           RGBA(1, 1, 1, 1), 1));
+            draw_batch();
+            target_->resolved();
+            source = target_;
+        }
+        target_ = root_;
+        clear_target();
+        state_.composite = Composite::Add;
+        state_.source = original;
+        paint_source(1 - std::clamp(amount, 0.0, 1.0));
+        state_.source = source;
+        paint_source(amount);
+        draw_batch();
+        state_ = std::move(saved);
+        bind_target();
     }
     void flush() override {
         if (!groups_.empty())

@@ -150,6 +150,10 @@ struct RawWindow {
 
     std::function<void(RawWindow *, int w, int h)> on_render = nullptr;
 
+    // Full-window startup blur: hold until fractional_scale_set_once is true,
+    // then fade out over 130 ms.
+    bool startup_blur = true;
+
     bool defer_initial_frame = false;
     // Returning false leaves the surface uncommitted; callers schedule a redraw.
     std::function<bool(RawWindow *, int, int)> first_frame_ready = nullptr;
@@ -170,7 +174,7 @@ enum struct WindowType {
     DOCK,
 };
 
-namespace windowing {
+namespace windowing {    
     RawApp *open_app();
 
     RawWindow *open_window(RawApp *app, WindowType type, RawWindowSettings settings);

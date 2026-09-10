@@ -1,5 +1,6 @@
 #include "client/windowing.h"
 
+#include "client/raw_windowing.h"
 #include "events.h"
 #include "utility.h"
 //#include "heart.h"
@@ -118,14 +119,14 @@ void on_render(RawWindow *rw, int w, int h) {
     // A deferred first frame can render at the default scale before the
     // compositor supplies its preferred scale for the mapped surface.
     //if (!rw->fractional_scale_set_once && !rw->first_frame_ready) {
-    if (!rw->fractional_scale_set_once) {
-        rw->drawing_context->save();
-        rw->drawing_context->set_operator(drawing::Composite::Source);
-        set_argb(rw->drawing_context, m->bg_color);
-        rw->drawing_context->paint_source();
-        rw->drawing_context->restore();
-        return;
-    }
+    // if (!rw->fractional_scale_set_once) {
+    //     rw->drawing_context->save();
+    //     rw->drawing_context->set_operator(drawing::Composite::Source);
+    //     set_argb(rw->drawing_context, m->bg_color);
+    //     rw->drawing_context->paint_source();
+    //     rw->drawing_context->restore();
+    //     return;
+    // }
     m->root->real_bounds = Bounds(0, 0, w, h);
     m->root->wanted_bounds = m->root->real_bounds;
     ::layout(m->root, m->root, m->root->real_bounds);

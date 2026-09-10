@@ -43,6 +43,7 @@ static ShadowStyle library_art_shadow{.6, 2, 0};
 static ShadowStyle library_text_shadow{0, 1.5, 1};
 static ShadowStyle popup_shadow{.6, 18, 4};
 static double popup_corner_radius = 12; // Logical pixels.
+static bool first_scale_event_happened = false;
 
 static std::string mylar_font = "SF Pro";
 static Player *player = nullptr;
@@ -316,6 +317,24 @@ static RootData *root_data_for(Container *c) {
 
 static Bounds draw_text(drawing::Context *cr, int x, int y, std::string text, int size, bool draw, std::string font, int wrap, double h, RGBA color, bool bold, int align = 0,
                         const ShadowStyle *shadow = nullptr, double dpi = 1) {
+    // float alpha_mix = 1.0;
+    // if (draw) {
+    //     draw = first_scale_event_happened;
+    //     static bool first_event = true;
+    //     static long start_time = 0;
+    //     if (draw) {
+    //         if (first_event) {
+    //             first_event = false;
+    //             start_time = get_current_time_in_ms();
+    //         }
+    //         long delta = get_current_time_in_ms() - start_time;
+    //         alpha_mix = ((float) (delta)) / 300.0f;
+    //         if (alpha_mix > 1) {
+    //             alpha_mix = 1.0;
+    //         }
+    //     }
+    // }
+    // color.a = alpha_mix;
     drawing::TextStyle style;
     style.font = font;
     style.size = size;
@@ -1337,6 +1356,7 @@ static void fill_out_for_songs(Container *root, const std::vector<Option> &playa
     root->type = ::fullycustom;
     root->when_paint = [](Container *root, Container *c) {
         auto root_data = (RootData *) root->user_data;
+        first_scale_event_happened = root_data->window->raw_window->fractional_scale_set_once;
         auto cr = root_data->window->raw_window->drawing_context;
         auto b = c->real_bounds;
         set_rect(cr, b); 
@@ -1389,6 +1409,8 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
     root->receive_events_even_if_obstructed = true;
     root->when_paint = [](Container *root, Container *c) {
         auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->drawing_context;
+        first_scale_event_happened = static_cast<RootData *>(root->user_data)->window->raw_window->fractional_scale_set_once;
+        
         set_rect(cr, c->real_bounds);
         cr->set_color(RGBA(1, 1, 1, 1));
         cr->fill();

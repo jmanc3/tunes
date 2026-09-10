@@ -29,6 +29,7 @@ in vec4 tint;
 in float maskOpacity;
 uniform sampler2D sourceTexture;
 uniform sampler2D clipTexture;
+uniform float blurSigma;
 uniform int sourceKind; // 0 solid, 1 premultiplied RGBA, 2 glyph coverage, 3 device-space group
 uniform int hasClip;
 uniform vec4 clipRect;
@@ -48,6 +49,19 @@ void main() {
         if (sourceKind == 3 && (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))))
             sampleColor = vec4(0.0);
         value *= sampleColor;
+    }
+    if (sourceKind == 4 || sourceKind == 5) {
+        vec2 stepSize = 1.0 / vec2(textureSize(sourceTexture, 0));
+        vec2 direction = sourceKind == 4 ? vec2(stepSize.x, 0.0) : vec2(0.0, stepSize.y);
+        vec4 sum = vec4(0.0);
+        float total = 0.0;
+        int radius = int(ceil(3.0 * blurSigma));
+        for (int i = -radius; i <= radius; ++i) {
+            float weight = exp(-float(i * i) / (2.0 * blurSigma * blurSigma));
+            sum += texture(sourceTexture, uv + direction * float(i)) * weight;
+            total += weight;
+        }
+        value *= sum / total;
     }
     if (sourceKind == 2) coverage *= texture(sourceTexture, uv).r;
     result = erasePass != 0 ? vec4(0.0, 0.0, 0.0, coverage * maskOpacity)

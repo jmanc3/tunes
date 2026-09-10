@@ -107,6 +107,22 @@ int main() try {
     }
     std::cout << "GL renderer: " << glGetString(GL_RENDERER) << '\n';
     auto gl = create_opengl_context(width, height);
+    for (double amount : {1.0, 0.5, 0.0}) {
+        compare(*gl, "fullscreen Gaussian blur", [=](Context &c) {
+            c.set_color(RGBA(0, 0, 0, 1));
+            c.paint_source();
+            c.set_color(RGBA(1, 1, 1, 1));
+            c.rectangle(width / 2, 0, width / 2, height);
+            c.fill();
+            c.gaussian_blur(6, amount);
+        }, 0.6);
+        auto pixels = read_pixels();
+        check(pixels.front() == 0xff000000 && pixels.back() == 0xffffffff,
+              "Blur must preserve opaque frame edges");
+        int near_edge = pixels[(height / 2) * width + width / 2 - 1] & 255;
+        check(amount > 0 ? (near_edge > 20 && near_edge < 128) : near_edge == 0,
+              "Blur must soften an edge and fade to the sharp original");
+    }
     compare(*gl, "scrolled queue below text header", [](Context &c) {
         c.save();
         c.rounded_rectangle({20, 10, 210, 160}, 12); c.clip();
@@ -358,6 +374,15 @@ int main() try {
     gl->flush();
     auto resized = read_pixels(128, 96);
     check(resized.front() == 0xff00ff00 && resized.back() == 0xff00ff00, "Resize rendered into stale bounds");
+    gl->resize(127, 95);
+    gl->begin_frame();
+    gl->set_color(RGBA(0, 1, 0, 1));
+    gl->paint_source();
+    gl->gaussian_blur(6, 1);
+    gl->flush();
+    resized = read_pixels(127, 95);
+    check(std::all_of(resized.begin(), resized.end(), [](uint32_t p) { return p == 0xff00ff00; }),
+          "Blur must preserve constant colors at non-aligned window sizes");
     gl->resize(width, height);
     compare(*gl, "after resize", groups, .5);
     check(gl->stats().image_uploads == uploads, "Resize discarded artwork texture cache");
