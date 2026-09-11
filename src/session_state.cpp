@@ -123,6 +123,18 @@ SessionState load_session(const std::filesystem::path &path) {
     for (auto &playlist : state.playlists)
         if (auto found = artwork.find(playlist.id); found != artwork.end())
             playlist.art_file = std::move(found->second);
+    if (!(in >> extension) || extension != "queue-playlists-v1")
+        return state;
+    if (!(in >> count) || (count != 0 && count != state.queue.size()))
+        return state;
+    std::vector<std::string> queue_playlists;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::string id;
+        if (!(in >> std::quoted(id)))
+            return state;
+        queue_playlists.push_back(std::move(id));
+    }
+    state.queue_playlist_ids = std::move(queue_playlists);
     return state;
 }
 
@@ -158,6 +170,10 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
     for (const auto &playlist : state.playlists)
         if (!playlist.art_file.empty())
             out << std::quoted(playlist.id) << ' ' << std::quoted(playlist.art_file) << '\n';
+    const auto queue_sources = state.queue_playlist_ids.empty() ? 0 : state.queue.size();
+    out << "queue-playlists-v1\n" << queue_sources << '\n';
+    for (std::size_t i = 0; i < queue_sources; ++i)
+        out << std::quoted(i < state.queue_playlist_ids.size() ? state.queue_playlist_ids[i] : std::string{}) << '\n';
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)
@@ -174,6 +190,7 @@ void remove_missing_tracks(SessionState &state) {
         state.current_index = found == state.queue.end() ? missing : found - state.queue.begin();
     }
     std::vector<std::string> kept;
+    std::vector<std::string> kept_playlist_ids;
     std::size_t selected = missing;
     std::size_t next = missing;
     for (std::size_t i = 0; i < state.queue.size(); ++i) {
@@ -185,12 +202,15 @@ void remove_missing_tracks(SessionState &state) {
         if (next == missing && i > state.current_index)
             next = kept.size();
         kept.push_back(state.queue[i]);
+        if (!state.queue_playlist_ids.empty())
+            kept_playlist_ids.push_back(i < state.queue_playlist_ids.size() ? state.queue_playlist_ids[i] : std::string{});
     }
     if (selected == missing) {
         selected = next == missing ? 0 : next;
         state.seconds = 0;
     }
     state.queue = std::move(kept);
+    state.queue_playlist_ids = std::move(kept_playlist_ids);
     state.current_index = state.queue.empty() ? missing : selected;
     state.current_path = state.queue.empty() ? "" : state.queue[state.current_index];
 }

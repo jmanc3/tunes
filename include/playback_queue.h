@@ -16,7 +16,7 @@ public:
         std::uint64_t id;
         std::string path;
         Category category = Category::Queue;
-        // Temporary playback provenance; never written into track metadata.
+        // Playback provenance, saved with the session rather than track metadata.
         std::string playlist_id;
     };
     static constexpr auto none = std::numeric_limits<std::size_t>::max();
@@ -26,6 +26,15 @@ public:
     std::vector<std::string> paths() const {
         std::vector<std::string> result;
         for (const auto& item : items_) result.push_back(item.path);
+        return result;
+    }
+    std::vector<std::string> playlist_ids() const {
+        std::vector<std::string> result;
+        for (std::size_t i = 0; i < items_.size(); ++i) {
+            if (items_[i].playlist_id.empty()) continue;
+            if (result.empty()) result.resize(items_.size());
+            result[i] = items_[i].playlist_id;
+        }
         return result;
     }
     // Import restored/explicit playback lists; normal audio progression only
@@ -45,6 +54,12 @@ public:
         items_.clear();
         for (const auto& path : paths) items_.push_back({next_id_++, path, Category::Queue, playlist_id});
         index_ = index < items_.size() ? index : none;
+    }
+    void restore(const std::vector<std::string>& paths, std::size_t index,
+                 const std::vector<std::string>& playlist_ids) {
+        reset(paths, index);
+        for (std::size_t i = 0; i < std::min(items_.size(), playlist_ids.size()); ++i)
+            items_[i].playlist_id = playlist_ids[i];
     }
     void add(const std::vector<std::string>& paths, Action action, const std::string& playlist_id = {}) {
         auto at = upcoming_begin();

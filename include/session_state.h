@@ -17,6 +17,8 @@ struct PlaylistState {
 struct SessionState {
     std::string music_root;
     std::vector<std::string> queue;
+    // Source playlist for each queue occurrence; empty means no playlist sources.
+    std::vector<std::string> queue_playlist_ids;
     std::size_t current_index = std::numeric_limits<std::size_t>::max();
     std::string current_path;
     double seconds = 0;

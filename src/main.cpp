@@ -2782,7 +2782,9 @@ static void checkpoint_session(Container *root, bool force) {
     auto state = startup.session;
     const auto position = player->playback_position();
     state.music_root = startup.music_root;
+    observe_queue();
     state.queue = player->queue();
+    state.queue_playlist_ids = playback_queue.playlist_ids();
     state.current_path = position.path;
     state.current_index = position.index;
     state.seconds = position.seconds;
@@ -2811,8 +2813,12 @@ static void checkpoint_session(Container *root, bool force) {
 static void prepare_session_display(Container *root, StartupState &startup) {
     auto rd = static_cast<RootData *>(root->user_data);
     auto display = playback_data(root);
-    if (!startup.explicit_files)
+    if (!startup.explicit_files) {
         remove_missing_tracks(startup.session);
+        playback_queue.restore(startup.session.queue, startup.session.current_index, startup.session.queue_playlist_ids);
+    } else {
+        playback_queue.reset(startup.queue, 0);
+    }
     const std::string path = startup.explicit_files
         ? (startup.queue.empty() ? std::string() : startup.queue.front())
         : startup.session.current_path;
@@ -2838,8 +2844,8 @@ static void prepare_session_display(Container *root, StartupState &startup) {
         display->duration = duration;
         display->position = std::clamp(static_cast<float>(display->elapsed / duration), 0.0f, 1.0f);
     }
-    rd->current_art = rd->artwork->clone(track.art);
-    rd->artwork->request(rd->current_art, 0);
+    const auto current = playback_queue.current();
+    rd->current_art = playback_art(rd, path, current ? current->playlist_id : std::string{}, 0);
     poll_artwork(rd->artwork_refresh);
 }
 
@@ -4179,6 +4185,14 @@ void open_window(StartupState &startup) {
         root->wanted_bounds = root->real_bounds;
         layout(root, root, root->real_bounds);
         // The bottom bar waits only for its tiny blurred preview, like the grid.
+        const auto display = playback_data(root);
+        if (!display->path.empty()) {
+            const auto current = playback_queue.current();
+            // Once the track is known to have no cover, preload its saved
+            // playlist fallback before committing the first frame.
+            root_data->current_art = playback_art(root_data, display->path,
+                current ? current->playlist_id : std::string{}, 0);
+        }
         bool ready = !root_data->current_art || root_data->artwork->preview_ready(root_data->current_art);
         for (auto i = root_data->album_first; i < root_data->album_end; ++i) {
             auto child = root_data->library->children[i];
