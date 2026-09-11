@@ -7,6 +7,7 @@
 #include <fstream>
 #include <glib.h>
 #include <iomanip>
+#include <set>
 #include <unistd.h>
 
 std::filesystem::path session_state_path() {
@@ -82,6 +83,33 @@ SessionState load_session(const std::filesystem::path &path) {
     std::string expanded_album_track;
     if (in >> std::quoted(expanded_album_track))
         state.expanded_album_track = std::move(expanded_album_track);
+    // Optional extension: old sessions and old readers keep their v1 prefix.
+    std::string extension, expanded_playlist;
+    if (!(in >> extension) || extension != "playlists-v1")
+        return state;
+    if (!(in >> std::quoted(expanded_playlist) >> count) || count > 100000)
+        return state;
+    std::vector<PlaylistState> playlists;
+    std::set<std::string> identities;
+    std::size_t total_tracks = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        PlaylistState playlist;
+        std::size_t tracks = 0;
+        if (!(in >> std::quoted(playlist.id) >> std::quoted(playlist.name) >> tracks) ||
+            playlist.id.empty() || !identities.insert(playlist.id).second ||
+            tracks > 1000000 - total_tracks)
+            return state;
+        total_tracks += tracks;
+        for (std::size_t j = 0; j < tracks; ++j) {
+            std::string track;
+            if (!(in >> std::quoted(track)))
+                return state;
+            playlist.tracks.push_back(std::move(track));
+        }
+        playlists.push_back(std::move(playlist));
+    }
+    state.playlists = std::move(playlists);
+    state.expanded_playlist_id = std::move(expanded_playlist);
     return state;
 }
 
@@ -106,6 +134,12 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
         out << std::quoted(root) << ' ' << offset << '\n';
     out << state.window_width << ' ' << state.window_height << '\n' << state.sample_rate << '\n'
         << state.rescan_on_launch << '\n' << std::quoted(state.expanded_album_track) << '\n';
+    out << "playlists-v1\n" << std::quoted(state.expanded_playlist_id) << '\n' << state.playlists.size() << '\n';
+    for (const auto &playlist : state.playlists) {
+        out << std::quoted(playlist.id) << '\n' << std::quoted(playlist.name) << '\n' << playlist.tracks.size() << '\n';
+        for (const auto &track : playlist.tracks)
+            out << std::quoted(track) << '\n';
+    }
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)

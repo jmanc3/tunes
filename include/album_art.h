@@ -19,6 +19,8 @@ public:
     explicit AlbumArtCache(std::filesystem::path directory = {});
     ~AlbumArtCache();
     Handle create(std::vector<std::string> tracks);
+    // First four tracks, in order; composition and decoding stay on workers.
+    Handle create_collage(std::vector<std::string> tracks);
     Handle clone(const Handle &source);
     // Shares resident artwork with the grid and requests original resolution.
     Handle create_preview(const Handle &source);

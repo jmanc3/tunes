@@ -163,6 +163,7 @@ std::string fingerprint(const std::vector<std::string> &tracks, const std::vecto
 
 struct AlbumArtCache::Entry {
     std::vector<std::string> tracks;
+    bool collage = false;
     fs::path directory; // published by preview_ready's release store
     std::atomic<bool> requested{false};
     std::atomic<bool> preview_ready{false};
@@ -178,6 +179,7 @@ struct AlbumArtCache::Impl {
     // UI-thread ownership keeps loaded artwork alive for this cache's lifetime,
     // even after cards or the full-size preview drop their handles.
     std::map<std::vector<std::string>, Handle> entries;
+    std::map<std::vector<std::string>, Handle> collages;
     std::atomic<bool> stopping{false};
     std::atomic<bool> changed{false};
     std::atomic<unsigned> jobs{0};
@@ -224,6 +226,40 @@ struct AlbumArtCache::Impl {
         auto image = load_image(entry->directory / "full.png");
         if (image)
             return image;
+        if (entry->collage) {
+            if (entry->tracks.empty())
+                return {nullptr, g_object_unref};
+            std::vector<Pixbuf> tiles;
+            for (const auto &track : entry->tracks) {
+                if (stopping)
+                    return {nullptr, g_object_unref};
+                auto single = std::make_shared<Entry>();
+                single->tracks = {track};
+                const auto nearby = covers(single->tracks);
+                single->directory = directory / fingerprint(single->tracks, nearby);
+                tiles.push_back(source(single, nearby));
+            }
+            if (tiles.size() == 1 && tiles.front())
+                return std::move(tiles.front());
+            // A bounded square master also serves the expanded artwork preview.
+            constexpr int size = 1024, tile_size = size / 2;
+            Pixbuf collage(gdk_pixbuf_new(GDK_COLORSPACE_RGB, true, 8, size, size), g_object_unref);
+            if (!collage)
+                return collage;
+            gdk_pixbuf_fill(collage.get(), 0xe5e8edff);
+            for (int i = 0; i < 4; ++i) {
+                auto tile = tiles[i % tiles.size()].get();
+                if (!tile)
+                    continue;
+                const int x = (i % 2) * tile_size, y = (i / 2) * tile_size;
+                const int width = gdk_pixbuf_get_width(tile), height = gdk_pixbuf_get_height(tile);
+                const double scale = std::max(double(tile_size) / width, double(tile_size) / height);
+                gdk_pixbuf_composite(tile, collage.get(), x, y, tile_size, tile_size,
+                    x + (tile_size - width * scale) / 2, y + (tile_size - height * scale) / 2,
+                    scale, scale, GDK_INTERP_BILINEAR, 255);
+            }
+            return collage;
+        }
         image = load_image(entry->directory / "original.img");
         if (image)
             return image;
@@ -298,7 +334,7 @@ struct AlbumArtCache::Impl {
     void preview(const Handle &entry) {
         submit(preview_pool, [this, entry] {
             const auto sidecars = covers(entry->tracks);
-            entry->directory = directory / fingerprint(entry->tracks, sidecars);
+            entry->directory = directory / ((entry->collage ? "collage-v1-" : "") + fingerprint(entry->tracks, sidecars));
             auto image = load_image(entry->directory / "tiny-24.png", preview_pixels);
             if (!image) {
                 image = load_image(entry->directory / "preview.png", preview_pixels);
@@ -333,6 +369,18 @@ AlbumArtCache::Handle AlbumArtCache::create(std::vector<std::string> tracks) {
     auto entry = std::make_shared<Entry>();
     entry->tracks = std::move(tracks);
     impl_->entries.emplace(entry->tracks, entry);
+    return entry;
+}
+
+AlbumArtCache::Handle AlbumArtCache::create_collage(std::vector<std::string> tracks) {
+    if (tracks.size() > 4)
+        tracks.resize(4);
+    if (auto found = impl_->collages.find(tracks); found != impl_->collages.end())
+        return found->second;
+    auto entry = std::make_shared<Entry>();
+    entry->tracks = std::move(tracks);
+    entry->collage = true;
+    impl_->collages.emplace(entry->tracks, entry);
     return entry;
 }
 

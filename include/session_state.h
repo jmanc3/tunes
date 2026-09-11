@@ -6,6 +6,13 @@
 #include <string>
 #include <vector>
 
+struct PlaylistState {
+    std::string id;
+    std::string name;
+    std::vector<std::string> tracks;
+    bool operator==(const PlaylistState &) const = default;
+};
+
 struct SessionState {
     std::string music_root;
     std::vector<std::string> queue;
@@ -18,6 +25,9 @@ struct SessionState {
     std::map<std::string, double> scroll_offsets;
     // A track path identifying the expanded album in this library; empty means closed.
     std::string expanded_album_track;
+    // Newest playlists first; identities are independent of names and tracks.
+    std::vector<PlaylistState> playlists;
+    std::string expanded_playlist_id;
     // Logical pixels; zero uses the default window size.
     int window_width = 0;
     int window_height = 0;
