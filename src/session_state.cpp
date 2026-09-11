@@ -37,6 +37,7 @@ SessionState load_library_session(const std::string &music_root, const SessionSt
     state.window_width = last_session.window_width;
     state.window_height = last_session.window_height;
     state.sample_rate = last_session.sample_rate;
+    state.dark_theme = last_session.dark_theme;
     return state;
 }
 
@@ -135,6 +136,9 @@ SessionState load_session(const std::filesystem::path &path) {
         queue_playlists.push_back(std::move(id));
     }
     state.queue_playlist_ids = std::move(queue_playlists);
+    int dark = 0;
+    if (in >> extension && extension == "theme-v1" && in >> dark && (dark == 0 || dark == 1))
+        state.dark_theme = dark != 0;
     return state;
 }
 
@@ -174,6 +178,7 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
     out << "queue-playlists-v1\n" << queue_sources << '\n';
     for (std::size_t i = 0; i < queue_sources; ++i)
         out << std::quoted(i < state.queue_playlist_ids.size() ? state.queue_playlist_ids[i] : std::string{}) << '\n';
+    out << "theme-v1\n" << state.dark_theme << '\n';
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)

@@ -18,6 +18,11 @@ int main() {
         const auto first = base / "first.session", second = base / "second.session";
         SessionState state;
         check(state.rescan_on_launch && load_session(first).rescan_on_launch, "rescan must default to on");
+        check(!state.dark_theme && !load_session(first).dark_theme, "theme must default to light");
+        state.dark_theme = true;
+        check(save_session(first, state) && load_session(first).dark_theme, "dark theme did not round-trip");
+        state.dark_theme = false;
+        check(save_session(first, state) && !load_session(first).dark_theme, "light theme did not round-trip");
         state.rescan_on_launch = false;
         check(save_session(first, state), "save disabled setting failed");
         check(load_session(first) == state, "disabled setting did not round-trip");
@@ -29,7 +34,9 @@ int main() {
         std::ifstream input(first);
         std::string legacy((std::istreambuf_iterator<char>(input)), {});
         input.close();
-        legacy.resize(legacy.rfind("\n0\n") + 1);
+        const auto rate_end = legacy.find("\n48000\n");
+        check(rate_end != std::string::npos, "sample rate missing from fixture");
+        legacy.resize(rate_end + std::string("\n48000\n").size());
         std::ofstream(first, std::ios::trunc) << legacy;
         check(load_session(first) == state, "legacy session did not default to enabled");
         state.expanded_album_track = "album/track with \"quotes\" and\na newline.flac";

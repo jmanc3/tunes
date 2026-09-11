@@ -36,6 +36,7 @@ struct SessionState {
     int window_height = 0;
     unsigned sample_rate = 48000;
     bool rescan_on_launch = true;
+    bool dark_theme = false;
     bool operator==(const SessionState &) const = default;
 };
 

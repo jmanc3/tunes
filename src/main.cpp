@@ -1,3 +1,4 @@
+#include "theme.h"
 
 #include "client/raw_windowing.h"
 #include "container.h"
@@ -432,11 +433,11 @@ static void paint_button_bg(Container *root, Container *c) {
     
     if (c->state.mouse_pressing) {
         cr->rectangle(c->real_bounds.x, c->real_bounds.y, c->real_bounds.w, c->real_bounds.h);
-        cr->set_color(RGBA(0, 0, 0, .4));
+        cr->set_color(theme_colors::shadow);
         cr->fill();
     } else if (c->state.mouse_hovering) {
         cr->rectangle(c->real_bounds.x, c->real_bounds.y, c->real_bounds.w, c->real_bounds.h);
-        cr->set_color(RGBA(0, 0, 0, .2));
+        cr->set_color(theme_colors::shadow_soft);
         cr->fill();
     }
 }
@@ -449,9 +450,9 @@ struct AlbumData : UserData {
     std::string art_file;
     std::optional<std::chrono::steady_clock::time_point> play_pulse_start;
     std::weak_ptr<const AlbumTexture> palette_source;
-    RGBA background_color{.95, .96, .97, 1};
-    RGBA secondary_color{.4, .4, .4, 1};
-    RGBA accent_color{.4, .4, .4, 1};
+    RGBA background_color = theme_colors::album_fallback;
+    RGBA secondary_color = theme_colors::album_secondary;
+    RGBA accent_color = theme_colors::album_secondary;
     std::string name;
     std::string artist;
     AlbumArtCache::Handle art;
@@ -596,20 +597,20 @@ static void paint_playlist_submenu(Container *root) {
     const double d = rd->dpi;
     cr->save();
     rd->playlist_menu_shadow.draw(*cr, {b.x, b.y, b.w, b.h}, popup_corner_radius * d, popup_shadow, d);
-    cr->set_color(RGBA(.98, .985, .99, 1));
+    cr->set_color(theme().surface);
     rounded_rectangle(cr, b, popup_corner_radius * d);
     cr->fill_preserve();
     cr->clip();
     auto row = [&](const Bounds &bounds, const std::string &label, bool bold, double padding) {
         if (bounds_contains(bounds, root->mouse_current_x, root->mouse_current_y)) {
-            cr->set_color(RGBA(.87, .94, .97, 1));
+            cr->set_color(theme().button);
             set_rect(cr, bounds); cr->fill();
         }
         draw_text(cr, bounds.x + 16 * d, bounds.y + 10 * d, label, 12 * d, true,
-                  mylar_font, std::max(0.0, bounds.w - padding * d), 24 * d, RGBA(.16, .22, .26, 1), bold);
+                  mylar_font, std::max(0.0, bounds.w - padding * d), 24 * d, theme().text, bold);
     };
     row(Bounds(b.x, b.y + 2 * d, b.w, 40 * d), "+ New playlist", true, 32);
-    cr->set_color(RGBA(.16, .22, .26, .12));
+    cr->set_color(theme().divider);
     cr->rectangle(b.x + 12 * d, b.y + 41 * d, std::max(0.0, b.w - 24 * d), d); cr->fill();
     set_rect(cr, rd->playlist_list_bounds); cr->clip();
     const auto &playlists = rd->startup->session.playlists;
@@ -620,7 +621,7 @@ static void paint_playlist_submenu(Container *root) {
         row(bounds, playlists[i].name, false, rd->playlist_scroll_max > 0 ? 40 : 32);
     }
     if (rd->playlist_scroll_max > 0) {
-        cr->set_color(RGBA(.3, .37, .42, rd->playlist_scroll_dragging ? .8 : .45));
+        cr->set_color(with_alpha(theme().scrollbar, rd->playlist_scroll_dragging ? .8 : .45));
         rounded_rectangle(cr, rd->playlist_scroll_thumb, 2.5 * d); cr->fill();
     }
     cr->restore();
@@ -704,11 +705,11 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
         const auto d = rd->dpi;
         auto text = [&](double x, double y, const std::string &s, int size, bool bold, double width) {
             draw_text(cr, x, y, s, (size) * d, true, mylar_font, std::max(0.0, width), 24 * d,
-                      RGBA(.16, .22, .26, 1), bold);
+                      theme().text, bold);
         };
         cr->save();
         (context ? rd->context_shadow : rd->menu_shadow).draw(*cr, {b.x, b.y, b.w, b.h}, popup_corner_radius * d, popup_shadow, d);
-        cr->set_color(RGBA(.98, .985, .99, 1));
+        cr->set_color(theme().surface);
         rounded_rectangle(cr, b, popup_corner_radius * d);
         cr->fill_preserve();
         cr->clip();
@@ -719,12 +720,12 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
             for (int i = 0; i < count; ++i) {
                 Bounds row(b.x, b.y + (2 + i * 40) * d, b.w, 40 * d);
                 if (bounds_contains(row, root->mouse_current_x, root->mouse_current_y) || (i == 3 && rd->playlist_submenu)) {
-                    cr->set_color(RGBA(.87, .94, .97, 1));
+                    cr->set_color(theme().button);
                     cr->rectangle(row.x, row.y, row.w, row.h); cr->fill();
                 }
                 if (i == 4) {
                     draw_text(cr, row.x + 16 * d, row.y + 10 * d, labels[i], 12 * d, true,
-                              mylar_font, std::max(0.0, row.w - 32 * d), 24 * d, RGBA(.65, .16, .17, 1), false);
+                              mylar_font, std::max(0.0, row.w - 32 * d), 24 * d, theme().danger_text, false);
                 } else {
                     text(row.x + 16 * d, row.y + 10 * d, labels[i], 12, false, row.w - (i == 3 ? 48 : 32) * d);
                 }
@@ -774,7 +775,7 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
                 cr->rectangle(row.x, row.y, row.w, row.h); cr->clip();
                 cr->push_group();
                 cr->translate(swipe + ease * b.w, 0);
-                cr->set_color(RGBA(.91, .95, .97, 1));
+                cr->set_color(theme().selection);
                 cr->rectangle(row.x, row.y + 2 * d, row.w, 60 * d); cr->fill();
                 const auto handle = playback_art(rd, e.path, e.playlist_id, 48 * d);
                 if (const auto art = rd->artwork->image(handle))
@@ -793,7 +794,7 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
                 cr->restore();
                 if (rd->queue_drag && std::abs(rd->queue_dy) > std::abs(rd->queue_dx) &&
                     bounds_contains(row, root->mouse_current_x, root->mouse_current_y)) {
-                    cr->set_color(RGBA(.02, .56, .73, 1));
+                    cr->set_color(theme().accent);
                     cr->rectangle(row.x, row.y, row.w, 3 * d); cr->fill();
                 }
             }
@@ -805,7 +806,7 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
         if (rd->queue_scroll_max > 0) {
             const double viewport = b.bottom() - top;
             const double thumb = viewport * viewport / (viewport + rd->queue_scroll_max);
-            cr->set_color(RGBA(.2, .35, .42, .4));
+            cr->set_color(theme_colors::drop_indicator);
             cr->rectangle(b.right() - 5 * d,
                 top + (viewport - thumb) * rd->queue_scroll / rd->queue_scroll_max, 3 * d, thumb);
             cr->fill();
@@ -1135,7 +1136,7 @@ static Bounds playlist_title_bounds(const Bounds &panel, double dpi, std::size_t
 
 static double playlist_name_width(RootData *rd, const std::string &text) {
     return draw_text(rd->window->raw_window->drawing_context, 0, 0, text, 16 * rd->dpi,
-                     false, mylar_font, -1, -1, RGBA(0, 0, 0, 1), true).w;
+                     false, mylar_font, -1, -1, theme().text_primary, true).w;
 }
 
 static void paint_playlist_name_edit(Container *root, const Bounds &bounds, RGBA foreground) {
@@ -1149,7 +1150,7 @@ static void paint_playlist_name_edit(Container *root, const Bounds &bounds, RGBA
     cr->save();
     auto field = bounds;
     field.grow(4 * d);
-    cr->set_color(RGBA(.5, .6, .7, .18));
+    cr->set_color(theme_colors::edit_background);
     rounded_rectangle(cr, field, 4 * d); cr->fill();
     cr->set_color(foreground);
     cr->rectangle(field.x, field.bottom() - d, field.w, d); cr->fill();
@@ -1159,7 +1160,7 @@ static void paint_playlist_name_edit(Container *root, const Bounds &bounds, RGBA
         const auto begin = std::min(edit.caret, edit.anchor), end = std::max(edit.caret, edit.anchor);
         const double left = playlist_name_width(rd, edit.text.substr(0, begin));
         const double right = playlist_name_width(rd, edit.text.substr(0, end));
-        cr->set_color(RGBA(.25, .6, .9, .4));
+        cr->set_color(theme_colors::text_selection);
         cr->rectangle(x + left, bounds.y, right - left, bounds.h); cr->fill();
     }
     draw_text(cr, x, bounds.y, edit.text, 16 * d, true, mylar_font, -1, -1, foreground, true);
@@ -1380,7 +1381,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 update_album_colors(album, rd->artwork->image(album->art));
                 const auto background = album->background_color;
                 const bool light = .2126 * background.r + .7152 * background.g + .0722 * background.b > .45;
-                const auto foreground = light ? RGBA(.08, .08, .08, 1) : RGBA(.98, .98, .98, 1);
+                const auto foreground = light ? theme_colors::art_text_dark : theme_colors::art_text_light;
                 const auto secondary = album->secondary_color;
                 cr->save();
                 set_rect(cr, c->parent->real_bounds);
@@ -1446,7 +1447,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                         continue;
                     if (hover_enabled && bounds_contains(button, root->mouse_current_x, root->mouse_current_y)) {
                         set_rect(cr, button);
-                        cr->set_color(RGBA(0, 0, 0, .08));
+                        cr->set_color(theme_colors::row_hover);
                         cr->fill();
                     }
                     draw_text(cr, button.x, button.y + 4 * dpi, actions[i], 11 * dpi, true,
@@ -1467,7 +1468,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     const bool dragged = dragging && song.full == drag.path;
                     if (hovered) {
                         set_rect(cr, row);
-                        cr->set_color(RGBA(0, 0, 0, .07));
+                        cr->set_color(theme_colors::row_track);
                         cr->fill();
                     }
                     const bool playing = song.full == playing_path;
@@ -1500,10 +1501,10 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     if (!album->playlist_id.empty() && !remove_bounds.empty()) {
                         const bool remove_hovered = hovered && bounds_contains(remove_bounds, root->mouse_current_x, root->mouse_current_y);
                         if (remove_hovered) {
-                            cr->set_color(RGBA(.85, .2, .2, .15));
+                            cr->set_color(theme_colors::remove_hover);
                             rounded_rectangle(cr, remove_bounds, 4 * dpi); cr->fill();
                         }
-                        cr->set_color(remove_hovered ? RGBA(.85, .2, .2, 1) : row_secondary);
+                        cr->set_color(remove_hovered ? theme_colors::remove_icon : row_secondary);
                         cr->set_line_width(1.5 * dpi);
                         const double x = remove_bounds.x + remove_bounds.w / 2;
                         const double y = remove_bounds.y + remove_bounds.h / 2;
@@ -1538,7 +1539,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                                   mylar_font, std::max(1.0, floating.w - 48 * dpi), 22 * dpi, foreground, true);
                     }
                     const double y = first.y + drag.slot * 32 * dpi;
-                    cr->set_color(RGBA(.2, .57, .88, 1));
+                    cr->set_color(theme_colors::playing_indicator);
                     cr->rectangle(first.x - 18 * dpi, y - dpi, first.w + 18 * dpi, 2 * dpi); cr->fill();
                     cr->arc(first.x - 18 * dpi, y, 3 * dpi, 0, 2 * M_PI); cr->fill();
                 }
@@ -1552,20 +1553,20 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     if ((hover_enabled && bounds_contains(artwork, root->mouse_current_x, root->mouse_current_y)) || choosing || saving) {
                         const auto button = playlist_art_button_bounds(artwork, dpi);
                         const bool over = hover_enabled && bounds_contains(button, root->mouse_current_x, root->mouse_current_y);
-                        cr->set_color(RGBA(0, 0, 0, over ? .85 : .7));
+                        cr->set_color(with_alpha(theme_colors::black, over ? .85 : .7));
                         rounded_rectangle(cr, button, 6 * dpi); cr->fill();
                         const auto label = choosing ? "Choosing…" : saving ? (rd->playlist_art_removing ? "Removing…" : "Saving…")
                             : album->art_file.empty() ? "Choose art" : "Remove art";
                         draw_text(cr, button.x, button.y + 8 * dpi, label, 11 * dpi, true,
-                                  mylar_font, button.w, 20 * dpi, RGBA(1, 1, 1, 1), true, 1);
+                                  mylar_font, button.w, 20 * dpi, theme().on_accent, true, 1);
                     }
                     if (rd->playlist_art_error_id == album->playlist_id && !rd->playlist_art_error.empty()) {
                         Bounds message(artwork.x + 8 * dpi, artwork.y + 8 * dpi,
                                        std::max(0.0, artwork.w - 16 * dpi), std::min(72 * dpi, std::max(0.0, artwork.h - 56 * dpi)));
-                        cr->set_color(RGBA(.2, .05, .05, .92));
+                        cr->set_color(theme_colors::art_error);
                         rounded_rectangle(cr, message, 6 * dpi); cr->fill();
                         draw_text(cr, message.x + 8 * dpi, message.y + 6 * dpi, rd->playlist_art_error, 10 * dpi, true,
-                                  mylar_font, std::max(0.0, message.w - 16 * dpi), std::max(0.0, message.h - 12 * dpi), RGBA(1, 1, 1, 1), false);
+                                  mylar_font, std::max(0.0, message.w - 16 * dpi), std::max(0.0, message.h - 12 * dpi), theme().on_accent, false);
                     }
                 }
                 cr->restore();
@@ -1871,32 +1872,32 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         auto rd = root_data_for(root);
         rd->library_shadow.draw(*cr, {x, y, size, size}, 0, library_art_shadow, dpi, rd->library_shadow_alpha);
         cr->rectangle(x, y, size, size);
-        cr->set_color(RGBA(.9, .91, .93, 1));
+        cr->set_color(theme().placeholder);
         cr->fill();
         if (art && size > 0) {
             paint_artwork(static_cast<RootData *>(root->user_data), cr, data->art, art,
                           data->detail_fade, x, y, size);
         } else {
             draw_text(cr, x, y + size / 2 - 12 * dpi, "♫", 24 * dpi, true,
-                      mylar_font, size, -1, RGBA(.45, .47, .5, 1), false, 1);
+                      mylar_font, size, -1, theme().placeholder_text, false, 1);
         }
         if (c->state.mouse_hovering && size > 0) {
             const double cx = x + size / 2, cy = y + size / 2;
             cr->arc(cx, cy, std::min(26 * dpi, size / 3), 0, 2 * M_PI);
-            cr->set_color(RGBA(0, 0, 0, .65));
+            cr->set_color(theme_colors::art_overlay);
             cr->fill();
             cr->move_to(cx - 6 * dpi, cy - 10 * dpi);
             cr->line_to(cx + 10 * dpi, cy);
             cr->line_to(cx - 6 * dpi, cy + 10 * dpi);
             cr->close_path();
-            cr->set_color(RGBA(1, 1, 1, 1));
+            cr->set_color(theme().on_accent);
             cr->fill();
         }
         draw_text(cr, x, y + size + 8 * dpi, data->name, 12 * dpi, true,
-                  mylar_font, size, 20 * dpi, RGBA(0, 0, 0, 1), true,
+                  mylar_font, size, 20 * dpi, theme().text_primary, true,
                   0, nullptr, dpi);
         draw_text(cr, x, y + size + 30 * dpi, data->artist, 10 * dpi, true,
-                  mylar_font, size, 18 * dpi, RGBA(.4, .4, .4, 1), false,
+                  mylar_font, size, 18 * dpi, theme().text_muted, false,
                   0, nullptr, dpi);
         cr->restore();
     };
@@ -2381,8 +2382,8 @@ static void add_song(Container *parent, const Option &option) {
         auto dpi = root_data->window->raw_window->dpi;
         auto cr = root_data->window->raw_window->drawing_context;
         paint_button_bg(root, c);
-        auto b = draw_text(cr, 0, 0, option_data->name, 12 * dpi, false, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
-        draw_text(cr, 10, center_y(c, b.h), option_data->name, 12 * dpi, true, mylar_font, -1, -1, RGBA(0, 0, 0, 1), false, 0);
+        auto b = draw_text(cr, 0, 0, option_data->name, 12 * dpi, false, mylar_font, -1, -1, theme().text_primary, false, 0);
+        draw_text(cr, 10, center_y(c, b.h), option_data->name, 12 * dpi, true, mylar_font, -1, -1, theme().text_primary, false, 0);
     };
     c->when_clicked = [](Container *root, Container *c) {
         auto option_data = (OptionData *) c->user_data;
@@ -2409,7 +2410,7 @@ static void fill_out_for_songs(Container *root, const std::vector<Option> &playa
         auto cr = root_data->window->raw_window->drawing_context;
         auto b = c->real_bounds;
         set_rect(cr, b); 
-        set_argb(cr, RGBA(1, 1, 1, 1));
+        set_argb(cr, theme().background);
         cr->fill();
         // windowing::redraw(mylar_window->raw_window);
     };    
@@ -2461,7 +2462,7 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         first_scale_event_happened = static_cast<RootData *>(root->user_data)->window->raw_window->fractional_scale_set_once;
         
         set_rect(cr, c->real_bounds);
-        cr->set_color(RGBA(1, 1, 1, 1));
+        cr->set_color(theme().background);
         cr->fill();
         const auto data = static_cast<RootData *>(root->user_data);
         data->artwork_frame_time = std::chrono::steady_clock::now();
@@ -3123,23 +3124,23 @@ static void paint_playback_button(Container *root, Container *c, PlaybackButton 
     cr->translate(c->real_bounds.x + c->real_bounds.w / 2, c->real_bounds.y + c->real_bounds.h / 2);
     cr->scale(scale, scale);
     if (!active)
-        cr->set_color(RGBA(.66, .73, .77, 1));
+        cr->set_color(theme().disabled);
     else if (c->state.mouse_hovering)
-        cr->set_color(RGBA(.02, .52, .68, 1));
+        cr->set_color(theme().accent_hover);
     else
-        cr->set_color(RGBA(.24, .34, .40, 1));
+        cr->set_color(theme().icon);
     if (button == PlaybackButton::Play) {
         if (!active)
-            cr->set_color(RGBA(.76, .84, .88, 1));
+            cr->set_color(theme().button_disabled);
         else if (c->state.mouse_pressing)
-            cr->set_color(RGBA(.02, .43, .58, 1));
+            cr->set_color(theme().accent_pressed);
         else if (c->state.mouse_hovering)
-            cr->set_color(RGBA(.02, .56, .73, 1));
+            cr->set_color(theme().accent);
         else
-            cr->set_color(RGBA(.04, .62, .79, 1));
+            cr->set_color(theme().accent_fill);
         cr->arc(0, 0, 16, 0, 2 * M_PI);
         cr->fill();
-        cr->set_color(RGBA(1, 1, 1, 1));
+        cr->set_color(theme().on_accent);
         if (data->playing) {
             cr->rectangle(-5, -6, 3, 12);
             cr->rectangle(2, -6, 3, 12);
@@ -3347,21 +3348,21 @@ static Container *add_playback_slider(Container *bar, const char *name, bool vol
         cr->save();
         cr->set_line_cap(drawing::LineCap::Round);
         cr->set_line_width(4 * dpi);
-        cr->set_color(RGBA(.80, .86, .89, 1));
+        cr->set_color(theme().track);
         cr->move_to(x, y);
         cr->line_to(x + width, y);
         cr->stroke();
         if (highlight)
-            cr->set_color(RGBA(.02, .52, .68, 1));
+            cr->set_color(theme().accent_hover);
         else
-            cr->set_color(RGBA(.04, .62, .79, 1));
+            cr->set_color(theme().accent_fill);
         if (value > 0 && c->interactable) {
             cr->move_to(x, y);
             cr->line_to(x + width * value, y);
             cr->stroke();
         }
         if (highlight) {
-            cr->set_color(RGBA(.02, .52, .68, 1));
+            cr->set_color(theme().accent_hover);
             cr->arc(x + width * value, y, 5 * dpi, 0, 2 * M_PI);
             cr->fill();
         }
@@ -3451,7 +3452,7 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
         const auto &b = c->real_bounds;
         const double inset = b.w * .32;
         cr->save();
-        cr->set_color(RGBA(1, 1, 1, c->state.mouse_hovering ? 1 : .7));
+        cr->set_color(with_alpha(theme().on_accent, c->state.mouse_hovering ? 1 : .7));
         cr->set_line_width(2 * window->dpi);
         cr->move_to(b.x + inset, b.y + inset);
         cr->line_to(b.right() - inset, b.bottom() - inset);
@@ -3478,7 +3479,7 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
         const auto &b = c->real_bounds;
         cr->save();
         set_rect(cr, b);
-        cr->set_color(RGBA(0, 0, 0, .82));
+        cr->set_color(theme_colors::preview_scrim);
         cr->fill();
         const auto image = data->preview_art ? data->artwork->image(data->preview_art) : nullptr;
         data->preview_bounds = {};
@@ -3492,7 +3493,7 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
             cr->draw_image(*image, 1, drawing::ImageFilter::Good);
         } else {
             draw_text(cr, b.x, b.y + b.h / 2, data->artwork->pending() ? "Loading artwork…" : "No artwork available",
-                      14 * window->dpi, true, mylar_font, b.w, -1, RGBA(1, 1, 1, 1), false, 1);
+                      14 * window->dpi, true, mylar_font, b.w, -1, theme().on_accent, false, 1);
         }
         cr->restore();
     };
@@ -3538,7 +3539,7 @@ static void fill_playback_bar(Container *root, Container *bar) {
         cr->save();
         cr->translate(b.x + b.w / 2, b.y + b.h / 2);
         cr->scale(b.w / 32, b.h / 32);
-        cr->set_color(RGBA(.12, c->state.mouse_hovering ? .56 : .34, .43, 1));
+        cr->set_color((c->state.mouse_hovering ? theme_colors::folder_icon_hover : theme_colors::folder_icon));
         cr->set_line_width(2);
         cr->set_line_cap(drawing::LineCap::Round);
         for (int y : {-7, 0, 7}) {
@@ -3572,9 +3573,9 @@ static void fill_playback_bar(Container *root, Container *bar) {
         const double scale = std::min(b.w, b.h) / 32;
         cr->scale(scale, scale);
         if (c->state.mouse_hovering || c->state.mouse_pressing)
-            cr->set_color(RGBA(.02, .52, .68, 1));
+            cr->set_color(theme().accent_hover);
         else
-            cr->set_color(RGBA(.24, .34, .40, 1));
+            cr->set_color(theme().icon);
         for (int i = 0; i < 48; ++i) {
             const double angle = i * 2 * M_PI / 48;
             const double radius = (i % 6 == 1 || i % 6 == 2) ? 10 : 8;
@@ -3639,10 +3640,10 @@ static void fill_playback_bar(Container *root, Container *bar) {
         sync_playback(root);
         cr->save();
         set_rect(cr, bar->real_bounds);
-        cr->set_color(RGBA(.96, .98, .99, 1));
+        cr->set_color(theme().playback_surface);
         cr->fill();
         cr->rectangle(bar->real_bounds.x, bar->real_bounds.y, bar->real_bounds.w, dpi);
-        cr->set_color(RGBA(.82, .88, .91, 1));
+        cr->set_color(theme().border);
         cr->fill();
         auto text = [&](const Bounds &b, const std::string &value, int size, RGBA color, bool bold, int align) {
             if (b.w > 0)
@@ -3651,16 +3652,16 @@ static void fill_playback_bar(Container *root, Container *bar) {
         };
         const double elapsed = data->seeking ? data->seek_preview * data->duration : data->elapsed;
         text(data->elapsed_bounds, seconds_to_mmss(std::max(0, static_cast<int>(elapsed))), 9,
-             RGBA(.38, .47, .53, 1), false, 1);
+             theme().body, false, 1);
         text(data->duration_bounds, seconds_to_mmss(std::max(0, static_cast<int>(data->duration))), 9,
-             RGBA(.38, .47, .53, 1), false, 1);
+             theme().body, false, 1);
         if (!data->info_bounds.empty()) {
             const auto &b = data->info_bounds;
             auto track = root_data->tracks.find(data->path);
             auto art = root_data->current_art ? root_data->artwork->image(root_data->current_art) : nullptr;
             const double size = b.h;
             cr->rectangle(b.x, b.y, size, size);
-            cr->set_color(RGBA(.87, .93, .96, 1));
+            cr->set_color(theme().art_placeholder);
             cr->fill();
             if (art) {
                 paint_artwork(root_data, cr, root_data->current_art, art,
@@ -3668,14 +3669,14 @@ static void fill_playback_bar(Container *root, Container *bar) {
                               root_data->current_art_startup_fade);
             } else {
                 text(Bounds(b.x, b.y + 14 * dpi, size, 30 * dpi), "♫", 18,
-                     RGBA(.20, .52, .64, 1), false, 1);
+                     theme().art_placeholder_icon, false, 1);
             }
             const double text_x = b.x + size + 12 * dpi;
             const double text_w = std::max(0.0, b.right() - text_x);
             const std::string title = data->path.empty() ? "Choose an album" : track != root_data->tracks.end()
                 ? track->second.title : std::filesystem::path(data->path).stem().string();
             text(Bounds(text_x, b.y + 7 * dpi, text_w, 22 * dpi), title, 10,
-                 RGBA(.12, .22, .29, 1), true, 0);
+                 theme().heading, true, 0);
             std::string subtitle;
             if (track != root_data->tracks.end()) {
                 subtitle = track->second.artist;
@@ -3686,7 +3687,7 @@ static void fill_playback_bar(Container *root, Container *bar) {
                 }
             }
             text(Bounds(text_x, b.y + 28 * dpi, text_w, 18 * dpi), subtitle, 11,
-                 RGBA(.38, .47, .53, 1), false, 0);
+                 theme().body, false, 0);
         }
         cr->restore();
     };
@@ -3713,7 +3714,7 @@ static double settings_scale(Container *root) {
     const auto data = static_cast<RootData *>(root->user_data);
     const auto window = data->window->raw_window;
     const double width = data->settings_information ? 840 : 680;
-    const double height = data->settings_information ? 644 : 488 + settings_extra_height(root);
+    const double height = data->settings_information ? 644 : 548 + settings_extra_height(root);
     return std::max(.1, std::min({static_cast<double>(window->dpi),
         root->real_bounds.w / width, root->real_bounds.h / height}));
 }
@@ -3755,19 +3756,19 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         const auto &b = data->settings_bounds;
         cr->save();
         set_rect(cr, c->real_bounds);
-        cr->set_color(RGBA(.05, .12, .17, .48));
+        cr->set_color(theme().scrim);
         cr->fill();
         data->settings_shadow.draw(*cr, {b.x, b.y, b.w, b.h}, popup_corner_radius * dpi, popup_shadow, dpi);
         rounded_rectangle(cr, b, popup_corner_radius * dpi);
-        cr->set_color(RGBA(.97, .99, 1, 1));
+        cr->set_color(theme().panel);
         cr->fill();
         auto text = [&](double y, const std::string &label, int size, RGBA color, bool bold = false) {
             draw_text(cr, b.x + 28 * dpi, b.y + y * dpi, label, size * dpi, true,
                       mylar_font, b.w - 56 * dpi, -1, color, bold, 0);
         };
         if (data->settings_information) {
-            const RGBA body(.38, .47, .53, 1);
-            const RGBA heading(.12, .22, .29, 1);
+            const auto body = theme().body;
+            const auto heading = theme().heading;
             // Explicit lines keep the instructions and command fully visible without wrapping.
             auto line = [&](double y, const std::string &label) {
                 draw_text(cr, b.x + 28 * dpi, b.y + y * dpi, label, 10 * dpi, true,
@@ -3794,15 +3795,15 @@ static void fill_settings_menu(Container *root, Container *overlay) {
             line(478, "Restart PipeWire to apply config changes.");
             if (player->uses_pipewire())
                 text(558, data->pipewire_action.valid() ? "Applying…" : data->pipewire_status,
-                     10, data->pipewire_error ? RGBA(.65, .16, .12, 1) : RGBA(.02, .39, .53, 1));
+                     10, data->pipewire_error ? theme().error : theme().status);
         } else {
-            text(24, "Settings", 22, RGBA(.12, .22, .29, 1), true);
-            text(87, "Output sample rate", 12, RGBA(.12, .22, .29, 1), true);
-            text(112, "Sets the playback rate if supported.", 10, RGBA(.38, .47, .53, 1));
+            text(24, "Settings", 22, theme().heading, true);
+            text(87, "Output sample rate", 12, theme().heading, true);
+            text(112, "Sets the playback rate if supported.", 10, theme().body);
             text(248 + settings_extra_height(root), data->settings_error.empty()
                  ? "Current output: " + std::to_string(player->sample_rate()) + " Hz" : data->settings_error,
-                 10, data->settings_error.empty() ? RGBA(.02, .39, .53, 1) : RGBA(.65, .16, .12, 1));
-            text(302 + settings_extra_height(root), "Library", 12, RGBA(.12, .22, .29, 1), true);
+                 10, data->settings_error.empty() ? theme().status : theme().error);
+            text(302 + settings_extra_height(root), "Library", 12, theme().heading, true);
         }
         cr->restore();
     };
@@ -3817,13 +3818,13 @@ static void fill_settings_menu(Container *root, Container *overlay) {
             const bool selected = rate != 0 && player->sample_rate() == rate;
             cr->save();
             set_rect(cr, b);
-            if (selected) cr->set_color(RGBA(.04, .62, .79, 1));
-            else if (c->interactable && c->state.mouse_hovering) cr->set_color(RGBA(.78, .91, .96, 1));
-            else cr->set_color(RGBA(.87, .94, .97, 1));
+            if (selected) cr->set_color(theme().accent_fill);
+            else if (c->interactable && c->state.mouse_hovering) cr->set_color(theme().button_hover);
+            else cr->set_color(theme().button);
             cr->fill();
             draw_text(cr, b.x, b.y + 10 * dpi, label(), 10 * dpi, true,
-                      mylar_font, b.w, -1, selected ? RGBA(1, 1, 1, 1) :
-                      c->interactable ? RGBA(.02, .39, .53, 1) : RGBA(.45, .52, .56, 1),
+                      mylar_font, b.w, -1, selected ? theme().on_accent :
+                      c->interactable ? theme().status : theme().disabled_text,
                       selected, 1);
             cr->restore();
         };
@@ -3876,18 +3877,18 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         const bool enabled = data->startup->session.rescan_on_launch;
         cr->save();
         draw_text(cr, b.x, b.y + 10 * dpi, "Rescan on launch", 10 * dpi, true,
-                  mylar_font, b.w - 100 * dpi, -1, RGBA(.12, .22, .29, 1), false, 0);
+                  mylar_font, b.w - 100 * dpi, -1, theme().heading, false, 0);
         draw_text(cr, b.right() - 96 * dpi, b.y + 10 * dpi, enabled ? "On" : "Off", 10 * dpi, true,
-                  mylar_font, 36 * dpi, -1, RGBA(.38, .47, .53, 1), false, 1);
+                  mylar_font, 36 * dpi, -1, theme().body, false, 1);
         const double x = b.right() - 48 * dpi, y = b.y + b.h / 2;
         cr->set_line_width(24 * dpi);
         cr->set_line_cap(drawing::LineCap::Round);
-        if (enabled) cr->set_color(RGBA(.04, .62, .79, 1));
-        else cr->set_color(RGBA(.66, .73, .77, 1));
+        if (enabled) cr->set_color(theme().accent_fill);
+        else cr->set_color(theme().disabled);
         cr->move_to(x + 12 * dpi, y);
         cr->line_to(x + 36 * dpi, y);
         cr->stroke();
-        cr->set_color(RGBA(1, 1, 1, 1));
+        cr->set_color(theme().on_accent);
         cr->arc(x + (enabled ? 36 : 12) * dpi, y, 9 * dpi, 0, 2 * M_PI);
         cr->fill();
         cr->restore();
@@ -3898,6 +3899,44 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         auto data = static_cast<RootData *>(root->user_data);
         auto &enabled = data->startup->session.rescan_on_launch;
         enabled = !enabled;
+        checkpoint_session(root, true);
+        playback_changed(root);
+    };
+    auto theme_toggle = overlay->child(FILL_SPACE, FILL_SPACE);
+    theme_toggle->name = "dark-theme";
+    theme_toggle->z_index = 1;
+    theme_toggle->when_paint = [](Container *root, Container *c) {
+        auto data = static_cast<RootData *>(root->user_data);
+        auto cr = data->window->raw_window->drawing_context;
+        const double dpi = settings_scale(root);
+        const auto &b = c->real_bounds;
+        const bool enabled = data->startup->session.dark_theme;
+        cr->save();
+        draw_text(cr, b.x, b.y + 10 * dpi, "Dark theme", 10 * dpi, true,
+                  mylar_font, b.w - 100 * dpi, -1, theme().heading, false, 0);
+        draw_text(cr, b.right() - 96 * dpi, b.y + 10 * dpi, enabled ? "On" : "Off", 10 * dpi, true,
+                  mylar_font, 36 * dpi, -1, theme().body, false, 1);
+        const double x = b.right() - 48 * dpi, y = b.y + b.h / 2;
+        cr->set_line_width(24 * dpi);
+        cr->set_line_cap(drawing::LineCap::Round);
+        if (enabled) cr->set_color(theme().accent_fill);
+        else cr->set_color(theme().disabled);
+        cr->move_to(x + 12 * dpi, y);
+        cr->line_to(x + 36 * dpi, y);
+        cr->stroke();
+        cr->set_color(theme().on_accent);
+        cr->arc(x + (enabled ? 36 : 12) * dpi, y, 9 * dpi, 0, 2 * M_PI);
+        cr->fill();
+        cr->restore();
+    };
+    theme_toggle->when_clicked = [](Container *root, Container *c) {
+        if (c->state.mouse_button_pressed != BTN_LEFT)
+            return;
+        auto data = static_cast<RootData *>(root->user_data);
+        auto &enabled = data->startup->session.dark_theme;
+        enabled = !enabled;
+        dark_theme_enabled = enabled;
+        data->window->bg_color = theme().background;
         checkpoint_session(root, true);
         playback_changed(root);
     };
@@ -3930,17 +3969,17 @@ static void fill_settings_menu(Container *root, Container *overlay) {
         });
         playback_changed(root);
     };
-    overlay->pre_layout = [close, information, rates, rescan, auto_rescan, force_clock, auto_clock, rate_config](Container *root, Container *, const Bounds &b) {
+    overlay->pre_layout = [close, information, rates, rescan, auto_rescan, theme_toggle, force_clock, auto_clock, rate_config](Container *root, Container *, const Bounds &b) {
         auto data = static_cast<RootData *>(root->user_data);
         const double dpi = settings_scale(root);
         const double extra = settings_extra_height(root);
         const bool details = data->settings_information;
         const double width = (details ? 800 : 640) * dpi;
-        const double height = (details ? 604 : 448 + extra) * dpi;
+        const double height = (details ? 604 : 508 + extra) * dpi;
         const Bounds panel(b.x + (b.w - width) / 2, b.y + (b.h - height) / 2, width, height);
         data->settings_bounds = panel;
         layout(root, close, Bounds(panel.right() - 108 * dpi, panel.y + 24 * dpi, 80 * dpi, 36 * dpi));
-        information->exists = rescan->exists = auto_rescan->exists = !details;
+        information->exists = rescan->exists = auto_rescan->exists = theme_toggle->exists = !details;
         for (std::size_t i = 0; i < rates.size(); ++i) {
             rates[i]->exists = !details;
             if (!details)
@@ -3957,6 +3996,7 @@ static void fill_settings_menu(Container *root, Container *overlay) {
             layout(root, information, Bounds(panel.x + 28 * dpi, panel.y + 140 * dpi, 188 * dpi, 36 * dpi));
             layout(root, rescan, Bounds(panel.x + 28 * dpi, panel.y + (332 + extra) * dpi, 188 * dpi, 40 * dpi));
             layout(root, auto_rescan, Bounds(panel.x + 28 * dpi, panel.y + (380 + extra) * dpi, 240 * dpi, 40 * dpi));
+            layout(root, theme_toggle, Bounds(panel.x + 28 * dpi, panel.y + (436 + extra) * dpi, 240 * dpi, 40 * dpi));
         }
     };
 }
@@ -4024,7 +4064,7 @@ static void fill_library_scrollbar(Container *root, Container *scrollbar) {
         const double thickness = std::min((held ? 5 : 3) * data->dpi, b.w);
         cr->save();
         cr->rectangle(b.x, b.y, b.w, b.h); cr->clip();
-        cr->set_color(RGBA(.2, .3, .36, (held ? .65 : .4) * alpha));
+        cr->set_color(with_alpha(theme().scrollbar, (held ? .65 : .4) * alpha));
         cr->rounded_rectangle({b.x + (b.w - thickness) / 2, b.y + metrics.thumb_top,
                                thickness, metrics.thumb_height}, thickness / 2);
         cr->fill();
@@ -4054,10 +4094,10 @@ static void fill_root(Container *root) {
         Bounds b(root->real_bounds.right() - width - 12 * dpi, 12 * dpi, width, 110 * dpi);
         cr->save();
         rounded_rectangle(cr, b, 10 * dpi);
-        cr->set_color(RGBA(.1, .16, .2, .97)); cr->fill();
+        cr->set_color(theme_colors::progress_surface); cr->fill();
         auto text = [&](double y, const std::string &value, int size) {
             draw_text(cr, b.x + 14 * dpi, b.y + y * dpi, value, size * dpi, true,
-                      mylar_font, b.w - 28 * dpi, -1, RGBA(1, 1, 1, 1), false, 0);
+                      mylar_font, b.w - 28 * dpi, -1, theme().on_accent, false, 0);
         };
         text(12, progress.active ? "Converting audio to FLAC" : "Conversion failed", 13);
         if (progress.active) {
@@ -4084,7 +4124,7 @@ static void fill_root(Container *root) {
                 std::to_string(static_cast<int>(progress.seconds)) + " seconds converted"), 11);
             const double overall = progress.total ? (std::max(1ul, progress.track) - 1 + fraction) / progress.total : 0;
             cr->rectangle(b.x + 14 * dpi, b.y + 91 * dpi, (b.w - 28 * dpi) * overall, 4 * dpi);
-            cr->set_color(RGBA(.4, .8, .95, 1)); cr->fill();
+            cr->set_color(theme_colors::progress_fill); cr->fill();
         }
         cr->restore();
     };
@@ -4146,6 +4186,7 @@ static void fill_root(Container *root) {
 }
 
 void open_window(StartupState &startup) {
+    dark_theme_enabled = startup.session.dark_theme;
     RawWindowSettings settings;
     settings.name = "Tunes";
     settings.defer_initial_frame = true;
@@ -4157,7 +4198,7 @@ void open_window(StartupState &startup) {
     
     auto app = windowing::open_app();
     auto window = open_mylar_window(app, WindowType::NORMAL, settings);
-    window->bg_color = RGBA(1, 1, 1, 1);
+    window->bg_color = theme().background;
     auto resize = window->raw_window->on_resize;
     window->raw_window->on_resize = [&startup, resize](RawWindow *window, int w, int h) {
         if (w > 0 && h > 0 && window->dpi > 0) {
