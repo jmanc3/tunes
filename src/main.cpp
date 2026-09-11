@@ -1033,13 +1033,13 @@ struct AlbumTrackLayout {
     Bounds remove_bounds(const Bounds &panel, double dpi, std::size_t index) const {
         if (!single_column) return {};
         const auto row = track_bounds(panel, dpi, index);
-        return Bounds(row.right() - 44 * dpi, row.y + 4 * dpi, 24 * dpi, 24 * dpi).intersection(row);
+        return Bounds(row.right() - 36 * dpi, row.y + 4 * dpi, 24 * dpi, 24 * dpi).intersection(row);
     }
 
     Bounds duration_bounds(const Bounds &panel, double dpi, std::size_t index) const {
         const auto row = track_bounds(panel, dpi, index);
-        // Playlists have 20 logical pixels after the duration and after the × button.
-        return Bounds(row.right() - (single_column ? 110 : 50) * dpi, row.y + 7 * dpi, 46 * dpi, 22 * dpi);
+        // Keep 12 logical pixels of outer padding on both sides of each row.
+        return Bounds(row.right() - (single_column ? 94 : 58) * dpi, row.y + 7 * dpi, 46 * dpi, 22 * dpi);
     }
 };
 
@@ -1049,7 +1049,7 @@ static AlbumTrackLayout album_track_layout(double width, double dpi, std::size_t
     const double gap = 24 * dpi;
     // Playlists always remain a linear list; only albums may flow into columns.
     const auto allowed = static_cast<std::size_t>(std::max(1.0,
-        std::floor((text_width + gap) / (260 * dpi + gap))));
+        std::floor((text_width + gap) / (312 * dpi + gap))));
     const auto columns = !single_column && count > 7 ? std::min(allowed, (count + 6) / 7) : 1;
     const auto rows = std::max<std::size_t>(1, (count + columns - 1) / columns);
     return {art_size, text_width, std::max(0.0, (text_width - (columns - 1) * gap) / columns),
@@ -1446,12 +1446,12 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     if (button.x + button.w > b.x + 56 * dpi + text_width)
                         continue;
                     if (hover_enabled && bounds_contains(button, root->mouse_current_x, root->mouse_current_y)) {
-                        set_rect(cr, button);
+                        rounded_rectangle(cr, button, 6 * dpi);
                         cr->set_color(theme_colors::row_hover);
                         cr->fill();
                     }
                     draw_text(cr, button.x, button.y + 4 * dpi, actions[i], 11 * dpi, true,
-                              mylar_font, button.w, 20 * dpi, foreground, true);
+                              mylar_font, button.w, 20 * dpi, foreground, true, 1);
                 }
                 const auto playing_path = player->current_path();
                 const auto &drag = rd->playlist_track_drag;
@@ -1467,7 +1467,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                         bounds_contains(tracks.hit_bounds(b, dpi, i), root->mouse_current_x, root->mouse_current_y);
                     const bool dragged = dragging && song.full == drag.path;
                     if (hovered) {
-                        set_rect(cr, row);
+                        rounded_rectangle(cr, row, 6 * dpi);
                         cr->set_color(theme_colors::row_track);
                         cr->fill();
                     }
@@ -1491,10 +1491,10 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     cr->save();
                     set_rect(cr, row);
                     cr->clip();
-                    draw_text(cr, row.x, row.y + 7 * dpi, number, 11 * dpi, true, mylar_font,
-                              28 * dpi, 22 * dpi, row_secondary, bold, 2);
-                    draw_text(cr, row.x + 40 * dpi, row.y + 7 * dpi, title, 12 * dpi, true,
-                              mylar_font, std::max(1.0, duration_bounds.x - row.x - 46 * dpi), 22 * dpi,
+                    draw_text(cr, row.x + 12 * dpi, row.y + 7 * dpi, number, 11 * dpi, true, mylar_font,
+                              28 * dpi, 22 * dpi, row_secondary, bold, 0);
+                    draw_text(cr, row.x + 48 * dpi, row.y + 7 * dpi, title, 12 * dpi, true,
+                              mylar_font, std::max(1.0, duration_bounds.x - row.x - 56 * dpi), 22 * dpi,
                               row_foreground, bold);
                     draw_text(cr, duration_bounds.x, duration_bounds.y, time, 11 * dpi, true,
                               mylar_font, duration_bounds.w, duration_bounds.h, row_secondary, bold, 2);
@@ -3140,7 +3140,7 @@ static void paint_playback_button(Container *root, Container *c, PlaybackButton 
             cr->set_color(theme().accent_fill);
         cr->arc(0, 0, 16, 0, 2 * M_PI);
         cr->fill();
-        cr->set_color(theme().on_accent);
+        cr->set_color(accent_colors::foreground);
         if (data->playing) {
             cr->rectangle(-5, -6, 3, 12);
             cr->rectangle(2, -6, 3, 12);
@@ -3535,19 +3535,30 @@ static void fill_playback_bar(Container *root, Container *bar) {
     data->queue_button->when_paint = [](Container *root, Container *c) {
         auto rd = static_cast<RootData *>(root->user_data);
         auto cr = rd->window->raw_window->drawing_context;
-        const auto b = c->real_bounds;
+        const auto &b = c->real_bounds;
+        const double scale = std::min(b.w / 72, b.h / 32);
+        if (scale <= 0) return;
+        const bool selected = rd->queue_overlay->exists;
+        const auto foreground = selected || c->state.mouse_pressing
+            ? accent_colors::foreground : theme().text;
         cr->save();
-        cr->translate(b.x + b.w / 2, b.y + b.h / 2);
-        cr->scale(b.w / 32, b.h / 32);
-        cr->set_color((c->state.mouse_hovering ? theme_colors::folder_icon_hover : theme_colors::folder_icon));
-        cr->set_line_width(2);
-        cr->set_line_cap(drawing::LineCap::Round);
-        for (int y : {-7, 0, 7}) {
-            cr->move_to(-10, y); cr->line_to(3, y);
-        }
+        const Bounds pill(b.x, b.y + (b.h - 28 * scale) / 2, b.w, 28 * scale);
+        rounded_rectangle(cr, pill, pill.h / 2);
+        cr->set_color(c->state.mouse_pressing ? theme().accent_pressed :
+                      selected ? theme().accent_fill :
+                      c->state.mouse_hovering ? theme().button_hover : theme().button);
+        cr->fill();
+        const double stroke = scale;
+        rounded_rectangle(cr, Bounds(pill.x + stroke / 2, pill.y + stroke / 2,
+                                    pill.w - stroke, pill.h - stroke), (pill.h - stroke) / 2);
+        cr->set_line_width(stroke);
+        cr->set_color(selected || c->state.mouse_hovering ? theme().accent : theme().border);
         cr->stroke();
-        cr->move_to(7, -4); cr->line_to(13, 0); cr->line_to(7, 4);
-        cr->close_path(); cr->fill();
+        const int font_size = std::max(1, static_cast<int>(11 * scale));
+        const auto text = draw_text(cr, 0, 0, "Queue", font_size, false,
+                                    mylar_font, -1, -1, foreground, true);
+        draw_text(cr, b.x, b.y + (b.h - text.h) / 2, "Queue", font_size, true,
+                  mylar_font, b.w, -1, foreground, true, 1);
         cr->restore();
     };
     data->settings = bar->child(FILL_SPACE, FILL_SPACE);
@@ -3613,10 +3624,13 @@ static void fill_playback_bar(Container *root, Container *bar) {
         layout(root, data->next, Bounds(center + step - button / 2, button_y, button, button));
         const double mute_size = std::min(32 * dpi, right_width / 3);
         const double volume_y = b.y + (b.h - mute_size) / 2;
-        layout(root, data->queue_button, Bounds(b.right() - right_width, volume_y, mute_size, mute_size));
-        layout(root, data->mute, Bounds(b.right() - right_width + mute_size, volume_y, mute_size, mute_size));
-        layout(root, data->volume, Bounds(b.right() - right_width + 2 * mute_size, volume_y,
-            std::max(0.0, right_width - 3 * mute_size - pad), mute_size));
+        const double queue_width = std::min(72 * dpi, right_width * .3);
+        const double queue_gap = std::min(8 * dpi, right_width * .03);
+        const double controls_x = b.right() - right_width;
+        layout(root, data->queue_button, Bounds(controls_x, volume_y, queue_width, mute_size));
+        layout(root, data->mute, Bounds(controls_x + queue_width + queue_gap, volume_y, mute_size, mute_size));
+        layout(root, data->volume, Bounds(controls_x + queue_width + queue_gap + mute_size, volume_y,
+            std::max(0.0, right_width - queue_width - queue_gap - 2 * mute_size - pad), mute_size));
         layout(root, data->settings, Bounds(b.right() - pad - mute_size, volume_y,
             mute_size, mute_size));
         const double seek_left = compact ? b.x + pad : b.x + b.w * .28;
@@ -3823,7 +3837,7 @@ static void fill_settings_menu(Container *root, Container *overlay) {
             else cr->set_color(theme().button);
             cr->fill();
             draw_text(cr, b.x, b.y + 10 * dpi, label(), 10 * dpi, true,
-                      mylar_font, b.w, -1, selected ? theme().on_accent :
+                      mylar_font, b.w, -1, selected ? accent_colors::foreground :
                       c->interactable ? theme().status : theme().disabled_text,
                       selected, 1);
             cr->restore();
