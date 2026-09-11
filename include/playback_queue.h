@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <string>
 #include <vector>
@@ -15,6 +16,8 @@ public:
         std::uint64_t id;
         std::string path;
         Category category = Category::Queue;
+        // Temporary playback provenance; never written into track metadata.
+        std::string playlist_id;
     };
     static constexpr auto none = std::numeric_limits<std::size_t>::max();
     const std::vector<Entry>& entries() const { return items_; }
@@ -27,27 +30,30 @@ public:
     }
     // Import restored/explicit playback lists; normal audio progression only
     // updates the cursor and preserves duplicate identities and priority groups.
-    void observe(const std::vector<std::string>& paths, std::size_t index) {
+    template<typename SameTrack = std::equal_to<>>
+    void observe(const std::vector<std::string>& paths, std::size_t index, SameTrack same_track = {}) {
         if (items_.size() != paths.size() || !std::equal(items_.begin(), items_.end(), paths.begin(),
-                [](const auto& entry, const auto& path) { return entry.path == path; })) {
+                [&](const auto& entry, const auto& path) { return same_track(entry.path, path); })) {
             reset(paths, index);
         } else {
+            // Audio conversion may change a path without replacing its queue entry.
+            for (std::size_t i = 0; i < paths.size(); ++i) items_[i].path = paths[i];
             index_ = index < items_.size() ? index : none;
         }
     }
-    void reset(const std::vector<std::string>& paths, std::size_t index) {
+    void reset(const std::vector<std::string>& paths, std::size_t index, const std::string& playlist_id = {}) {
         items_.clear();
-        for (const auto& path : paths) items_.push_back({next_id_++, path});
+        for (const auto& path : paths) items_.push_back({next_id_++, path, Category::Queue, playlist_id});
         index_ = index < items_.size() ? index : none;
     }
-    void add(const std::vector<std::string>& paths, Action action) {
+    void add(const std::vector<std::string>& paths, Action action, const std::string& playlist_id = {}) {
         auto at = upcoming_begin();
         if (action == Action::Append) at = items_.size();
         else if (action == Action::AfterNext)
             while (at < items_.size() && items_[at].category == Category::Next) ++at;
         std::vector<Entry> added;
         for (const auto& path : paths)
-            added.push_back({next_id_++, path, action == Action::Append ? Category::Queue : Category::Next});
+            added.push_back({next_id_++, path, action == Action::Append ? Category::Queue : Category::Next, playlist_id});
         items_.insert(items_.begin() + at, added.begin(), added.end());
     }
     bool remove(std::uint64_t id) {

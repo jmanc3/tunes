@@ -276,6 +276,7 @@ struct RootData : UserData {
     double context_x = 0, context_y = 0;
     std::vector<std::string> context_paths;
     std::string context_playlist_id;
+    std::string context_source_playlist_id;
     bool context_whole_playlist = false;
     bool playlist_submenu = false;
     Bounds playlist_menu_bounds;
@@ -508,6 +509,28 @@ static void remove_playlist_track(Container *root, std::string id, std::string p
 static void delete_context_playlist(Container *root);
 static void finish_playlist_track_drag(Container *root);
 static void playlist_art_action(Container *root, const std::string &id);
+static AlbumArtCache::Handle playlist_art_handle(RootData *rd, const PlaylistState &playlist);
+
+static AlbumArtCache::Handle playback_art(RootData *rd, const std::string &path,
+                                          const std::string &playlist_id, int pixels) {
+    const auto track = rd->tracks.find(path);
+    // Playlist playback checks this track alone, even if its library album
+    // shares a cover from another track in the collection.
+    auto art = playlist_id.empty() && track != rd->tracks.end()
+        ? track->second.art : rd->artwork->create({path});
+    rd->artwork->request(art, pixels);
+    if (!playlist_id.empty() && rd->startup && rd->artwork->preview_ready(art) && !rd->artwork->image(art)) {
+        const auto &playlists = rd->startup->session.playlists;
+        const auto playlist = std::find_if(playlists.begin(), playlists.end(),
+            [&](const auto &entry) { return entry.id == playlist_id; });
+        if (playlist != playlists.end()) {
+            art = playlist_art_handle(rd, *playlist);
+            rd->artwork->request(art, pixels);
+        }
+    }
+    if (rd->artwork->pending()) poll_artwork(rd->artwork_refresh);
+    return art;
+}
 
 static void cancel_playlist_track_drag(RootData *rd) {
     rd->playlist_track_drag = {};
@@ -516,7 +539,9 @@ static void cancel_playlist_track_drag(RootData *rd) {
 }
 
 static void observe_queue() {
-    playback_queue.observe(player->queue(), player->current_index());
+    playback_queue.observe(player->queue(), player->current_index(), [](const auto &queued, const auto &current) {
+        return queued == current || preferred_audio_path(queued) == current;
+    });
 }
 
 static void commit_queue(Container *root) {
@@ -618,6 +643,7 @@ static void open_queue_context(Container *root, std::vector<std::string> paths, 
     cancel_playlist_track_drag(rd);
     rd->context_paths = std::move(paths);
     rd->context_playlist_id = std::move(playlist_id);
+    rd->context_source_playlist_id = rd->context_playlist_id;
     rd->context_whole_playlist = whole_playlist && !rd->context_playlist_id.empty();
     rd->playlist_submenu = false;
     rd->playlist_scroll = 0;
@@ -750,19 +776,17 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
                 cr->translate(swipe + ease * b.w, 0);
                 cr->set_color(RGBA(.91, .95, .97, 1));
                 cr->rectangle(row.x, row.y + 2 * d, row.w, 60 * d); cr->fill();
+                const auto handle = playback_art(rd, e.path, e.playlist_id, 48 * d);
+                if (const auto art = rd->artwork->image(handle))
+                    paint_artwork(rd, cr, handle, art, {}, row.x + 6 * d, row.y + 8 * d, 48 * d, false);
                 const auto it = rd->tracks.find(e.path);
                 if (it != rd->tracks.end()) {
                     const auto &track = it->second;
-                    rd->artwork->request(track.art, 48 * d);
-                    const auto detail = rd->artwork->image(track.art);
-                    const auto art = detail ? detail : rd->artwork->preview(track.art);
-                    if (art || rd->artwork->preview(track.art))
-                        paint_artwork(rd, cr, track.art, art, {}, row.x + 6 * d, row.y + 8 * d, 48 * d, false);
                     text(row.x + 64 * d, row.y + 10 * d, track.title, 12, true, row.w - 102 * d);
                     text(row.x + 64 * d, row.y + 30 * d, track.album.empty() ? "Unknown album" : track.album, 10, false, row.w - 102 * d);
                 } else {
-                    text(row.x + 12 * d, row.y + 10 * d, std::filesystem::path(e.path).stem().string(), 12, true, row.w - 50 * d);
-                    text(row.x + 12 * d, row.y + 33 * d, "Unknown album", 10, false, row.w - 50 * d);
+                    text(row.x + 64 * d, row.y + 10 * d, std::filesystem::path(e.path).stem().string(), 12, true, row.w - 102 * d);
+                    text(row.x + 64 * d, row.y + 30 * d, "Unknown album", 10, false, row.w - 102 * d);
                 }
                 if (!current) text(row.right() - 30 * d, row.y + 18 * d, "×", 18, false, 24 * d);
                 cr->pop_group_to_source(); cr->paint_source(1 - ease);
@@ -884,7 +908,11 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
                     for (const auto &[id, row] : rd->queue_rows) {
                         if (!bounds_contains(row, x, y)) continue;
                         for (const auto &entry : playback_queue.entries())
-                            if (entry.id == id) { open_queue_context(root, {entry.path}); break; }
+                            if (entry.id == id) {
+                                open_queue_context(root, {entry.path});
+                                rd->context_source_playlist_id = entry.playlist_id;
+                                break;
+                            }
                         break;
                     }
                 }
@@ -934,7 +962,7 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
             }
             if (action >= 0 && action < 3) {
                 observe_queue();
-                playback_queue.add(rd->context_paths, static_cast<PlaybackQueue::Action>(action));
+                playback_queue.add(rd->context_paths, static_cast<PlaybackQueue::Action>(action), rd->context_source_playlist_id);
                 commit_queue(root);
             }
             c->exists = false;
@@ -967,13 +995,14 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
     };
 }
 
-static void play_album(const AlbumOption &album, std::size_t index) {
+static void play_album(const AlbumData &source, std::size_t index) {
+    const auto &album = source.album;
     if (index >= album.songs.size()) return;
     auto &queue = player->queue();
     queue.clear();
     for (const auto &song : album.songs)
         queue.push_back(song.full);
-    playback_queue.reset(queue, index);
+    playback_queue.reset(queue, index, source.playlist_id);
     if (!player->play_queued_item(index))
         std::cerr << "Album playback failed: " << player->last_error() << '\n';
 }
@@ -1642,20 +1671,20 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     continue;
                 if (album->album.songs.empty()) return;
                 if (action == 0) {
-                    play_album(album->album, 0);
+                    play_album(*album, 0);
                 } else if (action == 1) {
                     auto queue = album_paths(album->album);
                     static std::mt19937 random(std::random_device{}());
                     std::shuffle(queue.begin(), queue.end(), random);
                     observe_queue();
                     const auto index = playback_queue.upcoming_begin();
-                    playback_queue.add(queue, PlaybackQueue::Action::PlayNext);
+                    playback_queue.add(queue, PlaybackQueue::Action::PlayNext, album->playlist_id);
                     commit_queue(root);
                     if (!player->play_queued_item(index))
                         std::cerr << "Album playback failed: " << player->last_error() << '\n';
                 } else {
                     observe_queue();
-                    playback_queue.add(album_paths(album->album), PlaybackQueue::Action::Append);
+                    playback_queue.add(album_paths(album->album), PlaybackQueue::Action::Append, album->playlist_id);
                     commit_queue(root);
                 }
                 return;
@@ -1667,7 +1696,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     if (!album->playlist_id.empty() && bounds_contains(tracks.remove_bounds(b, rd->dpi, i),
                                                                       root->mouse_current_x, root->mouse_current_y))
                         return;
-                    play_album(album->album, i);
+                    play_album(*album, i);
                     break;
                 }
             }
@@ -1751,7 +1780,7 @@ static bool consume_album_double_click(Container *root) {
         auto card = rd->album_double_click_target;
         auto album = static_cast<AlbumData *>(card->user_data);
         album->play_pulse_start = std::chrono::steady_clock::now();
-        play_album(album->album, 0);
+        play_album(*album, 0);
         open_album(root, card);
         windowing::redraw(rd->window->raw_window);
     }
@@ -1894,7 +1923,7 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         const double dy = root->mouse_current_y - (c->real_bounds.y + 8 * dpi + size / 2);
         if (std::hypot(dx, dy) <= std::min(26 * dpi, size / 3)) {
             album->play_pulse_start = now;
-            play_album(album->album, 0);
+            play_album(*album, 0);
             open_album(root, c);
         } else if (rd->expanded_album == c) {
             close_album(root);
@@ -2830,33 +2859,26 @@ static bool sync_playback(Container *root) {
     const bool can_play = !player->queue().empty();
     const bool can_previous = index != no_index && !path.empty();
     const bool can_next = index != no_index && index + 1 < player->queue().size();
-    const bool changed = data->path != path || data->playing != playing || data->gain != gain ||
+    bool changed = data->path != path || data->playing != playing || data->gain != gain ||
         static_cast<int>(data->elapsed) != static_cast<int>(elapsed) || data->duration != duration ||
         std::abs(data->position - position) * data->seek->real_bounds.w >= .5 ||
         data->play->interactable != can_play || data->previous->interactable != can_previous ||
         data->next->interactable != can_next;
-    if (data->path != path) {
+    if (data->path != path)
         data->seeking = false;
-        auto root_data = static_cast<RootData *>(root->user_data);
-        if (root_data->artwork) {
-            const auto previous_art = root_data->current_art;
-            if (previous_art)
-                root_data->artwork->release(previous_art);
-            root_data->current_art.reset();
-            if (!path.empty()) {
-                const auto track = root_data->tracks.find(path);
-                root_data->current_art = track != root_data->tracks.end()
-                    ? root_data->artwork->clone(track->second.art) : root_data->artwork->create({path});
-                root_data->artwork->request(root_data->current_art, 128);
-                poll_artwork(root_data->artwork_refresh);
-            }
-            if (root_data->current_art != previous_art) {
-                // Only the restored startup cover joins the blurred reveal.
-                // Album changes show the best resident texture immediately.
-                root_data->current_art_startup_fade = false;
-                root_data->current_art_fade.reset();
-            }
-        }
+    auto root_data = static_cast<RootData *>(root->user_data);
+    const auto current = playback_queue.current();
+    const auto art = path.empty() ? AlbumArtCache::Handle{} : playback_art(root_data, path,
+        current && current->path == path ? current->playlist_id : std::string{}, 128);
+    // Reconsider fallback after artwork loading and playlist edits, including
+    // consecutive queue entries for the same path from different playlists.
+    if (art != root_data->current_art) {
+        if (root_data->current_art) root_data->artwork->release(root_data->current_art);
+        root_data->current_art = art;
+        // Only the restored startup cover joins the blurred reveal.
+        root_data->current_art_startup_fade = false;
+        root_data->current_art_fade.reset();
+        changed = true;
     }
     data->path = path;
     data->elapsed = elapsed;
