@@ -262,6 +262,11 @@ struct PlaylistTrackDrag {
     std::chrono::steady_clock::time_point last_update;
 };
 
+struct PlaylistTrackTarget {
+    std::string playlist_id;
+    std::string path;
+};
+
 struct RootData : UserData {
     Container *queue_overlay = nullptr;
     Container *context_overlay = nullptr;
@@ -281,6 +286,7 @@ struct RootData : UserData {
     double playlist_scroll_grab = 0;
     PlaylistNameEdit playlist_edit;
     PlaylistTrackDrag playlist_track_drag;
+    std::optional<PlaylistTrackTarget> playlist_remove_press;
     std::uint64_t playlist_drag_generation = 0;
     std::vector<std::pair<std::uint64_t, Bounds>> queue_rows;
     std::vector<QueueRemoval> queue_removals;
@@ -485,11 +491,13 @@ static void checkpoint_session(Container *root, bool force = false);
 static void finish_playlist_name_edit(Container *root, bool commit);
 static void add_context_to_playlist(Container *root, const std::string &id);
 static void remove_context_from_playlist(Container *root);
+static void remove_playlist_track(Container *root, std::string id, std::string path);
 static void delete_context_playlist(Container *root);
 static void finish_playlist_track_drag(Container *root);
 
 static void cancel_playlist_track_drag(RootData *rd) {
     rd->playlist_track_drag = {};
+    rd->playlist_remove_press.reset();
     ++rd->playlist_drag_generation;
 }
 
@@ -977,6 +985,18 @@ struct AlbumTrackLayout {
         }
         return bounds;
     }
+
+    Bounds remove_bounds(const Bounds &panel, double dpi, std::size_t index) const {
+        if (!single_column) return {};
+        const auto row = track_bounds(panel, dpi, index);
+        return Bounds(row.right() - 44 * dpi, row.y + 4 * dpi, 24 * dpi, 24 * dpi).intersection(row);
+    }
+
+    Bounds duration_bounds(const Bounds &panel, double dpi, std::size_t index) const {
+        const auto row = track_bounds(panel, dpi, index);
+        // Playlists have 20 logical pixels after the duration and after the × button.
+        return Bounds(row.right() - (single_column ? 110 : 50) * dpi, row.y + 7 * dpi, 46 * dpi, 22 * dpi);
+    }
 };
 
 static AlbumTrackLayout album_track_layout(double width, double dpi, std::size_t count, bool single_column = false) {
@@ -1263,6 +1283,11 @@ static void open_album(Container *root, Container *card, bool animate = true) {
             for (std::size_t i = 0; i < album->album.songs.size(); ++i) {
                 if (!bounds_contains(tracks.hit_bounds(c->real_bounds, rd->dpi, i), root->mouse_current_x, root->mouse_current_y))
                     continue;
+                c->when_drag_end_is_click = false;
+                if (bounds_contains(tracks.remove_bounds(c->real_bounds, rd->dpi, i), root->mouse_current_x, root->mouse_current_y)) {
+                    rd->playlist_remove_press = PlaylistTrackTarget{album->playlist_id, album->album.songs[i].full};
+                    break;
+                }
                 rd->playlist_track_drag.playlist_id = album->playlist_id;
                 rd->playlist_track_drag.path = album->album.songs[i].full;
                 rd->playlist_track_drag.grab_y = (root->mouse_current_y - tracks.track_bounds(c->real_bounds, rd->dpi, i).y) / rd->dpi;
@@ -1384,6 +1409,8 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 for (std::size_t i = 0; i < album->album.songs.size(); ++i) {
                     const auto &song = album->album.songs[i];
                     const auto row = tracks.track_bounds(b, dpi, i);
+                    const auto duration_bounds = tracks.duration_bounds(b, dpi, i);
+                    const auto remove_bounds = tracks.remove_bounds(b, dpi, i);
                     if (row.intersection(c->parent->real_bounds).empty())
                         continue;
                     const bool hovered = !dragging && hover_enabled &&
@@ -1417,10 +1444,25 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     draw_text(cr, row.x, row.y + 7 * dpi, number, 11 * dpi, true, mylar_font,
                               28 * dpi, 22 * dpi, row_secondary, bold, 2);
                     draw_text(cr, row.x + 40 * dpi, row.y + 7 * dpi, title, 12 * dpi, true,
-                              mylar_font, std::max(1.0, row.w - 96 * dpi), 22 * dpi,
+                              mylar_font, std::max(1.0, duration_bounds.x - row.x - 46 * dpi), 22 * dpi,
                               row_foreground, bold);
-                    draw_text(cr, row.x + row.w - 50 * dpi, row.y + 7 * dpi, time, 11 * dpi, true,
-                              mylar_font, 46 * dpi, 22 * dpi, row_secondary, bold, 2);
+                    draw_text(cr, duration_bounds.x, duration_bounds.y, time, 11 * dpi, true,
+                              mylar_font, duration_bounds.w, duration_bounds.h, row_secondary, bold, 2);
+                    if (!album->playlist_id.empty() && !remove_bounds.empty()) {
+                        const bool remove_hovered = hovered && bounds_contains(remove_bounds, root->mouse_current_x, root->mouse_current_y);
+                        if (remove_hovered) {
+                            cr->set_color(RGBA(.85, .2, .2, .15));
+                            rounded_rectangle(cr, remove_bounds, 4 * dpi); cr->fill();
+                        }
+                        cr->set_color(remove_hovered ? RGBA(.85, .2, .2, 1) : row_secondary);
+                        cr->set_line_width(1.5 * dpi);
+                        const double x = remove_bounds.x + remove_bounds.w / 2;
+                        const double y = remove_bounds.y + remove_bounds.h / 2;
+                        const double radius = std::min({4 * dpi, remove_bounds.w / 4, remove_bounds.h / 4});
+                        cr->move_to(x - radius, y - radius); cr->line_to(x + radius, y + radius);
+                        cr->move_to(x + radius, y - radius); cr->line_to(x - radius, y + radius);
+                        cr->stroke();
+                    }
                     cr->restore();
                 }
                 if (!album->playlist_id.empty() && album->album.songs.empty()) {
@@ -1484,7 +1526,29 @@ static void open_album(Container *root, Container *card, bool animate = true) {
             }
         };
         rd->album_panel->when_clicked = [](Container *root, Container *c) {
-            cancel_playlist_track_drag(static_cast<RootData *>(root->user_data));
+            auto data = static_cast<RootData *>(root->user_data);
+            const auto remove_press = std::exchange(data->playlist_remove_press, std::nullopt);
+            cancel_playlist_track_drag(data);
+            if (remove_press && c->state.mouse_button_pressed == BTN_LEFT) {
+                data->last_album_clicked = data->album_double_click_target = nullptr;
+                if (data->expanded_album) {
+                    const auto album = static_cast<AlbumData *>(data->expanded_album->user_data);
+                    const auto tracks = album_track_layout(c->real_bounds.w, data->dpi, album->album.songs.size(), true);
+                    const auto path = preferred_audio_path(remove_press->path);
+                    const auto visible = Bounds(c->real_bounds.x, c->real_bounds.y, c->real_bounds.w,
+                                                std::min(c->real_bounds.h, data->album_visible_height)).intersection(data->library->real_bounds);
+                    for (std::size_t i = 0; i < album->album.songs.size(); ++i) {
+                        if (album->playlist_id == remove_press->playlist_id &&
+                            (album->album.songs[i].full == remove_press->path || album->album.songs[i].full == path) &&
+                            bounds_contains(tracks.remove_bounds(c->real_bounds, data->dpi, i).intersection(visible),
+                                            root->mouse_current_x, root->mouse_current_y)) {
+                            remove_playlist_track(root, remove_press->playlist_id, remove_press->path);
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
             if (consume_album_double_click(root))
                 return;
             if (c->state.mouse_button_pressed == BTN_RIGHT) {
@@ -1553,6 +1617,9 @@ static void open_album(Container *root, Container *card, bool animate = true) {
             for (std::size_t i = 0; i < album->album.songs.size(); ++i) {
                 if (bounds_contains(tracks.hit_bounds(b, rd->dpi, i),
                                     root->mouse_current_x, root->mouse_current_y)) {
+                    if (!album->playlist_id.empty() && bounds_contains(tracks.remove_bounds(b, rd->dpi, i),
+                                                                      root->mouse_current_x, root->mouse_current_y))
+                        return;
                     play_album(album->album, i);
                     break;
                 }
@@ -1934,11 +2001,17 @@ static void remove_context_from_playlist(Container *root) {
     if (!rd->startup || rd->context_whole_playlist || rd->context_playlist_id.empty() || rd->context_paths.size() != 1) return;
     const auto id = rd->context_playlist_id;
     const auto path = rd->context_paths.front();
-    const auto preferred = preferred_audio_path(path);
     rd->context_overlay->exists = false;
     rd->context_playlist_id.clear();
     rd->playlist_submenu = rd->playlist_scroll_dragging = false;
     windowing::redraw(rd->window->raw_window);
+    remove_playlist_track(root, id, path);
+}
+
+static void remove_playlist_track(Container *root, std::string id, std::string path) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->startup) return;
+    const auto preferred = preferred_audio_path(path);
     auto &playlists = rd->startup->session.playlists;
     auto playlist = std::find_if(playlists.begin(), playlists.end(), [&](const auto &entry) { return entry.id == id; });
     if (playlist == playlists.end()) return;
@@ -1974,7 +2047,7 @@ static void load_playlist_metadata(Container *root) {
 
 static void finish_playlist_metadata(Container *root) {
     auto rd = static_cast<RootData *>(root->user_data);
-    if (!rd->playlist_track_drag.playlist_id.empty()) return;
+    if (!rd->playlist_track_drag.playlist_id.empty() || rd->playlist_remove_press) return;
     if (!rd->playlist_metadata.valid() || rd->playlist_metadata.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
         return;
     try {
@@ -2674,7 +2747,7 @@ static void start_library_rescan(Container *root) {
 static void finish_library_rescan(Container *root) {
     auto data = static_cast<RootData *>(root->user_data);
     // Keep the pressed panel alive until the drag or ordinary track click ends.
-    if (!data->playlist_track_drag.playlist_id.empty()) return;
+    if (!data->playlist_track_drag.playlist_id.empty() || data->playlist_remove_press) return;
     if (!data->scan.valid() || data->scan.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
         return;
     try {
