@@ -270,6 +270,7 @@ struct RootData : UserData {
     double context_x = 0, context_y = 0;
     std::vector<std::string> context_paths;
     std::string context_playlist_id;
+    bool context_whole_playlist = false;
     bool playlist_submenu = false;
     Bounds playlist_menu_bounds;
     Bounds playlist_list_bounds;
@@ -484,6 +485,7 @@ static void checkpoint_session(Container *root, bool force = false);
 static void finish_playlist_name_edit(Container *root, bool commit);
 static void add_context_to_playlist(Container *root, const std::string &id);
 static void remove_context_from_playlist(Container *root);
+static void delete_context_playlist(Container *root);
 static void finish_playlist_track_drag(Container *root);
 
 static void cancel_playlist_track_drag(RootData *rd) {
@@ -588,12 +590,13 @@ static void drag_playlist_scrollbar(Container *root) {
     windowing::redraw(rd->window->raw_window);
 }
 
-static void open_queue_context(Container *root, std::vector<std::string> paths, std::string playlist_id = {}) {
+static void open_queue_context(Container *root, std::vector<std::string> paths, std::string playlist_id = {}, bool whole_playlist = false) {
     auto rd = static_cast<RootData *>(root->user_data);
     finish_playlist_name_edit(root, true);
     cancel_playlist_track_drag(rd);
     rd->context_paths = std::move(paths);
     rd->context_playlist_id = std::move(playlist_id);
+    rd->context_whole_playlist = whole_playlist && !rd->context_playlist_id.empty();
     rd->playlist_submenu = false;
     rd->playlist_scroll = 0;
     rd->playlist_scroll_dragging = false;
@@ -662,7 +665,8 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
         cr->fill_preserve();
         cr->clip();
         if (context) {
-            const char *labels[] = {"Play Next", "Play After All Next", "Add to Queue", "Add to playlist", "Remove from playlist"};
+            const char *labels[] = {"Play Next", "Play After All Next", "Add to Queue", "Add to playlist",
+                                   rd->context_whole_playlist ? "Delete playlist" : "Remove from playlist"};
             const int count = rd->context_playlist_id.empty() ? 4 : 5;
             for (int i = 0; i < count; ++i) {
                 Bounds row(b.x, b.y + (2 + i * 40) * d, b.w, 40 * d);
@@ -902,7 +906,8 @@ static void fill_queue_overlay(Container *root, Container *overlay, bool context
             }
             const int action = static_cast<int>((y - b.y - 2 * d) / (40 * d));
             if (action == 4 && !rd->context_playlist_id.empty()) {
-                remove_context_from_playlist(root);
+                if (rd->context_whole_playlist) delete_context_playlist(root);
+                else remove_context_from_playlist(root);
                 return;
             }
             if (action >= 0 && action < 3) {
@@ -1492,7 +1497,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                         open_queue_context(root, {album->album.songs[i].full}, album->playlist_id);
                         return;
                     }
-                open_queue_context(root, album_paths(album->album));
+                open_queue_context(root, album_paths(album->album), album->playlist_id, true);
                 return;
             }
             if (c->state.mouse_button_pressed != BTN_LEFT)
@@ -1748,7 +1753,8 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         if (consume_album_double_click(root))
             return;
         if (c->state.mouse_button_pressed == BTN_RIGHT) {
-            open_queue_context(root, album_paths(static_cast<AlbumData *>(c->user_data)->album));
+            const auto album = static_cast<AlbumData *>(c->user_data);
+            open_queue_context(root, album_paths(album->album), album->playlist_id, true);
             return;
         }
         if (c->state.mouse_button_pressed != BTN_LEFT)
@@ -1858,6 +1864,44 @@ static void sync_playlist_cards(Container *root) {
     }
 }
 
+static void delete_context_playlist(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->startup || !rd->context_whole_playlist || rd->context_playlist_id.empty()) return;
+    const auto id = rd->context_playlist_id;
+    rd->context_overlay->exists = false;
+    rd->context_playlist_id.clear();
+    rd->context_whole_playlist = false;
+    rd->context_paths.clear();
+    rd->playlist_submenu = rd->playlist_scroll_dragging = false;
+    cancel_playlist_track_drag(rd);
+    if (rd->playlist_edit.id == id) rd->playlist_edit = {};
+    std::erase_if(rd->startup->session.playlists, [&](const auto &playlist) { return playlist.id == id; });
+    if (rd->startup->session.expanded_playlist_id == id)
+        rd->startup->session.expanded_playlist_id.clear();
+    if (auto card = playlist_card(rd, id)) {
+        std::erase_if(rd->closing_albums, [card](const auto &closing) { return closing.card == card; });
+        if (rd->expanded_album == card || rd->outgoing_album == card) {
+            rd->outgoing_album = nullptr;
+            rd->album_reveal_start.reset();
+            rd->album_reveal = 1;
+        }
+        if (rd->expanded_album == card) {
+            rd->expanded_album = nullptr;
+            rd->album_visible_height = rd->album_visible_gap = 0;
+            rd->album_panel->exists = false;
+        }
+        rd->artwork->release(static_cast<AlbumData *>(card->user_data)->art);
+        std::erase(rd->library->children, card);
+        delete card;
+    }
+    rd->last_album_clicked = rd->album_double_click_target = nullptr;
+    rd->album_scroll_start.reset();
+    sync_playlist_cards(root);
+    layout(root, root, root->real_bounds);
+    checkpoint_session(root, true);
+    windowing::redraw(rd->window->raw_window);
+}
+
 static void finish_playlist_track_drag(Container *root) {
     auto rd = static_cast<RootData *>(root->user_data);
     update_playlist_track_drag(root, false);
@@ -1887,7 +1931,7 @@ static void finish_playlist_track_drag(Container *root) {
 
 static void remove_context_from_playlist(Container *root) {
     auto rd = static_cast<RootData *>(root->user_data);
-    if (!rd->startup || rd->context_playlist_id.empty() || rd->context_paths.size() != 1) return;
+    if (!rd->startup || rd->context_whole_playlist || rd->context_playlist_id.empty() || rd->context_paths.size() != 1) return;
     const auto id = rd->context_playlist_id;
     const auto path = rd->context_paths.front();
     const auto preferred = preferred_audio_path(path);
