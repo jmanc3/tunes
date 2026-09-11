@@ -10,6 +10,7 @@
 #include "audio_data.h"
 #include "audio_conversion.h"
 #include "album_art.h"
+#include "playlist_art.h"
 #include "drawing/cached_shadow.h"
 #include "session_state.h"
 #include "ThreadPool.h"
@@ -287,6 +288,15 @@ struct RootData : UserData {
     PlaylistNameEdit playlist_edit;
     PlaylistTrackDrag playlist_track_drag;
     std::optional<PlaylistTrackTarget> playlist_remove_press;
+    playlist_art::Chooser playlist_art_chooser;
+    std::string playlist_art_chooser_id;
+    bool playlist_art_chooser_poll_pending = false;
+    std::future<playlist_art::ImportResult> playlist_art_job;
+    std::string playlist_art_job_id;
+    std::string playlist_art_previous_file;
+    bool playlist_art_removing = false;
+    std::string playlist_art_error_id;
+    std::string playlist_art_error;
     std::uint64_t playlist_drag_generation = 0;
     std::vector<std::pair<std::uint64_t, Bounds>> queue_rows;
     std::vector<QueueRemoval> queue_removals;
@@ -351,6 +361,7 @@ struct RootData : UserData {
     std::optional<std::chrono::steady_clock::time_point> current_art_fade;
     bool current_art_startup_fade = true;
     AlbumArtCache::Handle preview_art;
+    std::string preview_playlist_id;
     Bounds preview_bounds;
     StartupState *startup = nullptr;
     double dpi = 1;
@@ -365,6 +376,7 @@ struct RootData : UserData {
     std::future<std::vector<Option>> playlist_metadata;
     bool scan_failed = false;
     ThreadPool scanner{1};
+    ThreadPool playlist_art_writer{1};
 };
 
 static RootData *root_data_for(Container *c) {
@@ -433,6 +445,7 @@ constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
 struct AlbumData : UserData {
     AlbumOption album;
     std::string playlist_id;
+    std::string art_file;
     std::optional<std::chrono::steady_clock::time_point> play_pulse_start;
     std::weak_ptr<const AlbumTexture> palette_source;
     RGBA background_color{.95, .96, .97, 1};
@@ -494,6 +507,7 @@ static void remove_context_from_playlist(Container *root);
 static void remove_playlist_track(Container *root, std::string id, std::string path);
 static void delete_context_playlist(Container *root);
 static void finish_playlist_track_drag(Container *root);
+static void playlist_art_action(Container *root, const std::string &id);
 
 static void cancel_playlist_track_drag(RootData *rd) {
     rd->playlist_track_drag = {};
@@ -1227,7 +1241,7 @@ static void update_album_colors(AlbumData *album, const std::shared_ptr<const Al
     }
 }
 
-static void open_artwork_preview(Container *root, const AlbumArtCache::Handle &art);
+static void open_artwork_preview(Container *root, const AlbumArtCache::Handle &art, const std::string &playlist_id = {});
 
 static bool consume_album_double_click(Container *root);
 
@@ -1255,6 +1269,12 @@ static void close_album(Container *root) {
 
 static Bounds album_action_bounds(const Bounds &b, double dpi, int action) {
     return Bounds(b.x + (56 + action * 76) * dpi, b.y + 61 * dpi, 70 * dpi, 26 * dpi);
+}
+
+static Bounds playlist_art_button_bounds(const Bounds &artwork, double dpi) {
+    const double width = std::min(120 * dpi, std::max(0.0, artwork.w - 16 * dpi));
+    const double height = std::min(32 * dpi, std::max(0.0, artwork.h - 16 * dpi));
+    return Bounds(artwork.x + (artwork.w - width) / 2, artwork.bottom() - height - 8 * dpi, width, height);
 }
 
 static void open_album(Container *root, Container *card, bool animate = true) {
@@ -1494,9 +1514,31 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     cr->arc(first.x - 18 * dpi, y, 3 * dpi, 0, 2 * M_PI); cr->fill();
                 }
                 const auto art = rd->artwork->image(album->art);
+                const Bounds artwork(b.x + b.w - art_size - 16 * dpi, b.y + 16 * dpi, art_size, art_size);
                 if (art && art_size > 0)
-                    paint_artwork(rd, cr, album->art, art, {}, b.x + b.w - art_size - 16 * dpi,
-                                  b.y + 16 * dpi, art_size, false);
+                    paint_artwork(rd, cr, album->art, art, {}, artwork.x, artwork.y, art_size, false);
+                if (!album->playlist_id.empty() && card == rd->expanded_album && !dragging && art_size > 0) {
+                    const bool choosing = rd->playlist_art_chooser.visible() && rd->playlist_art_chooser_id == album->playlist_id;
+                    const bool saving = rd->playlist_art_job.valid() && rd->playlist_art_job_id == album->playlist_id;
+                    if ((hover_enabled && bounds_contains(artwork, root->mouse_current_x, root->mouse_current_y)) || choosing || saving) {
+                        const auto button = playlist_art_button_bounds(artwork, dpi);
+                        const bool over = hover_enabled && bounds_contains(button, root->mouse_current_x, root->mouse_current_y);
+                        cr->set_color(RGBA(0, 0, 0, over ? .85 : .7));
+                        rounded_rectangle(cr, button, 6 * dpi); cr->fill();
+                        const auto label = choosing ? "Choosing…" : saving ? (rd->playlist_art_removing ? "Removing…" : "Saving…")
+                            : album->art_file.empty() ? "Choose art" : "Remove art";
+                        draw_text(cr, button.x, button.y + 8 * dpi, label, 11 * dpi, true,
+                                  mylar_font, button.w, 20 * dpi, RGBA(1, 1, 1, 1), true, 1);
+                    }
+                    if (rd->playlist_art_error_id == album->playlist_id && !rd->playlist_art_error.empty()) {
+                        Bounds message(artwork.x + 8 * dpi, artwork.y + 8 * dpi,
+                                       std::max(0.0, artwork.w - 16 * dpi), std::min(72 * dpi, std::max(0.0, artwork.h - 56 * dpi)));
+                        cr->set_color(RGBA(.2, .05, .05, .92));
+                        rounded_rectangle(cr, message, 6 * dpi); cr->fill();
+                        draw_text(cr, message.x + 8 * dpi, message.y + 6 * dpi, rd->playlist_art_error, 10 * dpi, true,
+                                  mylar_font, std::max(0.0, message.w - 16 * dpi), std::max(0.0, message.h - 12 * dpi), RGBA(1, 1, 1, 1), false);
+                    }
+                }
                 cr->restore();
             };
             for (const auto &closing : rd->closing_albums)
@@ -1585,7 +1627,12 @@ static void open_album(Container *root, Container *card, bool animate = true) {
             const Bounds artwork(b.x + b.w - tracks.art_size - 16 * rd->dpi,
                                  b.y + 16 * rd->dpi, tracks.art_size, tracks.art_size);
             if (bounds_contains(artwork, root->mouse_current_x, root->mouse_current_y)) {
-                open_artwork_preview(root, album->art);
+                if (!album->playlist_id.empty() && bounds_contains(playlist_art_button_bounds(artwork, rd->dpi),
+                                                                  root->mouse_current_x, root->mouse_current_y)) {
+                    playlist_art_action(root, album->playlist_id);
+                    return;
+                }
+                open_artwork_preview(root, album->art, album->playlist_id);
                 return;
             }
             for (int action = 0; action < 3; ++action) {
@@ -1711,13 +1758,21 @@ static bool consume_album_double_click(Container *root) {
     return true;
 }
 
+static AlbumArtCache::Handle playlist_art_handle(RootData *rd, const PlaylistState &playlist) {
+    const auto file = playlist_art::owned_file(rd->startup->state_file, playlist.art_file);
+    return file.empty() ? rd->artwork->create_collage(playlist.tracks) : rd->artwork->create_file(file);
+}
+
 static Container *add_album(Container *parent, const AlbumOption &option, AlbumArtCache::Handle existing_art = {},
                       std::optional<std::chrono::steady_clock::time_point> detail_fade = {}, const PlaylistState *playlist = nullptr) {
     if (option.songs.empty() && !playlist)
         return nullptr;
     auto data = new AlbumData;
     data->album = option;
-    if (playlist) data->playlist_id = playlist->id;
+    if (playlist) {
+        data->playlist_id = playlist->id;
+        data->art_file = playlist->art_file;
+    }
     data->detail_fade = detail_fade;
     std::vector<std::string> tracks;
     tracks.reserve(option.songs.size());
@@ -1725,7 +1780,7 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         tracks.push_back(song.full);
     auto root_data = root_data_for(parent);
     data->art = existing_art ? std::move(existing_art) : playlist
-        ? root_data->artwork->create_collage(std::move(tracks)) : root_data->artwork->create(std::move(tracks));
+        ? playlist_art_handle(root_data, *playlist) : root_data->artwork->create(std::move(tracks));
     root_data->artwork_prefetch.add(data->art);
     if (playlist) {
         data->name = playlist->name;
@@ -1897,7 +1952,8 @@ static void sync_playlist_cards(Container *root) {
             album->album = std::move(option);
             album->name = playlist.name;
             album->artist = "Playlist · " + std::to_string(playlist.tracks.size()) + " tracks";
-            auto art = rd->artwork->create_collage(playlist.tracks);
+            album->art_file = playlist.art_file;
+            auto art = playlist_art_handle(rd, playlist);
             if (album->art != art) {
                 rd->artwork->release(album->art);
                 album->art = std::move(art);
@@ -1931,6 +1987,118 @@ static void sync_playlist_cards(Container *root) {
     }
 }
 
+static void discard_playlist_art(RootData *rd, const std::string &file) {
+    if (!rd->startup || file.empty()) return;
+    rd->artwork->forget_file(playlist_art::owned_file(rd->startup->state_file, file));
+    rd->playlist_art_writer.enqueue([session = rd->startup->state_file, file] {
+        const auto error = playlist_art::remove_image(session, file);
+        if (!error.empty()) std::cerr << error << '\n';
+    });
+}
+
+static void finish_playlist_art_job(Container *root, bool closing = false) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->playlist_art_job.valid() || (!closing &&
+        rd->playlist_art_job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)) return;
+    const auto id = std::exchange(rd->playlist_art_job_id, {});
+    const auto previous = std::exchange(rd->playlist_art_previous_file, {});
+    const bool removing = std::exchange(rd->playlist_art_removing, false);
+    playlist_art::ImportResult result;
+    try { result = rd->playlist_art_job.get(); }
+    catch (const std::exception &error) { result.error = error.what(); }
+    if (!result.error.empty()) {
+        rd->playlist_art_error_id = id;
+        rd->playlist_art_error = result.error;
+        std::cerr << "Playlist artwork: " << result.error << '\n';
+        if (!closing) windowing::redraw(rd->window->raw_window);
+        return;
+    }
+    auto &playlists = rd->startup->session.playlists;
+    auto playlist = std::find_if(playlists.begin(), playlists.end(), [&](const auto &entry) { return entry.id == id; });
+    if (playlist == playlists.end() || playlist->art_file != previous) {
+        discard_playlist_art(rd, result.file);
+        return;
+    }
+    playlist->art_file = result.file;
+    if (removing)
+        rd->artwork->forget_file(playlist_art::owned_file(rd->startup->state_file, previous));
+    else if (previous != result.file)
+        discard_playlist_art(rd, previous);
+    if (rd->playlist_art_error_id == id) {
+        rd->playlist_art_error_id.clear();
+        rd->playlist_art_error.clear();
+    }
+    if (closing) return; // The final session checkpoint saves the completed job.
+    sync_playlist_cards(root);
+    if (rd->artwork_preview->exists && rd->preview_playlist_id == id) {
+        if (auto card = playlist_card(rd, id))
+            rd->preview_art = rd->artwork->create_preview(static_cast<AlbumData *>(card->user_data)->art);
+    }
+    layout(root, root, root->real_bounds);
+    checkpoint_session(root, true);
+    windowing::redraw(rd->window->raw_window);
+}
+
+static void poll_playlist_art_chooser(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    rd->playlist_art_chooser.poll();
+    if (!rd->playlist_art_chooser.visible() || rd->playlist_art_chooser_poll_pending) return;
+    rd->playlist_art_chooser_poll_pending = true;
+    const auto window = rd->window->raw_window;
+    std::weak_ptr<bool> lifetime = root->lifetime;
+    windowing::timer(rd->app, 16, [root, lifetime, window](void *) {
+        if (!lifetime.expired() && windowing::has_window(window)) {
+            static_cast<RootData *>(root->user_data)->playlist_art_chooser_poll_pending = false;
+            poll_playlist_art_chooser(root);
+        }
+    }, nullptr);
+}
+
+static void playlist_art_action(Container *root, const std::string &id) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->startup || rd->playlist_art_job.valid() || rd->playlist_art_chooser.visible()) return;
+    finish_playlist_name_edit(root, true);
+    cancel_playlist_track_drag(rd);
+    auto &playlists = rd->startup->session.playlists;
+    auto playlist = std::find_if(playlists.begin(), playlists.end(), [&](const auto &entry) { return entry.id == id; });
+    if (playlist == playlists.end()) return;
+    rd->playlist_art_error_id = id;
+    rd->playlist_art_error.clear();
+    if (!playlist->art_file.empty()) {
+        rd->playlist_art_job_id = id;
+        rd->playlist_art_previous_file = playlist->art_file;
+        rd->playlist_art_removing = true;
+        rd->playlist_art_job = rd->playlist_art_writer.enqueue([session = rd->startup->state_file, file = playlist->art_file] {
+            return playlist_art::ImportResult{{}, playlist_art::remove_image(session, file)};
+        });
+    } else {
+        rd->playlist_art_chooser_id = id;
+        const auto window = rd->window->raw_window;
+        std::weak_ptr<bool> lifetime = root->lifetime;
+        const bool shown = rd->playlist_art_chooser.show([root, lifetime, window, id](std::filesystem::path source) {
+            if (lifetime.expired() || !windowing::has_window(window)) return;
+            auto rd = static_cast<RootData *>(root->user_data);
+            rd->playlist_art_chooser_id.clear();
+            if (!source.empty()) {
+                auto &playlists = rd->startup->session.playlists;
+                auto playlist = std::find_if(playlists.begin(), playlists.end(), [&](const auto &entry) { return entry.id == id; });
+                if (playlist != playlists.end()) {
+                    rd->playlist_art_job_id = id;
+                    rd->playlist_art_previous_file = playlist->art_file;
+                    rd->playlist_art_removing = false;
+                    rd->playlist_art_job = rd->playlist_art_writer.enqueue([session = rd->startup->state_file, source = std::move(source)] {
+                        return playlist_art::import_image(session, source);
+                    });
+                }
+            }
+            windowing::redraw(window);
+        }, rd->playlist_art_error);
+        if (shown) poll_playlist_art_chooser(root);
+        else rd->playlist_art_chooser_id.clear();
+    }
+    windowing::redraw(rd->window->raw_window);
+}
+
 static void delete_context_playlist(Container *root) {
     auto rd = static_cast<RootData *>(root->user_data);
     if (!rd->startup || !rd->context_whole_playlist || rd->context_playlist_id.empty()) return;
@@ -1942,6 +2110,16 @@ static void delete_context_playlist(Container *root) {
     rd->playlist_submenu = rd->playlist_scroll_dragging = false;
     cancel_playlist_track_drag(rd);
     if (rd->playlist_edit.id == id) rd->playlist_edit = {};
+    if (rd->playlist_art_chooser_id == id) {
+        rd->playlist_art_chooser.close();
+        rd->playlist_art_chooser_id.clear();
+    }
+    for (const auto &playlist : rd->startup->session.playlists)
+        if (playlist.id == id) discard_playlist_art(rd, playlist.art_file);
+    if (rd->playlist_art_error_id == id) {
+        rd->playlist_art_error_id.clear();
+        rd->playlist_art_error.clear();
+    }
     std::erase_if(rd->startup->session.playlists, [&](const auto &playlist) { return playlist.id == id; });
     if (rd->startup->session.expanded_playlist_id == id)
         rd->startup->session.expanded_playlist_id.clear();
@@ -2887,6 +3065,8 @@ static void poll_playback(Container *root) {
         finish_library_rescan(root);
         finish_playlist_metadata(root);
         auto data = static_cast<RootData *>(root->user_data);
+        data->playlist_art_chooser.poll();
+        finish_playlist_art_job(root);
         if (data->pipewire_action.valid() &&
             data->pipewire_action.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             const auto result = data->pipewire_action.get();
@@ -3202,17 +3382,19 @@ static void close_artwork_preview(Container *root) {
     if (data->preview_art)
         data->artwork->release(data->preview_art);
     data->preview_art.reset();
+    data->preview_playlist_id.clear();
     data->artwork_preview->exists = false;
     data->library->interactable = true;
     data->playback_bar->interactable = true;
     playback_changed(root);
 }
 
-static void open_artwork_preview(Container *root, const AlbumArtCache::Handle &art) {
+static void open_artwork_preview(Container *root, const AlbumArtCache::Handle &art, const std::string &playlist_id) {
     auto data = static_cast<RootData *>(root->user_data);
     if (!art || !data->artwork_preview)
         return;
     data->preview_art = data->artwork->create_preview(art);
+    data->preview_playlist_id = playlist_id;
     data->preview_bounds = {};
     data->artwork_preview->exists = true;
     data->library->interactable = false;
@@ -4008,6 +4190,8 @@ void open_window(StartupState &startup) {
     };
     windowing::redraw(window->raw_window);
     windowing::main_loop(app);
+    root_data->playlist_art_chooser.close();
+    finish_playlist_art_job(root, true);
     player->pause();
     checkpoint_session(root, true);
     delete root; // Cancels queued artwork work and joins the workers before exit.

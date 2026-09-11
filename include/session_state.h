@@ -10,6 +10,7 @@ struct PlaylistState {
     std::string id;
     std::string name;
     std::vector<std::string> tracks;
+    std::string art_file;
     bool operator==(const PlaylistState &) const = default;
 };
 

@@ -110,6 +110,19 @@ SessionState load_session(const std::filesystem::path &path) {
     }
     state.playlists = std::move(playlists);
     state.expanded_playlist_id = std::move(expanded_playlist);
+    if (!(in >> extension) || extension != "playlist-art-v1")
+        return state;
+    if (!(in >> count) || count > state.playlists.size())
+        return state;
+    std::map<std::string, std::string> artwork;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::string id, file;
+        if (!(in >> std::quoted(id) >> std::quoted(file)) || !identities.contains(id) || !artwork.emplace(id, file).second)
+            return state;
+    }
+    for (auto &playlist : state.playlists)
+        if (auto found = artwork.find(playlist.id); found != artwork.end())
+            playlist.art_file = std::move(found->second);
     return state;
 }
 
@@ -140,6 +153,11 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
         for (const auto &track : playlist.tracks)
             out << std::quoted(track) << '\n';
     }
+    out << "playlist-art-v1\n" << std::count_if(state.playlists.begin(), state.playlists.end(),
+        [](const auto &playlist) { return !playlist.art_file.empty(); }) << '\n';
+    for (const auto &playlist : state.playlists)
+        if (!playlist.art_file.empty())
+            out << std::quoted(playlist.id) << ' ' << std::quoted(playlist.art_file) << '\n';
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)

@@ -23,6 +23,11 @@ Pixbuf load_image(const fs::path &path, int pixels = 0) {
         : gdk_pixbuf_new_from_file(path.c_str(), nullptr), g_object_unref);
 }
 
+Pixbuf load_custom_image(const fs::path &path, int pixels = 0) {
+    auto image = load_image(path, pixels);
+    return Pixbuf(image ? gdk_pixbuf_apply_embedded_orientation(image.get()) : nullptr, g_object_unref);
+}
+
 Pixbuf decode(const std::vector<unsigned char> &bytes) {
     auto loader = gdk_pixbuf_loader_new();
     const bool written = gdk_pixbuf_loader_write(loader, bytes.data(), bytes.size(), nullptr);
@@ -164,6 +169,7 @@ std::string fingerprint(const std::vector<std::string> &tracks, const std::vecto
 struct AlbumArtCache::Entry {
     std::vector<std::string> tracks;
     bool collage = false;
+    fs::path image_file;
     fs::path directory; // published by preview_ready's release store
     std::atomic<bool> requested{false};
     std::atomic<bool> preview_ready{false};
@@ -180,6 +186,7 @@ struct AlbumArtCache::Impl {
     // even after cards or the full-size preview drop their handles.
     std::map<std::vector<std::string>, Handle> entries;
     std::map<std::vector<std::string>, Handle> collages;
+    std::map<fs::path, Handle> files;
     std::atomic<bool> stopping{false};
     std::atomic<bool> changed{false};
     std::atomic<unsigned> jobs{0};
@@ -223,6 +230,8 @@ struct AlbumArtCache::Impl {
     // Prefer embedded artwork; preserve its exact bytes as well as a lossless,
     // full-resolution decoded PNG. Folder artwork is the fallback.
     Pixbuf source(const Handle &entry, const std::vector<fs::path> &sidecars) {
+        if (!entry->image_file.empty())
+            return load_custom_image(entry->image_file);
         auto image = load_image(entry->directory / "full.png");
         if (image)
             return image;
@@ -293,12 +302,12 @@ struct AlbumArtCache::Impl {
             }
             publish_detail(entry, image.get(), entry->desired_pixels.load());
             // Publish before compression / disk writes so the first view is ready sooner.
-            if (!stopping) {
+            if (!stopping && entry->image_file.empty()) {
                 if (preview)
                     save_png(preview.get(), entry->directory / "tiny-24.png");
                 save_png(image.get(), entry->directory / "full.png");
             }
-        } else if (!stopping) {
+        } else if (!stopping && entry->image_file.empty()) {
             save_bytes({}, entry->directory / "missing");
         }
         entry->preview_ready = true;
@@ -314,10 +323,11 @@ struct AlbumArtCache::Impl {
         submit(detail_pool, [this, entry] {
             const int pixels = entry->desired_pixels;
             if (pixels != 0) {
-                auto image = load_image(entry->directory / "full.png", pixels);
+                auto image = entry->image_file.empty() ? load_image(entry->directory / "full.png", pixels)
+                                                       : load_custom_image(entry->image_file, pixels);
                 if (!image) {
                     image = source(entry, covers(entry->tracks));
-                    if (image && !stopping)
+                    if (image && !stopping && entry->image_file.empty())
                         save_png(image.get(), entry->directory / "full.png");
                 }
                 if (image)
@@ -332,6 +342,10 @@ struct AlbumArtCache::Impl {
     }
 
     void preview(const Handle &entry) {
+        if (!entry->image_file.empty()) {
+            submit(detail_pool, [this, entry] { build(entry, {}); });
+            return;
+        }
         submit(preview_pool, [this, entry] {
             const auto sidecars = covers(entry->tracks);
             entry->directory = directory / ((entry->collage ? "collage-v1-" : "") + fingerprint(entry->tracks, sidecars));
@@ -388,6 +402,19 @@ AlbumArtCache::Handle AlbumArtCache::create_preview(const Handle &source) {
     auto entry = clone(source);
     request(entry, -1);
     return entry;
+}
+
+AlbumArtCache::Handle AlbumArtCache::create_file(const fs::path &path) {
+    if (auto found = impl_->files.find(path); found != impl_->files.end())
+        return found->second;
+    auto entry = std::make_shared<Entry>();
+    entry->image_file = path;
+    impl_->files.emplace(path, entry);
+    return entry;
+}
+
+void AlbumArtCache::forget_file(const fs::path &path) {
+    impl_->files.erase(path);
 }
 
 AlbumArtCache::Handle AlbumArtCache::clone(const Handle &source) {
