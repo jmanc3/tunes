@@ -23,7 +23,8 @@ public:
     // If the current item is unchanged, playback is not interrupted.
     void queue_changed();
 
-    // Starts playback or resumes after pause().
+    // Starts playback or resumes after pause(). Format conversion is asynchronous;
+    // true means accepted. Call poll_conversion() regularly to finish preparation.
     bool start();
 
     // Smoothly fades out and pauses at the current position.
@@ -49,7 +50,7 @@ public:
     // Returns 0 when there is no current song or its length is unknown.
     float seek_position() const;
 
-    // Immediately jumps to an existing queue item and starts it.
+    // Jumps to a queue item as soon as it is ready; other conversions continue in the background.
     bool play_queued_item(std::size_t index);
 
     // Loads a listening session without ever starting the audio device.
@@ -72,6 +73,17 @@ public:
     // single.flac starts immediately, then album_2 follows normally.
     bool play_track(const std::string& path);
 
+    struct ConversionProgress {
+        bool active = false;
+        std::string path;
+        std::string error;
+        std::size_t track = 0, total = 0;
+        double seconds = 0;
+    };
+    ConversionProgress conversion_progress() const;
+    // Called on the UI thread to apply completed background preparation.
+    bool poll_conversion();
+
     // Linear gain: 0.0 = silent, 1.0 = normal.
     void set_volume(float volume) noexcept;
     float volume() const noexcept;
@@ -91,6 +103,11 @@ public:
 
 private:
     struct Impl;
+    struct Conversion;
+    bool prepare_conversion(int action, std::size_t index = 0, double seconds = 0);
+    void launch_conversions();
+    void sync_conversion_queue();
+    std::unique_ptr<Conversion> conversion_;
 
     std::vector<std::string> queue_;
     std::unique_ptr<Impl> impl_;

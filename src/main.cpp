@@ -8,6 +8,7 @@
 #include "client/windowing.h"
 #include "utility.h"
 #include "audio_data.h"
+#include "audio_conversion.h"
 #include "album_art.h"
 #include "drawing/cached_shadow.h"
 #include "session_state.h"
@@ -1992,6 +1993,27 @@ static void poll_playback(Container *root) {
     windowing::timer(data->app, player->is_playing() ? 50 : 200, [root, lifetime, window](void *) {
         if (lifetime.expired() || !windowing::has_window(window))
             return;
+        const bool conversion_finished = player->poll_conversion();
+        if (conversion_finished) {
+            auto rd = static_cast<RootData *>(root->user_data);
+            for (auto card : rd->library->children) {
+                // The expanded panel is also a library child, but has no AlbumData.
+                if (card == rd->album_panel || !card->user_data) continue;
+                auto album = static_cast<AlbumData *>(card->user_data);
+                for (auto &song : album->album.songs) {
+                    const auto converted = preferred_audio_path(song.full);
+                    if (converted != song.full) {
+                        if (auto it = rd->tracks.find(song.full); it != rd->tracks.end()) {
+                            auto display = it->second;
+                            rd->tracks[converted] = std::move(display);
+                        }
+                        song.full = converted;
+                    }
+                }
+            }
+        }
+        const auto conversion = player->conversion_progress();
+        if (conversion_finished || conversion.active) windowing::redraw(window);
         finish_library_rescan(root);
         auto data = static_cast<RootData *>(root->user_data);
         if (data->pipewire_action.valid() &&
@@ -2895,6 +2917,50 @@ static void fill_root(Container *root) {
 
     auto albums = to_albums(playable);
 
+    root->after_paint = [](Container *root, Container *) {
+        const auto progress = player->conversion_progress();
+        if (!progress.active && progress.error.empty()) return;
+        auto rd = static_cast<RootData *>(root->user_data);
+        const double dpi = rd->dpi;
+        auto cr = rd->window->raw_window->drawing_context;
+        const double width = std::min(360 * dpi, std::max(0.0, root->real_bounds.w - 24 * dpi));
+        Bounds b(root->real_bounds.right() - width - 12 * dpi, 12 * dpi, width, 110 * dpi);
+        cr->save();
+        rounded_rectangle(cr, b, 10 * dpi);
+        cr->set_color(RGBA(.1, .16, .2, .97)); cr->fill();
+        auto text = [&](double y, const std::string &value, int size) {
+            draw_text(cr, b.x + 14 * dpi, b.y + y * dpi, value, size * dpi, true,
+                      mylar_font, b.w - 28 * dpi, -1, RGBA(1, 1, 1, 1), false, 0);
+        };
+        text(12, progress.active ? "Converting audio to FLAC" : "Conversion failed", 13);
+        if (progress.active) {
+            text(37, std::filesystem::path(progress.path).filename().string(), 11);
+        } else {
+            std::size_t start = 0;
+            double y = 37;
+            do {
+                const auto end = progress.error.find('\n', start);
+                text(y, progress.error.substr(start, end - start), 11);
+                if (end == std::string::npos) break;
+                start = end + 1;
+                y += 20;
+            } while (start < progress.error.size());
+        }
+        double duration = 0;
+        if (auto it = rd->tracks.find(progress.path); it != rd->tracks.end()) {
+            try { duration = std::stod(it->second.length); } catch (...) {}
+        }
+        const double fraction = duration > 0 ? std::clamp(progress.seconds / duration, 0.0, 1.0) : 0;
+        if (progress.active) {
+            text(61, "Track " + std::to_string(progress.track) + " / " + std::to_string(progress.total) +
+                "  ·  " + (duration > 0 ? std::to_string(static_cast<int>(fraction * 100)) + "%" :
+                std::to_string(static_cast<int>(progress.seconds)) + " seconds converted"), 11);
+            const double overall = progress.total ? (std::max(1ul, progress.track) - 1 + fraction) / progress.total : 0;
+            cr->rectangle(b.x + 14 * dpi, b.y + 91 * dpi, (b.w - 28 * dpi) * overall, 4 * dpi);
+            cr->set_color(RGBA(.4, .8, .95, 1)); cr->fill();
+        }
+        cr->restore();
+    };
     root->type = ::fullycustom;
     auto library = root->child(FILL_SPACE, FILL_SPACE);
     root_data->library = library;

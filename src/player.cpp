@@ -1,4 +1,8 @@
 #include "player.h"
+#include "audio_conversion.h"
+#include <future>
+#include <optional>
+#include <unordered_set>
 
 #include <algorithm>
 #include <atomic>
@@ -361,6 +365,12 @@ struct Player::Impl {
                 continue;
             }
 
+            // The buffered tail also needs output space. Drain any excess on the
+            // next callback instead of writing beyond this callback's buffer.
+            const ma_uint64 available = count - total;
+            const ma_uint64 overflow = tail_count + read > available
+                ? tail_count + read - available : 0;
+
             if (next_decoder) {
                 const ma_uint64 fade = std::min({
                     fade_frames,
@@ -372,12 +382,14 @@ struct Player::Impl {
                     out + total * channels,
                     scratch.data(),
                     read,
-                    fade
+                    std::max(fade, overflow)
                 );
 
                 total += emitted;
                 current_time_frames += emitted;
 
+                if (tail_count > fade)
+                    continue;
                 if (fade != 0)
                     begin_crossfade();
                 else
@@ -387,12 +399,13 @@ struct Player::Impl {
                     out + total * channels,
                     scratch.data(),
                     read,
-                    0
+                    overflow
                 );
 
                 total += emitted;
                 current_time_frames += emitted;
-                mode = mode_type::done;
+                if (tail_count == 0)
+                    mode = mode_type::done;
             }
         }
 
@@ -582,6 +595,7 @@ struct Player::Impl {
 
     bool load_first_playable_locked() {
         for (std::size_t i = 0; i < live_queue.size(); ++i) {
+            if (pending_conversions.contains(live_queue[i])) return false;
             if (load_current_locked(live_queue[i], i, 0)) {
                 clear_error_locked();
                 return true;
@@ -621,8 +635,11 @@ struct Player::Impl {
                 base_index = current_index;
 
                 if (current_index != no_index) {
-                    for (std::size_t i = current_index + 1; i < live_queue.size(); ++i)
+                    for (std::size_t i = current_index + 1; i < live_queue.size(); ++i) {
+                        // Preserve album order when the next track is still converting.
+                        if (pending_conversions.contains(live_queue[i])) break;
                         candidates.emplace_back(i, live_queue[i]);
+                    }
                 }
             }
 
@@ -1060,6 +1077,7 @@ struct Player::Impl {
     bool quitting = false;
 
     std::vector<std::string> live_queue;
+    std::unordered_set<std::string> pending_conversions;
 
     std::unique_ptr<decoder_handle> current_decoder;
     std::unique_ptr<decoder_handle> next_decoder;
@@ -1103,6 +1121,24 @@ struct Player::Impl {
 };
 
 
+struct Player::Conversion {
+    struct Job {
+        std::string path;
+        std::future<AudioConversionResult> result;
+        std::optional<AudioConversionResult> outcome;
+        std::atomic<double> seconds{0};
+        bool finished = false;
+        std::string error;
+    };
+    // Only the UI thread edits jobs and the requested playback action.
+    std::vector<std::shared_ptr<Job>> jobs;
+    std::string requested_path;
+    int action = 0; // none, start, select, restore, restore and start
+    std::size_t index = 0;
+    double seconds = 0;
+    std::string error;
+};
+
 Player::Player(double crossfade_ms)
     : impl_(std::make_unique<Impl>(std::max(0.0, crossfade_ms))) {
 }
@@ -1141,10 +1177,207 @@ bool Player::set_sample_rate(unsigned rate) {
         return false;
     }
     impl_.swap(candidate);
+    sync_conversion_queue();
     return true;
 }
 
-Player::~Player() = default;
+void Player::sync_conversion_queue() {
+    std::lock_guard lock(impl_->mutex);
+    impl_->pending_conversions.clear();
+    if (conversion_) {
+        for (const auto &job : conversion_->jobs)
+            if (!job->finished) impl_->pending_conversions.insert(job->path);
+    }
+}
+
+bool Player::prepare_conversion(int action, std::size_t index, double seconds) {
+    if (!conversion_) conversion_ = std::make_unique<Conversion>();
+    auto &c = *conversion_;
+    c.error.clear();
+    if (std::all_of(c.jobs.begin(), c.jobs.end(), [](const auto &job) { return job->finished; }))
+        c.jobs.clear();
+
+    if (action == 1 && c.action != 0) {
+        // Resume a pending selection/restoration at its requested position.
+        action = c.action == 3 ? 4 : c.action;
+        index = c.index;
+        seconds = c.seconds;
+    } else if (action == 1) {
+        index = current_index();
+        if (index >= queue_.size()) index = 0;
+    }
+    if (index >= queue_.size()) index = 0;
+    for (auto &path : queue_) {
+        path = preferred_audio_path(path);
+        const auto existing = std::find_if(c.jobs.begin(), c.jobs.end(),
+            [&](const auto &job) { return job->path == path; });
+        if (existing != c.jobs.end() || !needs_audio_conversion(path)) continue;
+        auto job = std::make_shared<Conversion::Job>();
+        job->path = path;
+        c.jobs.push_back(std::move(job));
+    }
+
+    if (action != 0) {
+        // Prepare the newly selected album in playback order before older queued work.
+        // Running jobs keep their objects and continue uninterrupted.
+        std::vector<std::shared_ptr<Conversion::Job>> ordered;
+        ordered.reserve(c.jobs.size());
+        for (std::size_t offset = 0; offset < queue_.size(); ++offset) {
+            const auto &path = queue_[(index + offset) % queue_.size()];
+            const auto job = std::find_if(c.jobs.begin(), c.jobs.end(),
+                [&](const auto &entry) { return entry->path == path; });
+            if (job != c.jobs.end() && std::find(ordered.begin(), ordered.end(), *job) == ordered.end()) {
+                if ((*job)->finished && !(*job)->error.empty()) {
+                    (*job)->finished = false;
+                    (*job)->error.clear();
+                    (*job)->seconds.store(0);
+                }
+                ordered.push_back(*job);
+            }
+        }
+        for (const auto &job : c.jobs)
+            if (std::find(ordered.begin(), ordered.end(), job) == ordered.end()) ordered.push_back(job);
+        c.jobs = std::move(ordered);
+    }
+
+    bool waiting = false;
+    if (action != 0) {
+        c.action = 0;
+        c.requested_path.clear();
+        if (!queue_.empty()) {
+            const auto selected = std::find_if(c.jobs.begin(), c.jobs.end(), [&](const auto &job) {
+                return job->path == queue_[index] && !job->finished;
+            });
+            if (selected != c.jobs.end()) {
+                c.action = action;
+                c.index = index;
+                c.seconds = seconds;
+                c.requested_path = queue_[index];
+                // A newly selected track goes ahead of queued background work.
+                std::rotate(c.jobs.begin(), selected, selected + 1);
+                waiting = true;
+            }
+        }
+    } else if (c.action != 0) {
+        // Queue edits retain a pending selection only while it is still present.
+        if (c.index >= queue_.size() || queue_[c.index] != c.requested_path) {
+            const auto it = std::find(queue_.begin(), queue_.end(), c.requested_path);
+            if (it == queue_.end()) c.action = 0;
+            else c.index = static_cast<std::size_t>(it - queue_.begin());
+        }
+        waiting = c.action != 0;
+    }
+    sync_conversion_queue();
+    launch_conversions();
+    return waiting;
+}
+
+void Player::launch_conversions() {
+    if (!conversion_) return;
+    auto &c = *conversion_;
+    std::size_t running = 0;
+    for (const auto &job : c.jobs) if (job->result.valid()) ++running;
+    for (const auto &job : c.jobs) {
+        // Keep a slot available for a newly selected album while background work continues.
+        if (running >= (c.action != 0 ? 2u : 1u)) break;
+        if (job->finished || job->result.valid() || job->outcome) continue;
+        try {
+            job->result = std::async(std::launch::async, [job = job.get()] {
+                return convert_to_flac(job->path, [job](double elapsed) { job->seconds.store(elapsed); });
+            });
+            ++running;
+        } catch (...) {
+            // Optional background work must not disrupt playback if a thread cannot start.
+            job->outcome = AudioConversionResult{{}, "Automatic conversion is temporarily unavailable."};
+        }
+    }
+}
+
+Player::ConversionProgress Player::conversion_progress() const {
+    ConversionProgress progress;
+    if (!conversion_) return progress;
+    const auto &c = *conversion_;
+    progress.error = c.error;
+    progress.total = c.jobs.size();
+    std::shared_ptr<Conversion::Job> displayed;
+    for (const auto &job : c.jobs) {
+        if (job->finished) ++progress.track;
+        else {
+            progress.active = true;
+            if (job->result.valid() && (!displayed || job->path == c.requested_path)) displayed = job;
+        }
+    }
+    if (progress.active) ++progress.track;
+    if (displayed) {
+        progress.path = displayed->path;
+        progress.seconds = displayed->seconds.load();
+    }
+    return progress;
+}
+
+bool Player::poll_conversion() {
+    if (!conversion_) return false;
+    auto &c = *conversion_;
+    bool completed = false, queue_updated = false, selected_ready = false, selected_failed = false;
+    for (const auto &job : c.jobs) {
+        if (!job->outcome && (!job->result.valid() ||
+            job->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready)) continue;
+        completed = true;
+        job->finished = true;
+        AudioConversionResult result;
+        if (job->outcome) {
+            result = std::move(*job->outcome);
+            job->outcome.reset();
+        } else {
+            // Contain unexpected worker failures too; ordinary conversion failures
+            // arrive as status values and never use exceptions for control flow.
+            try { result = job->result.get(); }
+            catch (...) { result.error = "Automatic conversion could not finish."; }
+        }
+        if (result) {
+            const auto &path = result.path;
+            for (auto &queued : queue_) {
+                if (queued == job->path) { queued = path; queue_updated = true; }
+            }
+            if (c.action != 0 && c.requested_path == job->path) {
+                selected_ready = c.index < queue_.size() && queue_[c.index] == path;
+                if (!selected_ready) c.action = 0;
+            }
+        } else {
+            job->error = c.error = result.error;
+            if (std::find(queue_.begin(), queue_.end(), job->path) != queue_.end()) {
+                impl_->set_error(c.error);
+                queue_updated = true;
+            }
+            if (c.action != 0 && c.requested_path == job->path) {
+                selected_failed = true;
+                c.action = 0;
+            }
+        }
+    }
+    if (completed) sync_conversion_queue();
+    if (selected_ready) {
+        const auto action = std::exchange(c.action, 0);
+        bool ok;
+        if (action == 3 || action == 4) {
+            ok = impl_->restore_session(queue_, c.index, c.seconds);
+            if (ok && action == 4) ok = impl_->start(queue_);
+        } else ok = impl_->play_queue_index(queue_, c.index);
+        if (!ok) c.error = impl_->get_last_error();
+    } else if (completed && c.action == 0 && !selected_failed && queue_updated) {
+        // Updating future paths preserves the current decoder and playback position.
+        impl_->queue_changed(queue_);
+    }
+    launch_conversions();
+    return completed;
+}
+
+Player::~Player() {
+    if (conversion_) {
+        for (const auto &job : conversion_->jobs)
+            if (job->result.valid()) job->result.wait();
+    }
+}
 
 std::vector<std::string>& Player::queue() noexcept {
     return queue_;
@@ -1155,18 +1388,21 @@ const std::vector<std::string>& Player::queue() const noexcept {
 }
 
 void Player::queue_changed() {
-    impl_->queue_changed(queue_);
+    if (!prepare_conversion(0)) impl_->queue_changed(queue_);
 }
 
 bool Player::start() {
+    if (prepare_conversion(1)) return true;
     return impl_->start(queue_);
 }
 
 void Player::pause() {
+    if (conversion_ && conversion_->action != 0) conversion_->action = 3;
     impl_->pause();
 }
 
 void Player::stop() {
+    if (conversion_) conversion_->action = 0;
     impl_->stop();
 }
 
@@ -1191,11 +1427,14 @@ float Player::seek_position() const {
 }
 
 bool Player::play_queued_item(std::size_t index) {
+    if (index >= queue_.size()) return false;
+    if (prepare_conversion(2, index)) return true;
     return impl_->play_queue_index(queue_, index);
 }
 
 bool Player::restore_session(std::vector<std::string> tracks, std::size_t index, double seconds) {
     queue_ = std::move(tracks);
+    if (prepare_conversion(3, index, seconds)) return true;
     return impl_->restore_session(queue_, index, seconds);
 }
 

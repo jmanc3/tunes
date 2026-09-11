@@ -1,3 +1,4 @@
+#include "audio_conversion.h"
 #include "tunes_paths.h"
 #include "audio_data.h"
 #include <glib.h>
@@ -338,6 +339,7 @@ static void cache_creation_thread(std::string cache_path, std::string path_to_se
     for (const auto& entry : fs::recursive_directory_iterator(path_to_search, fs::directory_options::skip_permission_denied)) {
         if (fs::is_regular_file(entry.path())) {
             std::string full_path = entry.path().string();
+            if (full_path.find(".flac.tmp-") != std::string::npos) continue;
 
             results.emplace_back(pool.enqueue([full_path] { return read_track(full_path); }));
         }
@@ -619,6 +621,14 @@ bool extract_album_art(const std::string& filePath, const std::string& outputBas
 }
 
 std::vector<AlbumOption> to_albums(std::vector<Option> &playable) {
+    // Cached scans may predate conversion. Resolve companions before grouping.
+    std::unordered_map<std::string, bool> seen;
+    std::vector<Option> preferred;
+    for (auto option : playable) {
+        option.full = preferred_audio_path(option.full);
+        if (seen.emplace(option.full, true).second) preferred.push_back(std::move(option));
+    }
+    playable = std::move(preferred);
     struct DiscFolders {
         std::unordered_map<int, std::string> disc_owners;
         std::string first_folder;
