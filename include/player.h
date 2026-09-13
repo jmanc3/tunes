@@ -84,7 +84,8 @@ public:
     // Called on the UI thread to apply completed background preparation.
     bool poll_conversion();
 
-    // Linear gain: 0.0 = silent, 1.0 = normal.
+    // Normalized user volume: 0.0 = silent, 1.0 = normal. The audio gain is
+    // mapped logarithmically so quiet levels have more slider range.
     void set_volume(float volume) noexcept;
     float volume() const noexcept;
 

@@ -29,6 +29,19 @@ constexpr ma_uint32 channels = 2;
 constexpr ma_uint64 max_chunk = 4096;
 
 constexpr double transport_fade_ms = 5.0;
+// The UI value is normalized, while perceived loudness follows a logarithmic
+// scale. Keep a useful amount of control near silence without changing the
+// value persisted by the UI.
+constexpr float minimum_volume_db = -60.0f;
+
+float volume_to_gain(float volume) noexcept {
+    if (volume <= 0.0f)
+        return 0.0f;
+
+    return ma_volume_db_to_linear(
+        minimum_volume_db + volume * -minimum_volume_db
+    );
+}
 
 constexpr std::size_t no_index = std::numeric_limits<std::size_t>::max();
 
@@ -247,7 +260,9 @@ struct Player::Impl {
     }
 
     void apply_output_gain(float* out, ma_uint32 frame_count) {
-        const float volume_gain = volume.load(std::memory_order_relaxed);
+        const float volume_gain = volume_to_gain(
+            volume.load(std::memory_order_relaxed)
+        );
 
         for (ma_uint32 frame = 0; frame < frame_count; ++frame) {
             float transport_gain = transport_gain_current;
