@@ -1436,12 +1436,12 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 cr->fill();
                 const double pointer_x = card->real_bounds.x + card->real_bounds.w / 2;
                 const double pointer_reveal = std::clamp(visible_gap / (16 * dpi), 0.0, 1.0);
-                // Fade the fixed-size triangle without changing its corners or tip position.
-                cr->move_to(pointer_x - pointer_half_width, b.y);
-                cr->line_to(pointer_x, b.y - pointer_height);
-                cr->line_to(pointer_x + pointer_half_width, b.y);
+                // Reveal and retract the pointer from the panel edge, keeping its proportions.
+                cr->move_to(pointer_x - pointer_half_width * pointer_reveal, b.y);
+                cr->line_to(pointer_x, b.y - pointer_height * pointer_reveal);
+                cr->line_to(pointer_x + pointer_half_width * pointer_reveal, b.y);
                 cr->close_path();
-                set_argb(cr, with_alpha(background, background.a * pointer_reveal));
+                set_argb(cr, background);
                 cr->fill();
                 draw_text(cr, b.x + 16 * dpi, b.y + 16 * dpi, "×", 22 * dpi, true,
                           mylar_font, 28 * dpi, -1, foreground, false);
@@ -1737,6 +1737,12 @@ static void open_album(Container *root, Container *card, bool animate = true) {
         rd->outgoing_album = nullptr;
         return;
     }
+    const auto viewport = rd->library->real_bounds;
+    const auto card_bounds = card->real_bounds;
+    const bool fully_visible = !card_bounds.empty() &&
+        card_bounds.x >= viewport.x && card_bounds.y >= viewport.y &&
+        card_bounds.right() <= viewport.right() && card_bounds.bottom() <= viewport.bottom();
+    bool closing_above = false;
     if (rd->expanded_album != card) {
         const auto &cards = rd->library->children;
         const auto index = std::distance(cards.begin(), std::find(cards.begin(), cards.end(), card));
@@ -1758,13 +1764,21 @@ static void open_album(Container *root, Container *card, bool animate = true) {
             rd->album_transition_from_gap = (closing->occupied_height - closing->visible_height) / rd->dpi;
             rd->closing_albums.erase(closing);
         }
+        // Include panels already closing when the user switches albums rapidly.
+        closing_above = std::any_of(rd->closing_albums.begin(), rd->closing_albums.end(), [&](const auto &entry) {
+            const auto closing_index = std::distance(cards.begin(), std::find(cards.begin(), cards.end(), entry.card));
+            return closing_index / rd->album_columns < index / rd->album_columns;
+        });
         rd->album_reveal_start = std::chrono::steady_clock::now();
         rd->album_reveal = 0;
     }
     rd->expanded_album = card;
-    // Interpolate the selected card's screen position, compensating for changing panels above it.
-    rd->album_scroll_from = (card->real_bounds.y - rd->library->real_bounds.y) / rd->dpi;
-    rd->album_scroll_start = std::chrono::steady_clock::now();
+    rd->album_scroll_start.reset();
+    if (!fully_visible || closing_above) {
+        // Interpolate the card's screen position, compensating for closing panels above it.
+        rd->album_scroll_from = (card_bounds.y - viewport.y) / rd->dpi;
+        rd->album_scroll_start = std::chrono::steady_clock::now();
+    }
     layout(root, root, root->real_bounds);
     windowing::redraw(rd->window->raw_window);
 }
