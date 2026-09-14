@@ -1385,7 +1385,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
         rd->album_panel->when_paint = [](Container *root, Container *c) {
             auto rd = static_cast<RootData *>(root->user_data);
             auto cr = rd->window->raw_window->drawing_context;
-            auto draw_panel = [&](Container *card, Bounds b, double visible_height, double visible_gap) {
+            auto draw_panel = [&](Container *card, Bounds b, double visible_height) {
                 auto album = static_cast<AlbumData *>(card->user_data);
                 const double dpi = rd->dpi;
                 // These rows are painted directly rather than child widgets.
@@ -1426,21 +1426,9 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 draw_edge_shadow(b.y, true);
                 draw_edge_shadow(panel_bottom, false);
                 // Reveal the final layout without moving or scaling its contents.
-                // A low, wide pointer beneath the album title.
-                const double pointer_half_width = 24 * dpi;
-                const double pointer_height = 24 * dpi;
-                set_rect(cr, Bounds(b.x, b.y - pointer_height, b.w, pointer_height + visible_height));
+                set_rect(cr, Bounds(b.x, b.y, b.w, visible_height));
                 cr->clip();
                 set_rect(cr, b);
-                set_argb(cr, background);
-                cr->fill();
-                const double pointer_x = card->real_bounds.x + card->real_bounds.w / 2;
-                const double pointer_reveal = std::clamp(visible_gap / (16 * dpi), 0.0, 1.0);
-                // Reveal and retract the pointer from the panel edge, keeping its proportions.
-                cr->move_to(pointer_x - pointer_half_width * pointer_reveal, b.y);
-                cr->line_to(pointer_x, b.y - pointer_height * pointer_reveal);
-                cr->line_to(pointer_x + pointer_half_width * pointer_reveal, b.y);
-                cr->close_path();
                 set_argb(cr, background);
                 cr->fill();
                 draw_text(cr, b.x + 16 * dpi, b.y + 16 * dpi, "×", 22 * dpi, true,
@@ -1595,8 +1583,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 cr->restore();
             };
             for (const auto &closing : rd->closing_albums)
-                draw_panel(closing.card, closing.bounds, closing.visible_height,
-                           closing.occupied_height - closing.visible_height);
+                draw_panel(closing.card, closing.bounds, closing.visible_height);
             if (!rd->expanded_album)
                 return;
             if (rd->outgoing_album) {
@@ -1606,7 +1593,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                     cr->push_group();
                     auto bounds = c->real_bounds;
                     bounds.h = height;
-                    draw_panel(card, bounds, rd->album_visible_height, rd->album_visible_gap);
+                    draw_panel(card, bounds, rd->album_visible_height);
                     cr->pop_group_to_source();
                     cr->set_operator(drawing::Composite::Add);
                     cr->paint_source(opacity);
@@ -1617,7 +1604,7 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 cr->pop_group_to_source();
                 cr->paint_source();
             } else {
-                draw_panel(rd->expanded_album, c->real_bounds, rd->album_visible_height, rd->album_visible_gap);
+                draw_panel(rd->expanded_album, c->real_bounds, rd->album_visible_height);
             }
         };
         rd->album_panel->when_clicked = [](Container *root, Container *c) {
@@ -2565,6 +2552,29 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         }
         if (data->album_panel && (data->album_panel->exists || !data->closing_albums.empty()))
             data->album_panel->when_paint(root, data->album_panel);
+        // Pointers animate with their cards, outside the tracklist crossfade.
+        // Keep every retracting pointer when switching rapidly within a row.
+        cr->save();
+        set_rect(cr, c->real_bounds);
+        cr->clip();
+        for (auto i = data->album_first; i < data->album_end; ++i) {
+            const auto card = c->children[i];
+            const auto album = static_cast<AlbumData *>(card->user_data);
+            const double reveal = album->selection_amount(data->artwork_frame_time);
+            if (reveal <= 0) continue;
+            update_album_colors(album, data->artwork->image(album->art));
+            const double x = card->real_bounds.x + card->real_bounds.w / 2;
+            const double y = card->real_bounds.bottom() + 16 * data->dpi;
+            const double half_width = 24 * data->dpi * reveal;
+            const double height = 24 * data->dpi * reveal;
+            cr->move_to(x - half_width, y);
+            cr->line_to(x, y - height);
+            cr->line_to(x + half_width, y);
+            cr->close_path();
+            set_argb(cr, album->background_color);
+            cr->fill();
+        }
+        cr->restore();
         if (data->library_scroll_max + c->scroll_v_real > .5 * data->dpi) {
             const auto &b = c->real_bounds;
             cr->save();
