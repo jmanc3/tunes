@@ -321,6 +321,7 @@ struct RootData : UserData {
     drawing::CachedShadow settings_shadow;
     Container *library_scrollbar = nullptr;
     double library_scroll_max = 0;
+    Bounds library_layout_bounds;
     double scrollbar_grab = 0;
     bool scrollbar_dragging = false;
     std::chrono::steady_clock::time_point scrollbar_activity{};
@@ -457,6 +458,22 @@ struct AlbumData : UserData {
     std::string artist;
     AlbumArtCache::Handle art;
     std::optional<std::chrono::steady_clock::time_point> detail_fade;
+    double selection_from = 0;
+    double selection_target = 0;
+    std::optional<std::chrono::steady_clock::time_point> selection_start;
+
+    double selection_amount(std::chrono::steady_clock::time_point now) const {
+        if (!selection_start) return selection_target;
+        const double t = std::clamp(std::chrono::duration<double, std::milli>(now - *selection_start).count() / 320.0, 0.0, 1.0);
+        return selection_from + (selection_target - selection_from) * t * t * (3 - 2 * t);
+    }
+
+    void select(bool selected, bool animate = true) {
+        const auto now = std::chrono::steady_clock::now();
+        selection_from = selection_amount(now);
+        selection_target = selected ? 1 : 0;
+        selection_start = animate ? std::optional(now) : std::nullopt;
+    }
 };
 
 // Grid cards and the playback cover use the same preview and crossfade path.
@@ -1288,6 +1305,8 @@ static void close_album(Container *root) {
     cancel_playlist_track_drag(rd);
     // Keep the event target alive until the current event dispatch completes.
     retain_closing_album(rd);
+    if (rd->expanded_album)
+        static_cast<AlbumData *>(rd->expanded_album->user_data)->select(false);
     rd->expanded_album = nullptr;
     rd->outgoing_album = nullptr;
     rd->album_scroll_start.reset();
@@ -1407,18 +1426,22 @@ static void open_album(Container *root, Container *card, bool animate = true) {
                 draw_edge_shadow(b.y, true);
                 draw_edge_shadow(panel_bottom, false);
                 // Reveal the final layout without moving or scaling its contents.
-                set_rect(cr, Bounds(b.x, b.y - 12 * dpi, b.w, 12 * dpi + visible_height));
+                // A low, wide pointer beneath the album title.
+                const double pointer_half_width = 24 * dpi;
+                const double pointer_height = 24 * dpi;
+                set_rect(cr, Bounds(b.x, b.y - pointer_height, b.w, pointer_height + visible_height));
                 cr->clip();
                 set_rect(cr, b);
                 set_argb(cr, background);
                 cr->fill();
                 const double pointer_x = card->real_bounds.x + card->real_bounds.w / 2;
-                const double pointer_size = 12 * dpi * std::clamp(visible_gap / (16 * dpi), 0.0, 1.0);
-                cr->move_to(pointer_x - pointer_size, b.y);
-                cr->line_to(pointer_x, b.y - pointer_size);
-                cr->line_to(pointer_x + pointer_size, b.y);
+                const double pointer_reveal = std::clamp(visible_gap / (16 * dpi), 0.0, 1.0);
+                // Fade the fixed-size triangle without changing its corners or tip position.
+                cr->move_to(pointer_x - pointer_half_width, b.y);
+                cr->line_to(pointer_x, b.y - pointer_height);
+                cr->line_to(pointer_x + pointer_half_width, b.y);
                 cr->close_path();
-                set_argb(cr, background);
+                set_argb(cr, with_alpha(background, background.a * pointer_reveal));
                 cr->fill();
                 draw_text(cr, b.x + 16 * dpi, b.y + 16 * dpi, "×", 22 * dpi, true,
                           mylar_font, 28 * dpi, -1, foreground, false);
@@ -1703,6 +1726,9 @@ static void open_album(Container *root, Container *card, bool animate = true) {
             }
         };
     }
+    if (rd->expanded_album)
+        static_cast<AlbumData *>(rd->expanded_album->user_data)->select(false, animate);
+    static_cast<AlbumData *>(card->user_data)->select(true, animate);
     if (!animate) {
         rd->expanded_album = card;
         rd->album_reveal = 1;
@@ -1848,8 +1874,26 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         cr->save();
         set_rect(cr, c->parent->real_bounds);
         cr->clip();
+        const auto now = std::chrono::steady_clock::now();
+        const double selection = data->selection_amount(now);
+        auto rd = root_data_for(root);
+        if (data->selection_start) {
+            if (now - *data->selection_start >= std::chrono::milliseconds(320))
+                data->selection_start.reset();
+            else {
+                rd->artwork_refresh->animating = true;
+                poll_artwork(rd->artwork_refresh);
+            }
+        }
+        const double pad = 8 * dpi;
+        const double normal_size = std::max(0.0, c->real_bounds.w - 2 * pad);
+        const double size = normal_size * (1 + .08 * selection);
+        const double growth = (size - normal_size) / 2;
+        const double x = c->real_bounds.x + pad - growth;
+        const double y = c->real_bounds.y + pad - growth;
+        // Keep text at its normal font size even during the playback pulse.
+        cr->save();
         if (data->play_pulse_start) {
-            auto rd = static_cast<RootData *>(root->user_data);
             const double t = std::clamp(std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - *data->play_pulse_start).count() / 240.0, 0.0, 1.0);
             const double scale = 1 - .07 * std::pow(std::sin(M_PI * t), 2);
@@ -1865,11 +1909,6 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
                 poll_artwork(rd->artwork_refresh);
             }
         }
-        const double pad = 8 * dpi;
-        const double x = c->real_bounds.x + pad;
-        const double y = c->real_bounds.y + pad;
-        const double size = std::max(0.0, c->real_bounds.w - 2 * pad);
-        auto rd = root_data_for(root);
         rd->library_shadow.draw(*cr, {x, y, size, size}, 0, library_art_shadow, dpi, rd->library_shadow_alpha);
         cr->rectangle(x, y, size, size);
         cr->set_color(theme().placeholder);
@@ -1893,11 +1932,12 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
             cr->set_color(theme().on_accent);
             cr->fill();
         }
+        cr->restore();
         draw_text(cr, x, y + size + 8 * dpi, data->name, 12 * dpi, true,
                   mylar_font, size, 20 * dpi, theme().text_primary, true,
                   0, nullptr, dpi);
         draw_text(cr, x, y + size + 30 * dpi, data->artist, 10 * dpi, true,
-                  mylar_font, size, 18 * dpi, theme().text_muted, false,
+                  mylar_font, size, 18 * dpi, with_alpha(theme().text_muted, 1 - selection), false,
                   0, nullptr, dpi);
         cr->restore();
     };
@@ -2571,6 +2611,20 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         const double dpi = window->dpi;
         const bool restore = !data->scroll_restored ||
             (window->fractional_scale_set_once && !data->scroll_restored_at_preferred_scale);
+        const auto previous_viewport = data->library_layout_bounds;
+        std::optional<double> panel_viewport_fraction;
+        // layout() has already replaced the library bounds. Use the saved viewport
+        // and the panel's previous bounds to anchor a visible panel across reflow.
+        if (!restore && data->expanded_album && data->album_panel && previous_viewport.h > 0 && b.h > 0 &&
+            (b.w != previous_viewport.w || b.h != previous_viewport.h || dpi != data->dpi)) {
+            const auto panel = data->album_panel->real_bounds;
+            const Bounds visible_panel(panel.x, panel.y, panel.w, std::min(panel.h, data->album_visible_height));
+            if (!visible_panel.intersection(previous_viewport).empty()) {
+                panel_viewport_fraction = (panel.y - previous_viewport.y) / previous_viewport.h;
+                data->album_scroll_start.reset();
+            }
+        }
+        data->library_layout_bounds = b;
         if (restore && data->startup && !c->children.empty() && b.w > 0 && b.h > 0) {
             if (!data->scroll_restored)
                 restore_expanded_album(root, data->startup->session.expanded_album_track,
@@ -2645,6 +2699,11 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
             data->album_visible_gap = previous_gap + (gap - previous_gap) * data->album_reveal;
             panel_h = data->album_visible_height + data->album_visible_gap;
         }
+        const double row_h = card_h + gap;
+        const double panel_top = expanded_row == no_index ? 0 :
+            (expanded_row + 1) * row_h + closing_height_before(expanded_row + 1);
+        if (panel_viewport_fraction)
+            c->scroll_v_real = *panel_viewport_fraction * b.h - pad - panel_top;
         double content_h = rows ? 2 * pad + rows * card_h + (rows - 1) * gap + panel_h + closing_height_before(rows) : 0;
         if (data->expanded_album) {
             const double target = -(pad + expanded_row * (card_h + gap) + closing_height_before(expanded_row));
@@ -2669,9 +2728,6 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
         c->scroll_v_real = std::clamp(c->scroll_v_real, std::min(0.0, b.h - content_h), scroll_max);
         // Lay out the viewport plus one row on either side. Only visible cards
         // issue foreground requests; the prefetch cursor handles the rest.
-        const double row_h = card_h + gap;
-        const double panel_top = expanded_row == no_index ? 0 :
-            (expanded_row + 1) * row_h + closing_height_before(expanded_row + 1);
         auto row_top = [&](std::size_t row) {
             return row * row_h + closing_height_before(row) + (row > expanded_row ? panel_h : 0);
         };
