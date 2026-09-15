@@ -345,6 +345,39 @@ int main() try {
         }
     }
 
+    // Exercise the actual GPU layer path: rest must be exact, clicks must
+    // produce different geometry, and projected content must obey the clip.
+    const auto card_scene = [&](double hit, double push, double swing, bool mesh) {
+        gl->begin_frame();
+        gl->save();
+        gl->rectangle(35, 25, 170, 140); gl->clip();
+        gl->push_group({40, 30, 160, 130});
+        gl->set_color(RGBA(.3, .6, .9, 1));
+        gl->rectangle(40, 30, 160, 130); gl->fill();
+        gl->set_color(RGBA(1, 1, 1, 1));
+        gl->rectangle(65, 50, 20, 90); gl->fill();
+        gl->pop_group_to_source();
+        if (mesh) gl->paint_deformed_source({40, 30, 160, 130}, hit, .3, push, swing);
+        else gl->paint_source();
+        gl->restore();
+        gl->flush();
+        check(glGetError() == GL_NO_ERROR, "Deformed layer produced a GL error");
+        return read_pixels();
+    };
+    const auto resting_card = card_scene(.5, 0, 0, false);
+    check(card_scene(.5, 0, 0, true) == resting_card, "Zero deformation changed the resting layer");
+    const auto left_press = card_scene(.1, .8, .3, true);
+    const auto right_press = card_scene(.9, .8, .3, true);
+    check(left_press != resting_card && left_press != right_press,
+          "Deformation must bend the layer at the click position");
+    const auto rebound = card_scene(.1, -.2, -.2, true);
+    check(rebound != resting_card, "Spring rebound was not rendered");
+    for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+            if (x < 35 || x >= 205 || y < 25 || y >= 165)
+                check(rebound[y * width + x] == 0, "Projected layer escaped its parent clip");
+    check(card_scene(.5, 0, 0, true) == resting_card, "Deformation leaked into subsequent frames");
+
     gl->begin_frame();
     auto before = gl->stats().draw_calls;
     for (int i = 0; i < 100; ++i) {

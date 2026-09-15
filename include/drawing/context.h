@@ -71,6 +71,11 @@ public:
     }
     virtual void pop_group_to_source() = 0;
     virtual void paint_source(double alpha = 1) = 0;
+    // Project a popped group as a flexible card. Bounds are in user coordinates;
+    // hit coordinates are normalized (0..1), push is signed, swing is radians.
+    // Backends without mesh support retain the undeformed layer.
+    virtual void paint_deformed_source(Rect bounds, double hit_x, double hit_y,
+                                       double push, double swing = 0) { paint_source(); }
     // Draw at the origin in image pixels under the current transform. Clips to
     // image bounds and preserves drawing state; consumes the current path.
     virtual void draw_image(const Image &image, double alpha = 1, ImageFilter filter = ImageFilter::Bilinear) = 0;

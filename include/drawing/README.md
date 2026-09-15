@@ -83,7 +83,12 @@ not retain a reference to the caller's pixel storage. Image drawing starts at th
 origin and uses the current transform, filter, alpha, and composite operator.
 `save`/`restore` does not include paths; filling, stroking, and clipping consume
 paths. Popping a group restores the state at its push and makes the group its
-paint source.
+paint source. `paint_deformed_source(bounds, hit_x, hit_y, push, swing)` projects
+that layer through a subdivided mesh on OpenGL: the normalized hit position
+anchors a local dent, signed push controls depth/rebound, and swing rotates
+around the top edge in radians. Zero deformation uses the ordinary paint path.
+Cairo paints the undeformed source. Use bounded groups for these short-lived
+animations; idle cards require no extra render targets.
 
 Cairo owns one context and Pango layout cache per shared-memory buffer slot. Its
 mapped pixels outlive the context, and `flush()` runs before presentation. The

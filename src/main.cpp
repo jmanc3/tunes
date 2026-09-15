@@ -449,7 +449,18 @@ struct AlbumData : UserData {
     AlbumOption album;
     std::string playlist_id;
     std::string art_file;
-    std::optional<std::chrono::steady_clock::time_point> play_pulse_start;
+    std::optional<std::chrono::steady_clock::time_point> press_start;
+    double press_x = .5, press_y = .5;
+
+    void press(Container *root, Container *card, double dpi) {
+        const auto now = std::chrono::steady_clock::now();
+        const double normal = std::max(1.0, card->real_bounds.w - 16 * dpi);
+        const double size = normal * (1 + .08 * selection_amount(now));
+        const double growth = (size - normal) / 2;
+        press_x = std::clamp((root->mouse_current_x - card->real_bounds.x - 8 * dpi + growth) / size, 0.0, 1.0);
+        press_y = std::clamp((root->mouse_current_y - card->real_bounds.y - 8 * dpi + growth) / size, 0.0, 1.0);
+        press_start = now;
+    }
     std::weak_ptr<const AlbumTexture> palette_source;
     RGBA background_color = theme_colors::album_fallback;
     RGBA secondary_color = theme_colors::album_secondary;
@@ -1807,7 +1818,7 @@ static bool consume_album_double_click(Container *root) {
         rd->album_double_click_handled = true;
         auto card = rd->album_double_click_target;
         auto album = static_cast<AlbumData *>(card->user_data);
-        album->play_pulse_start = std::chrono::steady_clock::now();
+        album->press(root, card, rd->dpi);
         play_album(*album, 0);
         open_album(root, card);
         windowing::redraw(rd->window->raw_window);
@@ -1892,25 +1903,30 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         const double growth = (size - normal_size) / 2;
         const double x = c->real_bounds.x + pad - growth;
         const double y = c->real_bounds.y + pad - growth;
-        // Keep text at its normal font size even during the playback pulse.
-        cr->save();
-        if (data->play_pulse_start) {
-            const double t = std::clamp(std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - *data->play_pulse_start).count() / 240.0, 0.0, 1.0);
-            const double scale = 1 - .07 * std::pow(std::sin(M_PI * t), 2);
-            const double cx = c->real_bounds.x + c->real_bounds.w / 2;
-            const double cy = c->real_bounds.y + c->real_bounds.h / 2;
-            cr->translate(cx, cy);
-            cr->scale(scale, scale);
-            cr->translate(-cx, -cy);
-            if (t >= 1)
-                data->play_pulse_start.reset();
-            else {
+        double push = 0, label_push = 0, swing = 0;
+        if (data->press_start) {
+            const double seconds = std::chrono::duration<double>(now - *data->press_start).count();
+            if (seconds >= .9) {
+                data->press_start.reset();
+            } else {
+                // Fast inward impulse, a softer overshoot, then an exact rest.
+                const auto spring = [](double t) {
+                    if (t <= 0 || t >= .9) return 0.0;
+                    const double tail = std::pow(1 - t / .9, 2);
+                    return 2.5 * std::exp(-5 * t) * std::sin(18 * t) * tail;
+                };
+                push = spring(seconds);
+                label_push = spring(seconds - .035);
+                swing = .65 * label_push;
                 rd->artwork_refresh->animating = true;
                 poll_artwork(rd->artwork_refresh);
             }
         }
-        rd->library_shadow.draw(*cr, {x, y, size, size}, 0, library_art_shadow, dpi, rd->library_shadow_alpha);
+        rd->library_shadow.draw(*cr, {x, y, size, size}, 0, library_art_shadow, dpi,
+                                rd->library_shadow_alpha * (1 - .25 * std::max(0.0, push)));
+        const bool deform = data->press_start.has_value() && size > 0;
+        cr->save();
+        if (deform) cr->push_group({x - 2 * dpi, y - 2 * dpi, size + 4 * dpi, size + 4 * dpi});
         cr->rectangle(x, y, size, size);
         cr->set_color(theme().placeholder);
         cr->fill();
@@ -1933,13 +1949,25 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
             cr->set_color(theme().on_accent);
             cr->fill();
         }
+        if (deform) {
+            cr->pop_group_to_source();
+            cr->paint_deformed_source({x, y, size, size}, data->press_x, data->press_y, push);
+        }
         cr->restore();
+        cr->save();
+        const drawing::Rect labels{x - 2 * dpi, y + size + 4 * dpi, size + 4 * dpi, 50 * dpi};
+        if (deform) cr->push_group(labels);
         draw_text(cr, x, y + size + 8 * dpi, data->name, 12 * dpi, true,
                   mylar_font, size, 20 * dpi, theme().text_primary, true,
                   0, nullptr, dpi);
         draw_text(cr, x, y + size + 30 * dpi, data->artist, 10 * dpi, true,
                   mylar_font, size, 18 * dpi, with_alpha(theme().text_muted, 1 - selection), false,
                   0, nullptr, dpi);
+        if (deform) {
+            cr->pop_group_to_source();
+            cr->paint_deformed_source(labels, data->press_x, 0, .45 * label_push, swing);
+        }
+        cr->restore();
         cr->restore();
     };
     c->when_clicked = [](Container *root, Container *c) {
@@ -1956,6 +1984,7 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         auto album = static_cast<AlbumData *>(c->user_data);
         const double dpi = rd->dpi;
         const auto now = std::chrono::steady_clock::now();
+        album->press(root, c, dpi);
         rd->last_album_clicked = c;
         rd->last_album_click_time = now;
         rd->last_album_click_x = root->mouse_current_x;
@@ -1964,7 +1993,6 @@ static Container *add_album(Container *parent, const AlbumOption &option, AlbumA
         const double dx = root->mouse_current_x - (c->real_bounds.x + c->real_bounds.w / 2);
         const double dy = root->mouse_current_y - (c->real_bounds.y + 8 * dpi + size / 2);
         if (std::hypot(dx, dy) <= std::min(26 * dpi, size / 3)) {
-            album->play_pulse_start = now;
             play_album(*album, 0);
             open_album(root, c);
         } else if (rd->expanded_album == c) {

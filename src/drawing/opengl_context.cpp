@@ -844,6 +844,61 @@ class GLContext final : public OpenGLContext {
             bounds = intersect(bounds, state_.source->bounds);
         source_geometry(quad(bounds), std::clamp(alpha, 0.0, 1.0));
     }
+    void paint_deformed_source(Rect bounds, double hit_x, double hit_y,
+                               double push, double swing) override {
+        const auto source = state_.source;
+        if (!source || empty(bounds) || (std::abs(push) < 1e-6 && std::abs(swing) < 1e-6)) {
+            paint_source(1);
+            return;
+        }
+        if (empty(state_.clip)) return;
+        const auto a = state_.transform.apply({bounds.x, bounds.y});
+        const double w = bounds.width * state_.transform.sx;
+        const double h = bounds.height * state_.transform.sy;
+        if (w == 0 || h == 0) return;
+        hit_x = std::clamp(hit_x, 0.0, 1.0);
+        hit_y = std::clamp(hit_y, 0.0, 1.0);
+        push = std::clamp(push, -1.0, 1.0);
+        swing = std::clamp(swing, -1.0, 1.0);
+        const double span = std::max(std::abs(w), std::abs(h));
+        const double camera = span * 2.8;
+        const auto layer = source->bounds;
+        // Subdivide the texture, including its transparent border. This bends
+        // artwork and glyphs together without disturbing paths, clips or caches.
+        constexpr int columns = 32, rows = 24;
+        std::array<Vertex, (columns + 1) * (rows + 1)> mesh;
+        for (int j = 0; j <= rows; ++j) {
+            for (int i = 0; i <= columns; ++i) {
+                const double u = double(i) / columns, v = double(j) / rows;
+                const double px = layer.x + u * layer.width;
+                const double py = layer.y + v * layer.height;
+                const double nx = (px - a.x) / w, ny = (py - a.y) / h;
+                const double dx = nx - hit_x, dy = ny - hit_y;
+                const double dent = std::exp(-8.0 * (dx * dx + dy * dy));
+                const double tilt = (nx - .5) * (hit_x - .5) + (ny - .5) * (hit_y - .5);
+                double z = span * push * (.08 + .24 * dent + .24 * tilt);
+                // Labels hinge at their top edge, with a small flexible ripple.
+                const double local_y = py - a.y;
+                z += local_y * std::sin(swing);
+                const double perspective = camera / (camera + z);
+                const double cx = a.x + w / 2, cy = a.y + h / 2;
+                Point projected{cx + (px - cx) * perspective,
+                    cy + (a.y + local_y * std::cos(swing) - cy) * perspective};
+                projected.y += span * .025 * push * std::sin(pi * nx) * ny;
+                const double shade = std::clamp(1 - .12 * push * dent, .85, 1.05);
+                mesh[j * (columns + 1) + i] = vertex(projected, u, 1 - v, RGBA(shade, shade, shade, 1), 1);
+            }
+        }
+        start_batch(source->color.id, 3);
+        batch_source_ = source;
+        for (int j = 0; j < rows; ++j) {
+            for (int i = 0; i < columns; ++i) {
+                const int n = j * (columns + 1) + i;
+                for (int index : {n, n + 1, n + columns + 2, n, n + columns + 2, n + columns + 1})
+                    vertices_.push_back(mesh[index]);
+            }
+        }
+    }
     void draw_image(const Image &image, double alpha, ImageFilter filter) override {
         auto a = state_.transform.apply({0, 0});
         auto b = state_.transform.apply({double(image.width), double(image.height)});
