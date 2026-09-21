@@ -711,6 +711,35 @@ struct Player::Impl {
         if (!device_initialized)
             return false;
 
+        // PulseAudio (including PipeWire's PulseAudio server) corks on stop
+        // without draining. Discard its queued audio before restarting so a
+        // paused track cannot play ahead of the new track's fade-in.
+        if (device.pContext && device.pContext->backend == ma_backend_pulseaudio &&
+            device.pulse.pStreamPlayback && device.pulse.pMainLoop) {
+            auto* stream = static_cast<pa_stream*>(device.pulse.pStreamPlayback);
+            auto* loop = static_cast<pa_mainloop*>(device.pulse.pMainLoop);
+            int flushed = 0;
+            auto* operation = pa_stream_flush(stream,
+                [](pa_stream*, int success, void* userdata) {
+                    *static_cast<int*>(userdata) = success;
+                }, &flushed);
+            if (operation) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+                while (pa_operation_get_state(operation) == PA_OPERATION_RUNNING &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    if (pa_mainloop_iterate(loop, 0, nullptr) < 0)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                pa_operation_cancel(operation);
+                pa_operation_unref(operation);
+            }
+            if (!flushed) {
+                set_error("Failed to clear paused audio from the playback device.");
+                return false;
+            }
+        }
+
         {
             std::lock_guard<std::mutex> lock(mutex);
             transport_gain_current = 0.0f;

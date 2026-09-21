@@ -119,6 +119,13 @@ target_link_libraries(tunes PRIVATE tunes_drawing PkgConfig::DEPS)
 #     target_link_options(tunes_sample_rate_test PRIVATE -Wl,--wrap=ma_device_init -Wl,--wrap=ma_device_start)
 #     add_test(NAME sample_rate_switching COMMAND tunes_sample_rate_test)
 #     set_tests_properties(sample_rate_switching PROPERTIES TIMEOUT 20)
+#     add_executable(tunes_player_pause_test tests/player_pause_test.cpp src/player.cpp src/miniaudio.c src/audio_conversion.cpp)
+#     target_include_directories(tunes_player_pause_test PRIVATE include)
+#     target_link_libraries(tunes_player_pause_test PRIVATE PkgConfig::DEPS)
+#     target_link_options(tunes_player_pause_test PRIVATE
+#         -Wl,--wrap=ma_device_init -Wl,--wrap=ma_device_start)
+#     add_test(NAME paused_audio_buffer COMMAND tunes_player_pause_test)
+#     set_tests_properties(paused_audio_buffer PROPERTIES TIMEOUT 10 SKIP_RETURN_CODE 77)
 # endif()
 
 install(TARGETS tunes

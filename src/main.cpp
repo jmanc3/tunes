@@ -3307,10 +3307,12 @@ static void activate_playback_button(Container *root, PlaybackButton button) {
                 player->start();
             break;
         case PlaybackButton::Previous:
-            if (index != no_index && index > 0)
-                player->play_queued_item(index - 1);
-            else if (index == 0)
-                player->seek_to_start();
+            if (index != no_index) {
+                if (player->current_time_seconds() > 10 || index == 0)
+                    player->seek_to_start();
+                else
+                    player->play_queued_item(index - 1);
+            }
             break;
         case PlaybackButton::Next:
             if (index != no_index && index + 1 < player->queue().size())
@@ -3411,9 +3413,11 @@ static void playback_key_event(Container *root, Container *, int, bool pressed,
             activate_playback_button(root, PlaybackButton::Previous);
             return;
         case XKB_KEY_comma:
+        case XKB_KEY_Left:
             player->seek_relative_seconds(-10);
             break;
         case XKB_KEY_period:
+        case XKB_KEY_Right:
             player->seek_relative_seconds(10);
             break;
         case XKB_KEY_plus:
