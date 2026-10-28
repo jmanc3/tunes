@@ -59,6 +59,17 @@ static long get_current_time_in_ms() {
     return currentTime.count();
 }
 
+double easeCustom(double t) {
+    static std::vector<float> fls = { 0, 0.0010000000000000009, 0.0010000000000000009, 0.0020000000000000018, 0.0030000000000000027, 0.0030000000000000027, 0.0040000000000000036, 0.0050000000000000044, 0.006000000000000005, 0.008000000000000007, 0.009000000000000008, 0.010000000000000009, 0.01200000000000001, 0.013000000000000012, 0.015000000000000013, 0.017000000000000015, 0.019000000000000017, 0.02100000000000002, 0.02400000000000002, 0.026000000000000023, 0.029000000000000026, 0.031000000000000028, 0.03400000000000003, 0.03700000000000003, 0.041000000000000036, 0.04400000000000004, 0.04800000000000004, 0.052000000000000046, 0.05600000000000005, 0.061000000000000054, 0.06499999999999995, 0.06999999999999995, 0.07599999999999996, 0.08099999999999996, 0.08699999999999997, 0.09399999999999997, 0.10099999999999998, 0.10899999999999999, 0.11699999999999999, 0.125, 0.135, 0.14500000000000002, 0.15700000000000003, 0.16900000000000004, 0.18400000000000005, 0.19999999999999996, 0.21899999999999997, 0.241, 0.27, 0.31200000000000006, 0.371, 0.41200000000000003, 0.44899999999999995, 0.483, 0.515, 0.5449999999999999, 0.573, 0.599, 0.623, 0.647, 0.6679999999999999, 0.6890000000000001, 0.708, 0.727, 0.744, 0.761, 0.776, 0.791, 0.8049999999999999, 0.819, 0.831, 0.843, 0.855, 0.865, 0.876, 0.885, 0.894, 0.903, 0.911, 0.919, 0.926, 0.933, 0.9390000000000001, 0.945, 0.951, 0.956, 0.961, 0.966, 0.97, 0.974, 0.978, 0.981, 0.984, 0.987, 0.989, 0.991, 0.993, 0.995, 0.997, 0.998, 0.999, 0.999, 1 };
+    
+    int i = std::round(t * fls.size() - 1);
+    if (i < 0)
+        i = 0;
+    if (i > fls.size() - 1)
+        i = fls.size() - 1;
+    return fls[i];
+}
+
 bool is_audio(const std::filesystem::path& path) {
     magic_t magic = magic_open(MAGIC_MIME_TYPE);
     if (!magic)
@@ -2735,8 +2746,8 @@ static void fill_out_for_albums(Container *root, const std::vector<AlbumOption> 
             panel_full_h = std::max((150 + 32 * tracks.rows) * dpi, tracks.art_size + 32 * dpi);
             if (data->album_reveal_start) {
                 const double t = std::clamp(std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - *data->album_reveal_start).count() / 320.0, 0.0, 1.0);
-                data->album_reveal = t * t * (3 - 2 * t);
+                    std::chrono::steady_clock::now() - *data->album_reveal_start).count() / 600.0, 0.0, 1.0);
+                data->album_reveal = easeCustom(t);
                 if (t >= 1) {
                     data->album_reveal_start.reset();
                     data->outgoing_album = nullptr;
@@ -2969,11 +2980,13 @@ static bool sync_playback(Container *root) {
     const auto elapsed = player->current_time_seconds();
     const auto duration = player->total_time_seconds();
     const auto gain = player->volume();
-    const bool playing = player->is_playing();
     const float position = duration > 0 ? std::clamp(static_cast<float>(elapsed / duration), 0.0f, 1.0f) : 0;
     const bool can_play = !player->queue().empty();
     const bool can_previous = index != no_index && !path.empty();
     const bool can_next = index != no_index && index + 1 < player->queue().size();
+    if (!can_next && duration > 0 && elapsed >= duration && player->is_playing())
+        player->pause();
+    const bool playing = player->is_playing();
     bool changed = data->path != path || data->playing != playing || data->gain != gain ||
         static_cast<int>(data->elapsed) != static_cast<int>(elapsed) || data->duration != duration ||
         std::abs(data->position - position) * data->seek->real_bounds.w >= .5 ||
@@ -3303,8 +3316,12 @@ static void activate_playback_button(Container *root, PlaybackButton button) {
         case PlaybackButton::Play:
             if (player->is_playing())
                 player->pause();
-            else
+            else {
+                const auto duration = player->total_time_seconds();
+                if (duration > 0 && player->current_time_seconds() >= duration && !player->seek_to_start())
+                    break;
                 player->start();
+            }
             break;
         case PlaybackButton::Previous:
             if (index != no_index) {
