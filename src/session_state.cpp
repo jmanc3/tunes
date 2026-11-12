@@ -1,6 +1,7 @@
 #include "tunes_paths.h"
 #include "session_state.h"
 #include "audio_data.h"
+#include "audio_conversion.h"
 
 #include <algorithm>
 #include <cmath>
@@ -139,6 +140,21 @@ SessionState load_session(const std::filesystem::path &path) {
     int dark = 0;
     if (in >> extension && extension == "theme-v1" && in >> dark && (dark == 0 || dark == 1))
         state.dark_theme = dark != 0;
+    std::string start, query;
+    if (in >> extension && extension == "songs-continuation-v1" && in >> std::quoted(start) >> std::quoted(query)) {
+        state.songs_continuation_start = std::move(start);
+        state.songs_continuation_query = std::move(query);
+    }
+    int page = 0;
+    if (in >> extension && extension == "library-page-v1" && in >> page >> count && page >= 0 && page < 4 && count <= 4) {
+        state.library_page = page;
+        for (std::size_t i = 0; i < count; ++i) {
+            int tab = 0;
+            double offset = 0;
+            if (!(in >> tab >> offset) || tab < 1 || tab > 3 || !std::isfinite(offset)) break;
+            state.page_scroll_offsets[tab] = std::min(0.0, offset);
+        }
+    }
     return state;
 }
 
@@ -179,6 +195,11 @@ bool save_session(const std::filesystem::path &path, const SessionState &state) 
     for (std::size_t i = 0; i < queue_sources; ++i)
         out << std::quoted(i < state.queue_playlist_ids.size() ? state.queue_playlist_ids[i] : std::string{}) << '\n';
     out << "theme-v1\n" << state.dark_theme << '\n';
+    out << "songs-continuation-v1\n" << std::quoted(state.songs_continuation_start) << '\n'
+        << std::quoted(state.songs_continuation_query) << '\n';
+    out << "library-page-v1\n" << state.library_page << ' ' << state.page_scroll_offsets.size() << '\n';
+    for (const auto &[tab, offset] : state.page_scroll_offsets)
+        out << tab << ' ' << offset << '\n';
     out.close();
     const bool written = static_cast<bool>(out);
     if (written)
@@ -200,7 +221,7 @@ void remove_missing_tracks(SessionState &state) {
     std::size_t next = missing;
     for (std::size_t i = 0; i < state.queue.size(); ++i) {
         std::error_code error;
-        if (!std::filesystem::is_regular_file(state.queue[i], error))
+        if (!std::filesystem::is_regular_file(state.queue[i], error) || is_junk_audio_path(state.queue[i]))
             continue;
         if (i == state.current_index)
             selected = kept.size();
@@ -218,4 +239,7 @@ void remove_missing_tracks(SessionState &state) {
     state.queue_playlist_ids = std::move(kept_playlist_ids);
     state.current_index = state.queue.empty() ? missing : selected;
     state.current_path = state.queue.empty() ? "" : state.queue[state.current_index];
+    // Earlier scans could add macOS metadata files to playlists as well.
+    for (auto &playlist : state.playlists)
+        std::erase_if(playlist.tracks, [](const auto &path) { return is_junk_audio_path(path); });
 }

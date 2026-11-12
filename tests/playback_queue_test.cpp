@@ -34,5 +34,25 @@ int main() {
     check(!q.current() && q.paths().size() == 2);
     q.clear();
     check(q.paths().empty());
-    std::cout << "Queue priority, reordering, duplicates, progression and clear passed\n";
+    // Continuation: fed one track at a time, after explicit queue items.
+    q.observe({"song-a"}, 0);
+    q.set_continuation({"song-b", "song-c", "song-d"});
+    check(q.continuation_size() == 3 && q.continuation_front() == "song-b");
+    check(q.feed() && !q.feed());
+    check(q.paths() == std::vector<std::string>({"song-a", "song-b"}));
+    q.add({"queued"}, Q::Action::Append);
+    q.add({"next"}, Q::Action::PlayNext);
+    check(q.paths() == std::vector<std::string>({"song-a", "next", "queued", "song-b"}));
+    check(!q.move(q.entries().back().id, q.entries()[1].id) && !q.move(q.entries()[1].id, q.entries().back().id));
+    q.observe(q.paths(), 3); // song-b plays; the next one is fed
+    check(q.continuation_size() == 2 && q.feed() && q.paths().back() == "song-c");
+    check(q.remove_continuation() && q.continuation_size() == 0 && !q.feed());
+    check(q.paths() == std::vector<std::string>({"song-a", "next", "queued", "song-b"}));
+    q.set_continuation({"x"});
+    q.reset({"album"}, 0); // a new context replaces it
+    check(q.continuation_size() == 0 && !q.feed());
+    q.set_continuation({"y"});
+    q.clear();
+    check(q.continuation_size() == 0);
+    std::cout << "Queue priority, reordering, duplicates, progression, clear and continuation passed\n";
 }

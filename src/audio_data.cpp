@@ -40,6 +40,20 @@
 #include <mp4file.h>
 #include <mp4tag.h>
 #include <tag.h>
+#include <tpropertymap.h>
+#include <flacproperties.h>
+#include <mp4properties.h>
+#include <mpegproperties.h>
+#include <oggflacfile.h>
+#include <opusfile.h>
+#include <speexfile.h>
+#include <wavfile.h>
+#include <aifffile.h>
+#include <apefile.h>
+#include <wavpackfile.h>
+#include <asffile.h>
+#include <dsffile.h>
+#include <dsdifffile.h>
 
 static std::string toLower(const std::string& str) {
     std::string lower = str;
@@ -321,11 +335,143 @@ Option read_track(const std::string &path) {
         o.year = std::to_string(tag->year());
         o.track = std::to_string(tag->track());
     }
+    {
+        const auto properties = tag_file.file()->properties();
+        const auto found = properties.find("ALBUMARTIST");
+        if (found != properties.end() && !found->second.isEmpty())
+            o.album_artist = found->second.front().to8Bit(true);
+    }
     if (o.name.empty())
         o.name = std::filesystem::path(path).filename().string();
     if (auto *properties = tag_file.audioProperties())
         o.length = std::to_string(properties->lengthInSeconds());
     return o;
+}
+
+TrackDetails read_track_details(const std::string &path) {
+    TrackDetails d;
+    d.path = path;
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (!error) d.file_size = size;
+    TagLib::FileRef ref(path.c_str());
+    if (ref.isNull() || !ref.file()->isValid())
+        return d;
+    d.valid = true;
+    if (auto *tag = ref.tag()) {
+        d.title = tag->title().to8Bit(true);
+        d.artist = tag->artist().to8Bit(true);
+        d.album = tag->album().to8Bit(true);
+        d.genre = tag->genre().to8Bit(true);
+        d.comment = tag->comment().to8Bit(true);
+        d.year = static_cast<int>(tag->year());
+        d.track = static_cast<int>(tag->track());
+    }
+    const auto properties = ref.file()->properties();
+    auto first = [&](const char *key) {
+        const auto found = properties.find(key);
+        return found == properties.end() || found->second.isEmpty() ? std::string{} : found->second.front().to8Bit(true);
+    };
+    d.album_artist = first("ALBUMARTIST");
+    d.composer = first("COMPOSER");
+    d.disc = getDiscNumber(path);
+    if (d.disc <= 0) {
+        const auto disc = first("DISCNUMBER");
+        std::from_chars(disc.data(), disc.data() + disc.size(), d.disc);
+    }
+    if (auto *audio = ref.audioProperties()) {
+        d.length_seconds = audio->lengthInSeconds();
+        d.sample_rate = audio->sampleRate();
+        d.channels = audio->channels();
+        d.bitrate = audio->bitrate();
+    }
+    auto *file = ref.file();
+    if (auto *f = dynamic_cast<TagLib::FLAC::File *>(file)) {
+        d.format = "FLAC";
+        d.lossless = true;
+        if (auto *p = f->audioProperties()) d.bits_per_sample = p->bitsPerSample();
+    } else if (auto *f = dynamic_cast<TagLib::MPEG::File *>(file)) {
+        const auto *p = f->audioProperties();
+        d.format = p && p->layer() != 3 ? "MPEG Layer " + std::to_string(p->layer()) : "MP3";
+    } else if (auto *f = dynamic_cast<TagLib::MP4::File *>(file)) {
+        d.format = "MP4";
+        if (auto *p = f->audioProperties()) {
+            d.bits_per_sample = p->bitsPerSample();
+            switch (p->codec()) {
+                case TagLib::MP4::Properties::AAC: d.format = "AAC"; d.bits_per_sample = 0; break;
+                case TagLib::MP4::Properties::ALAC: d.format = "ALAC"; d.lossless = true; break;
+                case TagLib::MP4::Properties::FLAC: d.format = "FLAC (MP4)"; d.lossless = true; break;
+                case TagLib::MP4::Properties::Opus: d.format = "Opus (MP4)"; d.bits_per_sample = 0; break;
+                case TagLib::MP4::Properties::AC3: d.format = "AC-3"; d.bits_per_sample = 0; break;
+                case TagLib::MP4::Properties::EAC3: d.format = "E-AC-3"; d.bits_per_sample = 0; break;
+                default: break;
+            }
+        }
+    } else if (dynamic_cast<TagLib::Ogg::Vorbis::File *>(file)) {
+        d.format = "Ogg Vorbis";
+    } else if (dynamic_cast<TagLib::Ogg::Opus::File *>(file)) {
+        d.format = "Opus";
+    } else if (dynamic_cast<TagLib::Ogg::Speex::File *>(file)) {
+        d.format = "Speex";
+    } else if (auto *f = dynamic_cast<TagLib::Ogg::FLAC::File *>(file)) {
+        d.format = "Ogg FLAC";
+        d.lossless = true;
+        if (auto *p = f->audioProperties()) d.bits_per_sample = p->bitsPerSample();
+    } else if (auto *f = dynamic_cast<TagLib::RIFF::WAV::File *>(file)) {
+        d.format = "WAV";
+        if (auto *p = f->audioProperties()) {
+            d.bits_per_sample = p->bitsPerSample();
+            d.lossless = p->format() == 1 || p->format() == 3 || p->format() == 0xFFFE;
+        }
+    } else if (auto *f = dynamic_cast<TagLib::RIFF::AIFF::File *>(file)) {
+        d.format = "AIFF";
+        if (auto *p = f->audioProperties()) {
+            d.bits_per_sample = p->bitsPerSample();
+            d.lossless = !p->isAiffC() || p->compressionType() == "NONE" || p->compressionType() == "sowt";
+        }
+    } else if (auto *f = dynamic_cast<TagLib::APE::File *>(file)) {
+        d.format = "Monkey's Audio";
+        d.lossless = true;
+        if (auto *p = f->audioProperties()) d.bits_per_sample = p->bitsPerSample();
+    } else if (auto *f = dynamic_cast<TagLib::WavPack::File *>(file)) {
+        d.format = "WavPack";
+        if (auto *p = f->audioProperties()) {
+            d.bits_per_sample = p->bitsPerSample();
+            d.lossless = p->isLossless();
+        }
+    } else if (auto *f = dynamic_cast<TagLib::ASF::File *>(file)) {
+        d.format = "WMA";
+        if (auto *p = f->audioProperties()) {
+            d.lossless = p->codec() == TagLib::ASF::Properties::WMA9Lossless;
+            if (d.lossless) { d.format = "WMA Lossless"; d.bits_per_sample = p->bitsPerSample(); }
+        }
+    } else if (auto *f = dynamic_cast<TagLib::DSF::File *>(file)) {
+        d.format = "DSD (DSF)";
+        d.lossless = true;
+        if (auto *p = f->audioProperties()) d.bits_per_sample = p->bitsPerSample();
+    } else if (auto *f = dynamic_cast<TagLib::DSDIFF::File *>(file)) {
+        d.format = "DSD (DFF)";
+        d.lossless = true;
+        if (auto *p = f->audioProperties()) d.bits_per_sample = p->bitsPerSample();
+    } else {
+        auto extension = std::filesystem::path(path).extension().string();
+        if (!extension.empty()) extension.erase(0, 1);
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return std::toupper(c); });
+        d.format = extension.empty() ? "Unknown" : extension;
+    }
+    return d;
+}
+
+bool is_library_track_candidate(const std::filesystem::path &path) {
+    if (is_junk_audio_path(path.string())) return false;
+    if (path.filename().string().find(".flac.tmp-") != std::string::npos) return false;
+    // "song.opus.flac" is our converted copy of "song.opus". The library lists
+    // the tagged original; playback picks the copy via preferred_audio_path.
+    if (path.extension() == ".flac" && path.stem().has_extension()) {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(path.parent_path() / path.stem(), error)) return false;
+    }
+    return true;
 }
 
 static void cache_creation_thread(std::string cache_path, std::string path_to_search) {
@@ -335,14 +481,19 @@ static void cache_creation_thread(std::string cache_path, std::string path_to_se
     ThreadPool pool(threads);
     std::vector< std::future<Option> > results;
 
-    std::vector<std::string> albums;
-    for (const auto& entry : fs::recursive_directory_iterator(path_to_search, fs::directory_options::skip_permission_denied)) {
-        if (fs::is_regular_file(entry.path())) {
-            std::string full_path = entry.path().string();
-            if (full_path.find(".flac.tmp-") != std::string::npos) continue;
-
-            results.emplace_back(pool.enqueue([full_path] { return read_track(full_path); }));
+    std::error_code error;
+    for (auto it = fs::recursive_directory_iterator(path_to_search, fs::directory_options::skip_permission_denied, error);
+         !error && it != fs::recursive_directory_iterator(); it.increment(error)) {
+        const auto &path = it->path();
+        const auto name = path.filename().string();
+        if (it->is_directory(error)) {
+            // Skip hidden folders and macOS archive metadata folders entirely.
+            if (!name.empty() && (name.front() == '.' || name == "__MACOSX")) it.disable_recursion_pending();
+            continue;
         }
+        if (!it->is_regular_file(error) || !is_library_track_candidate(path)) continue;
+        std::string full_path = path.string();
+        results.emplace_back(pool.enqueue([full_path] { return read_track(full_path); }));
     }
 
     std::vector<Option> options;
@@ -353,7 +504,7 @@ static void cache_creation_thread(std::string cache_path, std::string path_to_se
     std::ofstream file;
     file.exceptions(std::ios::failbit | std::ios::badbit);
     file.open(cache_path);
-    file << "version: 1" << std::endl;
+    file << "version: 3" << std::endl;
     for (auto o: options) {
         if (o.full.empty())
             continue;
@@ -366,6 +517,7 @@ static void cache_creation_thread(std::string cache_path, std::string path_to_se
         write_to(file, "Year: ", o.year);
         write_to(file, "Length: ", o.length);
         write_to(file, "Track: ", o.track);
+        write_to(file, "Album artist: ", o.album_artist);
         write_to(file, "Disc: ", o.disc);
     }
 
@@ -392,9 +544,13 @@ static void load_from_cache(std::string cache_path, std::vector<Option> &options
     std::string length;
     std::string track;
     std::string disc;
+    std::string album_artist;
     bool last = false;
     while (std::getline(file, line)) {
-        if (line.find("Path:") != std::string::npos) {
+        if (line.starts_with("Album artist:")) {
+            line.erase(0, std::min<std::size_t>(line.size(), 14));
+            album_artist = line;
+        } else if (line.find("Path:") != std::string::npos) {
             line.erase(0, 6);
             path = line;
         } else if (line.find("Title:") != std::string::npos) {
@@ -426,8 +582,14 @@ static void load_from_cache(std::string cache_path, std::vector<Option> &options
 
         if (last) {
             last = false;
+            // Older caches listed junk and conversion copies; drop them on load.
+            if (!is_library_track_candidate(path)) {
+                path = title = artist = album = genre = year = length = track = album_artist = "";
+                continue;
+            }
             options.push_back({path, title, artist, album, toLower(album), genre, year, length, track, disc});
-            path = title = artist = album = genre = year = length = track = "";
+            options.back().album_artist = album_artist;
+            path = title = artist = album = genre = year = length = track = album_artist = "";
         }
     }
     file.close();
@@ -523,6 +685,13 @@ std::string library_cache_path(const std::string &music_path) {
     const auto path = tunes_cache_directory() / "libraries" / (std::string(hash) + ".cache");
     g_free(hash);
     return path.string();
+}
+
+bool library_cache_current(const std::string &music_path) {
+    std::ifstream file(library_cache_path(normalize_music_directory(music_path)));
+    if (!file) return true; // No cache means nothing to upgrade.
+    std::string line;
+    return std::getline(file, line) && line == "version: 3";
 }
 
 std::vector<Option> load_library(const std::string &music_path, bool scan_if_missing) {

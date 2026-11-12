@@ -3,6 +3,9 @@
 #include <string>
 
 // Tests this build's decoder against the actual file contents.
+// Hidden files and macOS archive metadata (AppleDouble "._x.wav", __MACOSX)
+// can carry audio extensions but never contain audio.
+bool is_junk_audio_path(const std::string &path);
 bool needs_audio_conversion(const std::string &path);
 std::string preferred_audio_path(const std::string &path);
 struct AudioConversionResult {

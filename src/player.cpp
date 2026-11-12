@@ -1359,6 +1359,10 @@ Player::ConversionProgress Player::conversion_progress() const {
     return progress;
 }
 
+void Player::dismiss_conversion_error() {
+    if (conversion_) conversion_->error.clear();
+}
+
 bool Player::poll_conversion() {
     if (!conversion_) return false;
     auto &c = *conversion_;

@@ -11,7 +11,18 @@
 #include <unistd.h>
 extern char **environ;
 
+bool is_junk_audio_path(const std::string &path) {
+    const std::filesystem::path p(path);
+    const auto name = p.filename().string();
+    if (name.empty() || name.front() == '.') return true;
+    for (const auto &part : p.parent_path())
+        if (part == "__MACOSX") return true;
+    return false;
+}
+
 bool needs_audio_conversion(const std::string &path) {
+    // Junk is never converted; FFmpeg would only fail on it.
+    if (is_junk_audio_path(path)) return false;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec)) return false;
     if (preferred_audio_path(path) != path) return true;

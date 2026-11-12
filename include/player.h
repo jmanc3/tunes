@@ -81,6 +81,8 @@ public:
         double seconds = 0;
     };
     ConversionProgress conversion_progress() const;
+    // Hides the last conversion failure until another conversion fails.
+    void dismiss_conversion_error();
     // Called on the UI thread to apply completed background preparation.
     bool poll_conversion();
 

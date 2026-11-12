@@ -37,6 +37,15 @@ struct SessionState {
     unsigned sample_rate = 48000;
     bool rescan_on_launch = true;
     bool dark_theme = false;
+    // "Next in Songs": the song it continues from (empty means none) and the
+    // search that filtered the Songs page. The rest is rebuilt from the library.
+    std::string songs_continuation_start;
+    std::string songs_continuation_query;
+    // Library tab: 0 Albums, 1 Songs, 2 Artists, 3 Playlists.
+    int library_page = 0;
+    // Logical pixels for the Songs, Artists and Playlists tabs, keyed by tab.
+    // The Albums tab keeps using scroll_offsets.
+    std::map<int, double> page_scroll_offsets;
     bool operator==(const SessionState &) const = default;
 };
 
@@ -45,5 +54,6 @@ std::filesystem::path library_session_path(const std::string &music_root);
 SessionState load_library_session(const std::string &music_root, const SessionState &last_session);
 SessionState load_session(const std::filesystem::path &path);
 bool save_session(const std::filesystem::path &path, const SessionState &state);
-// Drops unavailable files while preserving queue order and duplicate entries.
+// Drops unavailable and junk files (see is_junk_audio_path) while preserving
+// queue order and duplicate entries. Junk is also removed from playlists.
 void remove_missing_tracks(SessionState &state);
