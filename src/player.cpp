@@ -1,5 +1,6 @@
 #include "player.h"
 #include "audio_conversion.h"
+#include "audio_tap.h"
 #include <future>
 #include <optional>
 #include <unordered_set>
@@ -27,6 +28,9 @@ namespace {
 constexpr ma_format format = ma_format_f32;
 constexpr ma_uint32 channels = 2;
 constexpr ma_uint64 max_chunk = 4096;
+
+// Shared by every Impl generation so sample-rate changes keep the feed alive.
+AudioTap visualizer_tap;
 
 constexpr double transport_fade_ms = 5.0;
 // The UI value is normalized, while perceived loudness follows a logarithmic
@@ -256,6 +260,7 @@ struct Player::Impl {
             );
         }
 
+        visualizer_tap.write(out, static_cast<std::size_t>(frame_count) * channels);
         apply_output_gain(out, frame_count);
     }
 
@@ -1545,4 +1550,14 @@ double Player::total_time_seconds() const {
 
 std::string Player::last_error() const {
     return impl_->get_last_error();
+}
+
+void Player::set_visualizer_tap(bool enabled) noexcept {
+    visualizer_tap.set_enabled(enabled);
+    if (!enabled) visualizer_tap.clear();
+}
+
+std::size_t Player::read_visualizer_samples(float* out, std::size_t max_floats) noexcept {
+    // Keep stereo frames intact.
+    return visualizer_tap.read(out, max_floats & ~std::size_t(1));
 }

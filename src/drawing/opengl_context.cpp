@@ -38,8 +38,13 @@ Rect integral(Rect r) {
 struct Texture {
     GLuint id = 0;
     int width = 0, height = 0;
+    bool owned = true;
     Texture() { glGenTextures(1, &id); }
-    ~Texture() { glDeleteTextures(1, &id); }
+    // Borrows a texture owned elsewhere (native_gl interop).
+    Texture(GLuint external, int w, int h) : id(external), width(w), height(h), owned(false) {}
+    ~Texture() {
+        if (owned) glDeleteTextures(1, &id);
+    }
     Texture(const Texture &) = delete;
     Texture &operator=(const Texture &) = delete;
     void allocate(int w, int h, bool mask, const void *data = nullptr) {
@@ -375,7 +380,7 @@ class GLContext final : public OpenGLContext {
                 {r.x, r.y + r.height}};
     }
     void textured_quad(const std::shared_ptr<Texture> &texture, int kind, Rect r, RGBA color, double alpha,
-                       bool mipmap = false) {
+                       bool mipmap = false, bool flip_y = false) {
         if (empty(state_.clip) || empty(r))
             return;
         start_batch(texture->id, kind, mipmap);
@@ -383,7 +388,8 @@ class GLContext final : public OpenGLContext {
         const auto points = quad(r);
         const double uv[6][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 0}, {1, 1}, {0, 1}};
         for (int i = 0; i < 6; ++i)
-            vertices_.push_back(vertex(state_.transform.apply(points[i]), uv[i][0], uv[i][1], color, alpha));
+            vertices_.push_back(vertex(state_.transform.apply(points[i]), uv[i][0],
+                                       flip_y ? 1 - uv[i][1] : uv[i][1], color, alpha));
     }
     Rect path_bounds() const {
         double x = std::numeric_limits<double>::infinity(), y = x, right = -x, bottom = -x;
@@ -991,6 +997,45 @@ class GLContext final : public OpenGLContext {
         draw_batch();
         state_ = std::move(saved);
         bind_target();
+    }
+    bool native_gl(const std::function<void()> &render) override {
+        draw_batch();
+        render();
+        // Foreign code may have changed anything; restore what this renderer
+        // assumes persists between batches. Per-batch state (scissor, blend
+        // func, textures, samplers, uniforms) is re-applied by uniforms().
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glUseProgram(pipeline_.program);
+        glBindVertexArray(pipeline_.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, pipeline_.vbo);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        for (GLenum cap : {GL_DEPTH_TEST, GL_CULL_FACE, GL_STENCIL_TEST, GL_DITHER, GL_POLYGON_OFFSET_FILL,
+                           GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE, GL_RASTERIZER_DISCARD})
+            glDisable(cap);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_TRUE);
+        glStencilMask(255);
+        glFrontFace(GL_CCW);
+        glBlendEquation(GL_FUNC_ADD);
+        for (GLenum param : {GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_ROWS, GL_UNPACK_SKIP_PIXELS,
+                             GL_UNPACK_IMAGE_HEIGHT, GL_UNPACK_SKIP_IMAGES, GL_PACK_ROW_LENGTH,
+                             GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS})
+            glPixelStorei(param, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        bind_target();
+        return true;
+    }
+    void draw_native_texture(unsigned texture, double width, double height, bool flip_y, double alpha) override {
+        if (texture && width > 0 && height > 0) {
+            auto borrowed = std::make_shared<Texture>(texture, int(width), int(height));
+            textured_quad(borrowed, 1, {0, 0, width, height}, RGBA(1, 1, 1, 1), std::clamp(alpha, 0.0, 1.0),
+                          false, flip_y);
+        }
+        consume_path();
     }
     void flush() override {
         if (!groups_.empty())

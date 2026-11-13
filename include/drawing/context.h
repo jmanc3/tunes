@@ -1,6 +1,7 @@
 #pragma once
 #include "drawing/color.h"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -83,6 +84,19 @@ public:
     // Blur the complete frame, mixing with the original by amount (0..1).
     virtual void gaussian_blur(double sigma, double amount) = 0;
     virtual void flush() = 0;
+
+    // --- Raw OpenGL interop (OpenGL backend only) ---
+    // Submits queued drawing, runs render with the GL context current, then
+    // restores the renderer's GL state. render may bind its own framebuffers,
+    // programs, textures and blend state. Returns false (without calling
+    // render) when the backend is not OpenGL.
+    virtual bool native_gl(const std::function<void()> &render) { return false; }
+    // Draws a GL texture the caller owns (premultiplied RGBA) at the origin,
+    // width x height user units, under the current transform and clip. flip_y
+    // suits textures rendered into a framebuffer (row 0 at the bottom). The
+    // texture must stay alive until the next native_gl() call or frame end.
+    virtual void draw_native_texture(unsigned texture, double width, double height,
+                                     bool flip_y = true, double alpha = 1) {}
 };
 
 // The caller owns the ARGB32 buffer and keeps it alive until context destruction.

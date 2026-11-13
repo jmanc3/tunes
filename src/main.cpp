@@ -16,6 +16,7 @@
 #include "session_state.h"
 #include "ThreadPool.h"
 #include "pipewire_settings.h"
+#include "visualizer.h"
 
 #include <chrono>
 #include <charconv>
@@ -290,6 +291,10 @@ struct SongEntry {
 
 struct RootData : UserData {
     LibraryPage page = LibraryPage::Albums;
+    Container *visualizer_overlay = nullptr;
+    std::unique_ptr<Visualizer> visualizer = std::make_unique<Visualizer>();
+    long visualizer_activity_ms = 0; // Last pointer or key activity; drives the auto-hiding controls.
+    Bounds visualizer_name_bounds;
     PlaylistNameEdit search;
     bool search_focused = false;
     // Result chosen with the arrow keys while searching; max means the field itself.
@@ -616,6 +621,9 @@ static void paint_artwork(RootData *rd, drawing::Context *cr, const AlbumArtCach
 }
 
 static void playback_changed(Container *root);
+static void open_visualizer(Container *root);
+static void close_visualizer(Container *root);
+static void visualizer_activity(Container *root);
 static void checkpoint_session(Container *root, bool force = false);
 static void finish_playlist_name_edit(Container *root, bool commit);
 static void add_context_to_playlist(Container *root, const std::string &id);
@@ -3465,6 +3473,7 @@ struct PlaybackData : UserData {
     Container *mute = nullptr;
     Container *volume = nullptr;
     Container *queue_button = nullptr;
+    Container *visualizer_button = nullptr;
     Bounds info_bounds;
     Bounds elapsed_bounds;
     Bounds duration_bounds;
@@ -4199,6 +4208,21 @@ static void playback_key_event(Container *root, Container *, int, bool pressed,
         if (pressed && sym == XKB_KEY_Escape) close_song_info(root);
         return;
     }
+    if (rd->visualizer_overlay && rd->visualizer_overlay->exists) {
+        if (!pressed) return;
+        visualizer_activity(root);
+        if (sym == XKB_KEY_Escape || sym == XKB_KEY_v || sym == XKB_KEY_V)
+            close_visualizer(root);
+        else if (sym == XKB_KEY_Right || sym == XKB_KEY_n || sym == XKB_KEY_N)
+            rd->visualizer->next_preset();
+        else if (sym == XKB_KEY_Left || sym == XKB_KEY_p || sym == XKB_KEY_P)
+            rd->visualizer->previous_preset();
+        else if (sym == XKB_KEY_r || sym == XKB_KEY_R)
+            rd->visualizer->random_preset();
+        else if (sym == XKB_KEY_space)
+            activate_playback_button(root, PlaybackButton::Play);
+        return;
+    }
     if (pressed && (mods & MOD_CTRL) && !(mods & (MOD_ALT | MOD_SUPER)) && (sym == XKB_KEY_l || sym == XKB_KEY_L)) {
         // Ctrl+L: focus the search field with an empty query, like a browser's address bar.
         const bool had_query = !rd->search.text.empty();
@@ -4481,6 +4505,173 @@ static void fill_artwork_preview(Container *root, Container *overlay) {
     };
 }
 
+
+// ---- Visualizer -------------------------------------------------------------
+
+static constexpr long visualizer_controls_idle_ms = 2500;
+
+static void visualizer_activity(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    rd->visualizer_activity_ms = get_current_time_in_ms();
+}
+
+// Controls stay visible while the pointer moves, then fade out.
+static double visualizer_controls_alpha(RootData *rd) {
+    const long idle = get_current_time_in_ms() - rd->visualizer_activity_ms;
+    return std::clamp(1.0 - (idle - visualizer_controls_idle_ms) / 300.0, 0.0, 1.0);
+}
+
+static void open_visualizer(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->visualizer_overlay || rd->visualizer_overlay->exists) return;
+    rd->context_overlay->exists = false;
+    rd->queue_overlay->exists = false;
+    rd->visualizer->open(player);
+    rd->visualizer_overlay->exists = true;
+    rd->library->interactable = false;
+    rd->playback_bar->interactable = false;
+    visualizer_activity(root);
+    layout(root, root, root->real_bounds);
+    playback_changed(root);
+}
+
+static void close_visualizer(Container *root) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    if (!rd->visualizer_overlay || !rd->visualizer_overlay->exists) return;
+    rd->visualizer->close();
+    rd->visualizer_overlay->exists = false;
+    rd->library->interactable = true;
+    rd->playback_bar->interactable = true;
+    layout(root, root, root->real_bounds);
+    playback_changed(root);
+}
+
+static void paint_visualizer_icon(drawing::Context *cr, const Bounds &b, RGBA color) {
+    // Four bars of an equalizer, centered in b.
+    const double scale = std::min(b.w, b.h) / 32;
+    const double heights[] = {8, 16, 12, 18};
+    cr->save();
+    cr->translate(b.x + b.w / 2, b.y + b.h / 2);
+    cr->scale(scale, scale);
+    cr->set_color(color);
+    for (int i = 0; i < 4; ++i) {
+        const double x = -8.5 + i * 5, h = heights[i];
+        rounded_rectangle(cr, Bounds(x, 9 - h, 3, h), 1.5);
+        cr->fill();
+    }
+    cr->restore();
+}
+
+static Container *add_visualizer_control(Container *overlay, const char *name, int kind) {
+    // kind: 0 close, 1 previous preset, 2 next preset.
+    auto c = overlay->child(FILL_SPACE, FILL_SPACE);
+    c->name = name;
+    c->when_drag_end_is_click = false;
+    c->when_clicked = [kind](Container *root, Container *c) {
+        if (c->state.mouse_button_pressed != BTN_LEFT) return;
+        auto rd = static_cast<RootData *>(root->user_data);
+        visualizer_activity(root);
+        if (kind == 0) close_visualizer(root);
+        else if (kind == 1) rd->visualizer->previous_preset();
+        else rd->visualizer->next_preset();
+    };
+    c->when_paint = [kind](Container *root, Container *c) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        auto window = rd->window->raw_window;
+        auto cr = window->drawing_context;
+        const double alpha = visualizer_controls_alpha(rd);
+        if (alpha <= 0) return;
+        const auto &b = c->real_bounds;
+        cr->save();
+        cr->arc(b.x + b.w / 2, b.y + b.h / 2, std::min(b.w, b.h) / 2, 0, 2 * M_PI);
+        cr->set_color(RGBA(0, 0, 0, (c->state.mouse_hovering ? .6 : .35) * alpha));
+        cr->fill();
+        cr->set_color(RGBA(1, 1, 1, (c->state.mouse_hovering ? 1 : .8) * alpha));
+        cr->set_line_width(2 * window->dpi);
+        cr->set_line_cap(drawing::LineCap::Round);
+        const double inset = b.w * .34;
+        if (kind == 0) {
+            cr->move_to(b.x + inset, b.y + inset);
+            cr->line_to(b.right() - inset, b.bottom() - inset);
+            cr->move_to(b.right() - inset, b.y + inset);
+            cr->line_to(b.x + inset, b.bottom() - inset);
+        } else {
+            const double cx = b.x + b.w / 2, cy = b.y + b.h / 2, d = b.w * .12;
+            const double dir = kind == 1 ? 1 : -1;
+            cr->move_to(cx + dir * d, cy - 2 * d);
+            cr->line_to(cx - dir * d, cy);
+            cr->line_to(cx + dir * d, cy + 2 * d);
+        }
+        cr->stroke();
+        cr->restore();
+    };
+    return c;
+}
+
+static void fill_visualizer_overlay(Container *root, Container *overlay) {
+    auto rd = static_cast<RootData *>(root->user_data);
+    rd->visualizer_overlay = overlay;
+    overlay->name = "visualizer";
+    overlay->type = ::fullycustom;
+    overlay->z_index = 100;
+    overlay->exists = false;
+    overlay->when_drag_end_is_click = false;
+    auto close = add_visualizer_control(overlay, "close-visualizer", 0);
+    auto previous = add_visualizer_control(overlay, "previous-visualizer-preset", 1);
+    auto next = add_visualizer_control(overlay, "next-visualizer-preset", 2);
+    overlay->when_mouse_motion = [](Container *root, Container *) { visualizer_activity(root); };
+    overlay->when_mouse_enters_container = [](Container *root, Container *) { visualizer_activity(root); };
+    overlay->pre_layout = [close, previous, next](Container *root, Container *, const Bounds &b) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        const double dpi = rd->window->raw_window->dpi;
+        const double size = std::min(40 * dpi, b.w / 4);
+        const double margin = std::min(16 * dpi, b.w / 16);
+        layout(root, close, Bounds(b.right() - size - margin, b.y + margin, size, size));
+        const double name_w = std::min(420 * dpi, std::max(0.0, b.w - 4 * size - 4 * margin));
+        const double y = b.bottom() - size - margin * 1.5;
+        const double cx = b.x + b.w / 2;
+        rd->visualizer_name_bounds = Bounds(cx - name_w / 2, y, name_w, size);
+        layout(root, previous, Bounds(cx - name_w / 2 - size - margin / 2, y, size, size));
+        layout(root, next, Bounds(cx + name_w / 2 + margin / 2, y, size, size));
+    };
+    overlay->when_paint = [](Container *root, Container *c) {
+        auto rd = static_cast<RootData *>(root->user_data);
+        auto window = rd->window->raw_window;
+        auto cr = window->drawing_context;
+        const auto &b = c->real_bounds;
+        const double dpi = window->dpi;
+        cr->save();
+        set_rect(cr, b);
+        cr->set_color(RGBA(0, 0, 0, 1));
+        cr->fill();
+        const bool drew = rd->visualizer->draw(cr, b.x, b.y, b.w, b.h);
+        if (!drew) {
+            draw_text(cr, b.x, b.y + b.h / 2, rd->visualizer->error(), 14 * dpi, true, mylar_font, b.w, -1,
+                      RGBA(1, 1, 1, .85), false, 1);
+        }
+        const double alpha = visualizer_controls_alpha(rd);
+        const auto &nb = rd->visualizer_name_bounds;
+        if (alpha > 0 && nb.w > 0) {
+            std::string name = rd->visualizer->preset_name();
+            if (name.empty())
+                name = rd->visualizer->preset_count() ? "projectM" : "projectM — no presets installed";
+            rounded_rectangle(cr, nb, nb.h / 2);
+            cr->set_color(RGBA(0, 0, 0, .35 * alpha));
+            cr->fill();
+            const double pad = 16 * dpi;
+            const auto metrics = draw_text(cr, 0, 0, name, 11 * dpi, false, mylar_font, nb.w - 2 * pad, -1,
+                                           RGBA(1, 1, 1, alpha), false, 1);
+            draw_text(cr, nb.x + pad, nb.y + (nb.h - metrics.h) / 2, name, 11 * dpi, true, mylar_font,
+                      nb.w - 2 * pad, nb.h, RGBA(1, 1, 1, .9 * alpha), false, 1);
+        }
+        cr->restore();
+        // Animate continuously while open; frames are paced by the compositor.
+        // Without a visualizer (Cairo), only keep going to finish the fade.
+        if (drew || alpha > 0)
+            windowing::redraw(window);
+    };
+}
+
 static void fill_playback_bar(Container *root, Container *bar) {
     auto data = new PlaybackData;
     bar->user_data = data;
@@ -4532,6 +4723,17 @@ static void fill_playback_bar(Container *root, Container *bar) {
         draw_text(cr, b.x, b.y + (b.h - text.h) / 2, "Queue", font_size, true,
                   mylar_font, b.w, -1, foreground, true, 1);
         cr->restore();
+    };
+    data->visualizer_button = bar->child(FILL_SPACE, FILL_SPACE);
+    data->visualizer_button->name = "show-visualizer";
+    data->visualizer_button->when_clicked = [](Container *root, Container *c) {
+        if (c->state.mouse_button_pressed == BTN_LEFT && c->interactable)
+            open_visualizer(root);
+    };
+    data->visualizer_button->when_paint = [](Container *root, Container *c) {
+        auto cr = static_cast<RootData *>(root->user_data)->window->raw_window->drawing_context;
+        const bool hot = c->state.mouse_hovering || c->state.mouse_pressing;
+        paint_visualizer_icon(cr, c->real_bounds, hot ? theme().accent_hover : theme().icon);
     };
     data->settings = bar->child(FILL_SPACE, FILL_SPACE);
     data->settings->name = "settings";
@@ -4586,7 +4788,7 @@ static void fill_playback_bar(Container *root, Container *bar) {
         const double dpi = static_cast<RootData *>(root->user_data)->window->raw_window->dpi;
         const double pad = std::min(16 * dpi, b.w / 8);
         const bool compact = b.w < 1000 * dpi;
-        const double right_width = std::min(272 * dpi, b.w * .42);
+        const double right_width = std::min(312 * dpi, b.w * .46);
         const double center = compact ? b.x + (b.w - right_width) / 2 : b.x + b.w / 2;
         const double step = std::min(44 * dpi, (b.w - right_width - 2 * pad) / 3);
         const double button = std::max(0.0, std::min(32 * dpi, step));
@@ -4598,11 +4800,13 @@ static void fill_playback_bar(Container *root, Container *bar) {
         const double volume_y = b.y + (b.h - mute_size) / 2;
         const double queue_width = std::min(72 * dpi, right_width * .3);
         const double queue_gap = std::min(8 * dpi, right_width * .03);
-        const double controls_x = b.right() - right_width;
+        const double visualizer_width = mute_size + queue_gap;
+        layout(root, data->visualizer_button, Bounds(b.right() - right_width, volume_y, mute_size, mute_size));
+        const double controls_x = b.right() - right_width + visualizer_width;
         layout(root, data->queue_button, Bounds(controls_x, volume_y, queue_width, mute_size));
         layout(root, data->mute, Bounds(controls_x + queue_width + queue_gap, volume_y, mute_size, mute_size));
         layout(root, data->volume, Bounds(controls_x + queue_width + queue_gap + mute_size, volume_y,
-            std::max(0.0, right_width - queue_width - queue_gap - 2 * mute_size - pad), mute_size));
+            std::max(0.0, right_width - visualizer_width - queue_width - queue_gap - 2 * mute_size - pad), mute_size));
         layout(root, data->settings, Bounds(b.right() - pad - mute_size, volume_y,
             mute_size, mute_size));
         const double seek_left = compact ? b.x + pad : b.x + b.w * .28;
@@ -5499,6 +5703,8 @@ static void fill_root(Container *root) {
     auto albums = to_albums(playable);
 
     root->after_paint = [](Container *root, Container *) {
+        if (auto rd = static_cast<RootData *>(root->user_data); rd->visualizer)
+            rd->visualizer->collect(rd->window->raw_window->drawing_context);
         const auto progress = player->conversion_progress();
         if (!progress.active && progress.error.empty()) return;
         auto rd = static_cast<RootData *>(root->user_data);
@@ -5586,6 +5792,8 @@ static void fill_root(Container *root) {
     fill_settings_menu(root, settings_menu);
     auto song_info = root->child(FILL_SPACE, FILL_SPACE);
     fill_song_info(root, song_info);
+    auto visualizer = root->child(FILL_SPACE, FILL_SPACE);
+    fill_visualizer_overlay(root, visualizer);
     // An invisible hit area over the toast painted in after_paint; it keeps
     // a dismissing click from reaching the controls underneath.
     auto toast = root->child(FILL_SPACE, FILL_SPACE);
@@ -5602,7 +5810,7 @@ static void fill_root(Container *root) {
         layout(root, root, root->real_bounds);
         windowing::redraw(rd->window->raw_window);
     };
-    root->pre_layout = [library, header, bar, scrollbar, overlay, settings_menu, song_info, queue_overlay, context_overlay](Container *root, Container *, const Bounds &b) {
+    root->pre_layout = [library, header, bar, scrollbar, overlay, settings_menu, song_info, queue_overlay, context_overlay, visualizer](Container *root, Container *, const Bounds &b) {
         const double dpi = static_cast<RootData *>(root->user_data)->window->raw_window->dpi;
         const double bar_height = std::min(96 * dpi, b.h);
         const double header_height = std::min(60 * dpi, std::max(0.0, b.h - bar_height));
@@ -5628,6 +5836,8 @@ static void fill_root(Container *root) {
             layout(root, settings_menu, b);
         if (song_info->exists)
             layout(root, song_info, b);
+        if (visualizer->exists)
+            layout(root, visualizer, b);
         // Only a failure is dismissable; progress stays while conversion runs.
         const auto progress = player ? player->conversion_progress() : Player::ConversionProgress{};
         data->conversion_toast->exists = !progress.active && !progress.error.empty();

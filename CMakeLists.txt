@@ -51,6 +51,59 @@ pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET
 target_link_libraries(tunes_drawing PRIVATE PkgConfig::DEPS)
 target_link_libraries(tunes PRIVATE tunes_drawing PkgConfig::DEPS)
 
+# --- Visualizer: projectM (libprojectM 4, OpenGL ES build) -------------------
+# Sources are fetched once into .deps/ in the source tree and shared by every
+# build directory. Point TUNES_PROJECTM_SOURCE_DIR at an existing checkout to
+# build offline.
+include(FetchContent)
+set(TUNES_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.deps")
+set(TUNES_PROJECTM_SOURCE_DIR "" CACHE PATH "Existing projectM checkout (skips download)")
+option(TUNES_FETCH_PRESETS "Download the projectM preset and texture packs for the visualizer" ON)
+
+set(ENABLE_GLES ON CACHE BOOL "" FORCE)
+set(ENABLE_DEBUG_POSTFIX OFF CACHE BOOL "" FORCE)
+set(ENABLE_PLAYLIST OFF CACHE BOOL "" FORCE)
+set(ENABLE_SDL_UI OFF CACHE BOOL "" FORCE)
+set(ENABLE_SYSTEM_PROJECTM_EVAL OFF CACHE BOOL "" FORCE)
+set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+if(TUNES_PROJECTM_SOURCE_DIR)
+    set(FETCHCONTENT_SOURCE_DIR_PROJECTM "${TUNES_PROJECTM_SOURCE_DIR}")
+endif()
+FetchContent_Declare(projectm
+    GIT_REPOSITORY https://github.com/projectM-visualizer/projectm.git
+    GIT_TAG eae22de40144ee8ded92f3c04b93a4c2f82adcc0
+    GIT_SUBMODULES vendor/projectm-eval
+    GIT_SHALLOW FALSE
+    SOURCE_DIR "${TUNES_DEPS_DIR}/projectm"
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(projectm)
+target_link_libraries(tunes PRIVATE libprojectM::projectM)
+
+set(TUNES_PRESETS_INSTALL_DIR "${CMAKE_INSTALL_PREFIX}/share/tunes")
+target_compile_definitions(tunes PRIVATE
+    TUNES_VISUALIZER_INSTALL_DIR="${TUNES_PRESETS_INSTALL_DIR}"
+    TUNES_VISUALIZER_SOURCE_DIR="${TUNES_DEPS_DIR}")
+if(TUNES_FETCH_PRESETS)
+    FetchContent_Declare(tunes_presets
+        GIT_REPOSITORY https://github.com/projectM-visualizer/presets-cream-of-the-crop.git
+        GIT_TAG 0180df21f5e0bd39b9060cc5de420ed2f1f9e509
+        SOURCE_DIR "${TUNES_DEPS_DIR}/presets"
+    )
+    FetchContent_Declare(tunes_textures
+        GIT_REPOSITORY https://github.com/projectM-visualizer/presets-milkdrop-texture-pack.git
+        GIT_TAG 6368812f27bc747b517218fbf89d21d59afce4d9
+        SOURCE_DIR "${TUNES_DEPS_DIR}/textures"
+    )
+    FetchContent_MakeAvailable(tunes_presets tunes_textures)
+    install(DIRECTORY "${TUNES_DEPS_DIR}/presets/" DESTINATION "${TUNES_PRESETS_INSTALL_DIR}/presets"
+            PATTERN ".git" EXCLUDE)
+    install(DIRECTORY "${TUNES_DEPS_DIR}/textures/textures/" DESTINATION "${TUNES_PRESETS_INSTALL_DIR}/textures")
+endif()
+
 # include(CTest)
 # if(BUILD_TESTING)
 #     add_executable(tunes_conversion_test tests/audio_conversion_test.cpp src/audio_conversion.cpp src/audio_data.cpp src/player.cpp src/miniaudio.c)
@@ -130,3 +183,10 @@ target_link_libraries(tunes PRIVATE tunes_drawing PkgConfig::DEPS)
 
 install(TARGETS tunes
         DESTINATION /usr/local/bin/)
+
+# Offscreen visualizer check: cmake --build build --target tunes_visualizer_test
+add_executable(tunes_visualizer_test EXCLUDE_FROM_ALL tests/visualizer_test.cpp src/visualizer.cpp
+               src/player.cpp src/miniaudio.c src/audio_conversion.cpp)
+target_include_directories(tunes_visualizer_test PRIVATE include)
+target_compile_definitions(tunes_visualizer_test PRIVATE TUNES_VISUALIZER_SOURCE_DIR="${TUNES_DEPS_DIR}")
+target_link_libraries(tunes_visualizer_test PRIVATE tunes_drawing libprojectM::projectM PkgConfig::DEPS)

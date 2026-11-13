@@ -104,6 +104,12 @@ public:
 
     std::string last_error() const;
 
+    // Visualizer feed. While enabled, the audio thread copies its stereo
+    // output (before volume is applied) into a lock-free ring.
+    void set_visualizer_tap(bool enabled) noexcept;
+    // Drains interleaved stereo samples; returns the number of floats read.
+    std::size_t read_visualizer_samples(float* out, std::size_t max_floats) noexcept;
+
 private:
     struct Impl;
     struct Conversion;
